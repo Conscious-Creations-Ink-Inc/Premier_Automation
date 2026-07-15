@@ -1,0 +1,67 @@
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# --- Paths -------------------------------------------------------------
+
+SAMPLE_DATA_DIR = BASE_DIR / "sample_data"
+SAMPLE_EMAILS_DIR = SAMPLE_DATA_DIR / "emails"
+PO_LINES_SEED_FILE = SAMPLE_DATA_DIR / "po_lines.json"
+
+STATE_DIR = BASE_DIR / "state"
+PIPELINE_STATE_DB_PATH = STATE_DIR / "pipeline_state.sqlite3"
+SPITFIRE_MOCK_DB_PATH = STATE_DIR / "mock_spitfire.sqlite3"
+
+# --- Stage 1: Ingest & Triage -------------------------------------------
+
+WAREHOUSE_SENDER_DOMAINS = []   # placeholder — real domains pending Premier's sample data (checklist #5)
+FREIGHT_SENDER_DOMAINS = []
+VENDOR_CONFIRMATION_DOMAINS = []
+PO_TOKEN_REGEX = r"\bPO\s?#?\s?(\d{5,7})\b"
+
+# --- Stage 2: Accumulate -------------------------------------------------
+
+HOLD_GRACE_PERIOD_HOURS = 48
+STALE_HOLD_THRESHOLD_DAYS = 14   # shared with Stage 7's stale-hold sweep
+
+# --- Stage 3: Extract -----------------------------------------------------
+
+COLUMN_SYNONYMS = {
+    "po_number": ["PO", "Purchase Order", "PO#", "PO Number"],
+    "spec_code": ["Spec", "Spec#", "Item Number", "Item#", "Product Number"],
+    "item_description": ["Description", "Item Description", "Product"],
+    "quantity_received": ["Qty", "Quantity", "Qty Shipped", "Qty Received"],
+    "unit_of_measure": ["UOM", "Unit", "Type"],
+    "vendor_name": ["Vendor", "Supplier"],
+}
+HEADER_MATCH_THRESHOLD = 85   # RapidFuzz ratio, 0-100 — fuzzy header matching against COLUMN_SYNONYMS
+SPEC_TOKEN_REGEX = r"\b([A-Z]{2,4}-\d{2,4}(?:-[A-Z]{1,4})?)\b"
+QTY_TOKEN_REGEX = r"\b(\d+)\s*(?:of|/)\s*(\d+)\b"
+
+ENABLE_AI_FALLBACK = False   # checklist #1b — off until Premier explicitly permits Claude on real content
+ANTHROPIC_MODEL = "claude-sonnet-5"
+AI_FALLBACK_CONFIDENCE_CAP = 0.5
+
+AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP = 0.85
+AZURE_OCR_RETRY_COUNT = 1
+AZURE_OCR_RETRY_BACKOFF_SECONDS = 2
+AZURE_DOC_INTELLIGENCE_ENDPOINT = None   # real value pending Azure resource provisioning
+AZURE_DOC_INTELLIGENCE_KEY = None        # store in Key Vault once real infra exists — never hardcode
+
+# --- Stage 4: Reconcile & Match --------------------------------------------
+
+DESC_MATCH_THRESHOLD = 80   # RapidFuzz token_sort_ratio, 0-100
+MATERIAL_COST_CODE_PREFIX = "1"   # shared with Stage 5
+
+# --- Stage 5: Verify ---------------------------------------------------------
+
+CBD_ADR_RECEIPT_WINDOW_DAYS = 30
+
+# --- Stage 6: Build & Log -------------------------------------------------
+
+STAGED_BY_USER = "CC-Automation"
+
+# --- Orchestrators ------------------------------------------------------------
+
+INGEST_ORCHESTRATOR_INTERVAL_MINUTES = 20   # our own default, not yet validated against real volume
+MATCH_ORCHESTRATOR_SCHEDULE = "daily"        # or "on_demand"
