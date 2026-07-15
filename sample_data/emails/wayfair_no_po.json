@@ -1,0 +1,10 @@
+{
+  "email_id": "msg-wayfair-delivery-day",
+  "received_at": "2026-06-10T09:00:00Z",
+  "sender_address": "marketing@wayfair.com",
+  "sender_domain": "wayfair.com",
+  "subject": "It's delivery day!",
+  "body_html": null,
+  "body_text": "Great news — your Wayfair order is arriving today. Track your package for updates.",
+  "attachments": []
+}

@@ -14,10 +14,13 @@ SPITFIRE_MOCK_DB_PATH = STATE_DIR / "mock_spitfire.sqlite3"
 
 # --- Stage 1: Ingest & Triage -------------------------------------------
 
-WAREHOUSE_SENDER_DOMAINS = []   # placeholder — real domains pending Premier's sample data (checklist #5)
-FREIGHT_SENDER_DOMAINS = []
-VENDOR_CONFIRMATION_DOMAINS = []
+WAREHOUSE_SENDER_DOMAINS = ["authoritylogistics.com", "hospitalitylogistics.com", "atlaslogistics.com"]
+FREIGHT_SENDER_DOMAINS = ["fedex.com", "ups.com", "dhl.com", "rxo.com", "oldominion.com"]
+VENDOR_CONFIRMATION_DOMAINS = ["pbhhospitality.com", "coraseal.com"]
+# ^ realistic placeholders matching the vendors/carriers named in the discovery docs — swap for
+# Premier's real domain lists once real samples arrive (checklist #5); nothing else needs to change.
 PO_TOKEN_REGEX = r"\bPO\s?#?\s?(\d{5,7})\b"
+PROPERTY_REPLY_MAX_WORDS = 200   # heuristic: a short reply, not a structured table -> likely a property confirmation
 
 # --- Stage 2: Accumulate -------------------------------------------------
 
