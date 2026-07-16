@@ -4,3 +4,4 @@ pdfplumber
 rapidfuzz
 openpyxl
 pytest
+pytesseract  # local, dev-time OCR for generating realistic test fixtures — NOT the production OCR path (that's Azure AI Document Intelligence, per Premier's confirmation)
