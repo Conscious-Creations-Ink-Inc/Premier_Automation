@@ -1,4 +1,5 @@
 import io
+import os
 
 import pytest
 from openpyxl import Workbook
@@ -6,13 +7,21 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
+from config import settings
 from pipeline.stage3_extract import ai_fallback
 from pipeline.stage3_extract.base import ExtractionSource, PartialFields
 from pipeline.stage3_extract.excel_adapter import EXCEL_CONTENT_TYPE, ExcelAdapter
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 from pipeline.stage3_extract.html_adapter import HtmlAdapter
-from pipeline.stage3_extract.ocr_adapter import MockDocumentIntelligenceClient, OcrAdapter, OcrResult
+from pipeline.stage3_extract.ocr_adapter import (
+    MockDocumentIntelligenceClient,
+    OcrAdapter,
+    OcrResult,
+    TesseractDocumentIntelligenceClient,
+)
 from pipeline.stage3_extract.pdf_adapter import PdfAdapter
+
+TESSERACT_AVAILABLE = os.path.exists(settings.TESSERACT_CMD_PATH)
 
 
 def source(**overrides):
@@ -154,6 +163,42 @@ def test_ocr_client_failure_both_attempts_logs_service_unavailable():
     assert len(records) == 1
     assert records[0].comments == "OCR service unavailable"
     assert records[0].extraction_confidence == 0.0
+
+
+# --- OcrAdapter (real Tesseract client, dev/test convenience only) -----------
+
+def make_pod_image_bytes(lines, font_size=28):
+    from PIL import Image, ImageDraw, ImageFont
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except OSError:
+        font = ImageFont.load_default()
+    img = Image.new("RGB", (900, 80 + 60 * len(lines)), color="white")
+    draw = ImageDraw.Draw(img)
+    for i, line in enumerate(lines):
+        draw.text((20, 20 + 60 * i), line, fill="black", font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.mark.skipif(not TESSERACT_AVAILABLE, reason="Tesseract not installed on this machine")
+def test_tesseract_client_reads_a_real_rendered_image():
+    # Local Tesseract has no table-structure detection (see ocr_adapter.py), so a clean POD
+    # photo falls through OCR -> raw text -> FreetextAdapter, same as a real photographed
+    # delivery note would. This is a dev/test convenience, never the production OCR path
+    # (that's Azure Document Intelligence, RealDocumentIntelligenceClient) — see STAGE_3_EXTRACT.md.
+    image_bytes = make_pod_image_bytes(["Delivery Confirmation", "PO 213987", "Spec LI-12", "Qty received: 1"])
+    source = ExtractionSource(
+        source_email_id="msg-ocr-tesseract", email_date="2026-06-08T14:00:00Z",
+        source_type="attachment", content_type="image/png", content_bytes=image_bytes,
+    )
+    records = OcrAdapter(client=TesseractDocumentIntelligenceClient()).extract(source)
+    assert len(records) == 1
+    r = records[0]
+    assert r.po_number == "213987"
+    assert r.spec_code == "LI-12"
+    assert r.extraction_source == "ocr"
 
 
 # --- ExcelAdapter ------------------------------------------------------------
