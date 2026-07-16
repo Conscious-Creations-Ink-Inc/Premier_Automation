@@ -6,6 +6,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SAMPLE_DATA_DIR = BASE_DIR / "sample_data"
 SAMPLE_EMAILS_DIR = SAMPLE_DATA_DIR / "emails"
+SAMPLE_ATTACHMENTS_DIR = SAMPLE_DATA_DIR / "attachments"
 PO_LINES_SEED_FILE = SAMPLE_DATA_DIR / "po_lines.json"
 
 STATE_DIR = BASE_DIR / "state"
@@ -35,7 +36,7 @@ COLUMN_SYNONYMS = {
     "po_number": ["PO", "Purchase Order", "PO#", "PO Number"],
     "spec_code": ["Spec", "Spec#", "Item Number", "Item#", "Product Number"],
     "item_description": ["Description", "Item Description", "Product"],
-    "quantity_received": ["Qty", "Quantity", "Qty Shipped", "Qty Received"],
+    "quantity_received": ["Qty", "Quantity", "Qty Shipped", "Qty Received", "Qty Rcvd"],
     "unit_of_measure": ["UOM", "Unit", "Type"],
     "vendor_name": ["Vendor", "Supplier"],
 }
@@ -52,6 +53,8 @@ AZURE_OCR_RETRY_COUNT = 1
 AZURE_OCR_RETRY_BACKOFF_SECONDS = 2
 AZURE_DOC_INTELLIGENCE_ENDPOINT = None   # real value pending Azure resource provisioning
 AZURE_DOC_INTELLIGENCE_KEY = None        # store in Key Vault once real infra exists — never hardcode
+
+TESSERACT_CMD_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # dev/test OCR only — see STAGE_3_EXTRACT.md
 
 # --- Stage 4: Reconcile & Match --------------------------------------------
 
