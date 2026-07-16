@@ -36,6 +36,33 @@ def get_connection(db_path=PIPELINE_STATE_DB_PATH) -> sqlite3.Connection:
             PRIMARY KEY (po_number, shipment_number)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS extracted_records (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_email_id       TEXT NOT NULL,
+            po_number             TEXT,
+            shipment_number       TEXT,
+            spec_code             TEXT,
+            parent_spec_code      TEXT,
+            sub_spec_suffix       TEXT,
+            item_description      TEXT,
+            vendor_name           TEXT,
+            carrier_name          TEXT,
+            tracking_number       TEXT,
+            quantity_received     REAL,
+            unit_of_measure       TEXT,
+            pod_stated_date       TEXT,
+            email_date            TEXT NOT NULL,
+            delivery_location     TEXT,
+            comments              TEXT,
+            extraction_source     TEXT NOT NULL,
+            extraction_confidence REAL NOT NULL,
+            raw_snippet           TEXT,
+            status                TEXT NOT NULL DEFAULT 'pending',
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT
+        )
+    """)
     conn.commit()
     return conn
 
