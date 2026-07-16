@@ -11,6 +11,7 @@ from config import settings
 from pipeline.models import Attachment, RawEmail
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_WELL_KNOWN_FOLDERS = {"inbox", "drafts", "sentitems", "deleteditems", "archive", "junkemail", "outbox"}
 
 
 class Mailbox(ABC):
@@ -98,6 +99,7 @@ class GraphMailbox(Mailbox):
             authority=settings.GRAPH_AUTHORITY_TEMPLATE.format(tenant_id=self.tenant_id),
             client_credential=self.client_secret,
         )
+        self._folder_id_cache: dict = {}  # display name -> resolved folder id, so repeated moves don't re-lookup
 
     def _access_token(self) -> str:
         result = self._app.acquire_token_silent(settings.GRAPH_SCOPE, account=None)
@@ -151,10 +153,33 @@ class GraphMailbox(Mailbox):
                 ))
         return attachments
 
+    def _resolve_folder_id(self, folder_name: str, headers: dict) -> str:
+        """Graph's /move endpoint only accepts a well-known folder name (inbox, archive, ...) or
+        a real folder id — never an arbitrary display name. Custom folders (Hidden, Routed,
+        Processed, Errors) must be looked up by displayName, and created the first time if they
+        don't exist yet. Cached per-instance so a batch of moves only looks each one up once."""
+        if folder_name.lower() in GRAPH_WELL_KNOWN_FOLDERS:
+            return folder_name
+        if folder_name in self._folder_id_cache:
+            return self._folder_id_cache[folder_name]
+
+        url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/mailFolders"
+        resp = requests.get(url, headers=headers, params={"$filter": f"displayName eq '{folder_name}'"}, timeout=30)
+        resp.raise_for_status()
+        matches = resp.json().get("value", [])
+        if matches:
+            folder_id = matches[0]["id"]
+        else:
+            create_resp = requests.post(url, headers=headers, json={"displayName": folder_name}, timeout=30)
+            create_resp.raise_for_status()
+            folder_id = create_resp.json()["id"]
+
+        self._folder_id_cache[folder_name] = folder_id
+        return folder_id
+
     def mark_processed(self, email_id: str, folder: str) -> None:
-        # `folder` is a Graph well-known folder name (e.g. "archive", "deleteditems") or a real
-        # folder id. Resolving Premier's actual processed-mail folder structure is still pending
-        # real mailbox access — see JOE_FOLLOWUPS_CHECKLIST.md item #4.
+        headers = self._headers()
+        destination_id = self._resolve_folder_id(folder, headers)
         url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages/{email_id}/move"
-        resp = requests.post(url, headers=self._headers(), json={"destinationId": folder}, timeout=30)
+        resp = requests.post(url, headers=headers, json={"destinationId": destination_id}, timeout=30)
         resp.raise_for_status()

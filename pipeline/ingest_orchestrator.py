@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from config import settings
 from connectors.mailbox import Mailbox
 from pipeline import extracted_records_store, stage2_accumulate, state_db
 from pipeline.models import DeliveryEvent, ExtractedRecord, TriageCategory
@@ -20,6 +21,16 @@ def _log(message: str) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _mark_processed_safely(mailbox: Mailbox, email_id: str, folder: str) -> None:
+    """A folder-move failure (transient Graph hiccup, etc.) must never crash the run — the email
+    is already durably captured in our own state by the time this is called; worst case it just
+    sits in Inbox and gets looked at again next poll (seen_message_ids still skips reprocessing it)."""
+    try:
+        mailbox.mark_processed(email_id, folder)
+    except Exception as e:
+        _log(f"failed to move {email_id} to '{folder}': {e}")
 
 
 def build_default_adapters(ocr_client: Optional[DocumentIntelligenceClient] = None) -> List[ExtractionAdapter]:
@@ -116,12 +127,17 @@ def process_new_mail(
                 triaged = triage(email)
                 if triaged.category == TriageCategory.ROUTE:
                     _log(f"routed, no accumulation: {email.email_id} — {triaged.reason}")
+                    _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_ROUTED)
                     continue
                 if triaged.category == TriageCategory.HIDE:
-                    continue  # discarded — Stage 1's job is done, nothing more happens with it
+                    # discarded — Stage 1's job is done, nothing more happens with it
+                    _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_HIDDEN)
+                    continue
                 released_events.extend(stage2_accumulate.process_triaged_email(conn, triaged, _now_iso()))
+                _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_PROCESSED)
             except Exception as e:
                 _log(f"failed to triage/accumulate {email.email_id}: {e}")
+                _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_ERRORS)
                 continue
 
         released_events.extend(stage2_accumulate.sweep_stale_holds(conn, datetime.now(timezone.utc)))

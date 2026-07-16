@@ -10,12 +10,13 @@ from tests.test_extract import make_pdf_bytes
 class FakeMailbox(Mailbox):
     def __init__(self, emails: List[RawEmail]):
         self._emails = emails
+        self.processed_calls: List[tuple] = []
 
     def fetch_new(self) -> List[RawEmail]:
         return self._emails
 
     def mark_processed(self, email_id: str, folder: str) -> None:
-        pass
+        self.processed_calls.append((email_id, folder))
 
 
 def make_email(**overrides):
@@ -49,11 +50,13 @@ def test_clean_warehouse_delivery_staged_end_to_end():
         body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>213987</td><td>LI-12</td><td>1</td></tr></table>",
     )
     c = new_conn()
-    count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
+    mailbox = FakeMailbox([email])
+    count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
     assert count == 1
     records = pending_records(c)
     assert records[0].po_number == "213987"
     assert records[0].spec_code == "LI-12"
+    assert mailbox.processed_calls == [("msg-warehouse-1", "Processed")]
 
 
 def test_no_po_email_is_routed_and_nothing_staged():
@@ -63,9 +66,53 @@ def test_no_po_email_is_routed_and_nothing_staged():
         subject="It's delivery day!", body_text="Your order is arriving today.",
     )
     c = new_conn()
-    count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
+    mailbox = FakeMailbox([email])
+    count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
     assert count == 0
     assert pending_records(c) == []
+    assert mailbox.processed_calls == [("msg-wayfair-1", "Routed")]
+
+
+def test_freight_status_email_is_hidden_and_moved_to_hidden_folder():
+    email = make_email(
+        email_id="msg-fedex-1",
+        sender_address="tracking@fedex.com", sender_domain="fedex.com",
+        subject="Your package has shipped", body_text="Your package has been shipped and is on its way.",
+    )
+    c = new_conn()
+    mailbox = FakeMailbox([email])
+    count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
+    assert count == 0
+    assert pending_records(c) == []
+    assert mailbox.processed_calls == [("msg-fedex-1", "Hidden")]
+
+
+def test_triage_failure_moves_email_to_errors_folder(monkeypatch):
+    email = make_email(email_id="msg-broken-1")
+    monkeypatch.setattr(ingest_orchestrator, "triage", lambda e: (_ for _ in ()).throw(ValueError("boom")))
+    c = new_conn()
+    mailbox = FakeMailbox([email])
+    count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
+    assert count == 0
+    assert mailbox.processed_calls == [("msg-broken-1", "Errors")]
+
+
+def test_mailbox_move_failure_does_not_crash_the_run(monkeypatch):
+    email = make_email(
+        email_id="msg-warehouse-2",
+        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
+        subject="Inbound - PO 213987",
+        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>213987</td><td>LI-12</td><td>1</td></tr></table>",
+    )
+
+    class FlakyMailbox(FakeMailbox):
+        def mark_processed(self, email_id, folder):
+            raise RuntimeError("simulated Graph API hiccup")
+
+    c = new_conn()
+    count = ingest_orchestrator.process_new_mail(FlakyMailbox([email]), conn=c)
+    assert count == 1
+    assert pending_records(c)[0].po_number == "213987"
 
 
 def test_same_delivery_in_body_and_attachment_deduplicates_to_one():

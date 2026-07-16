@@ -73,6 +73,16 @@ CBD_ADR_RECEIPT_WINDOW_DAYS = 30
 
 STAGED_BY_USER = "CC-Automation"
 
+# --- Mailbox folder routing (post-processing organization, both connectors) --
+# Every email process_new_mail finishes with gets moved out of Inbox into one of these, so the
+# Inbox only ever holds genuinely new/unprocessed mail and a human can audit any category by
+# looking at the folder — see ORCHESTRATOR_DESIGN.md's "every decision traceable" principle.
+
+MAILBOX_FOLDER_HIDDEN = "Hidden"        # TriageCategory.HIDE — pure noise, correctly discarded
+MAILBOX_FOLDER_ROUTED = "Routed"        # TriageCategory.ROUTE — sent to the human exception queue
+MAILBOX_FOLDER_PROCESSED = "Processed"  # SURFACE/HOLD — captured into our own state, safe to move
+MAILBOX_FOLDER_ERRORS = "Errors"        # triage/accumulate raised — needs a human look, never retried silently forever
+
 # --- Graph API (real mailbox connector) --------------------------------------
 
 GRAPH_TENANT_ID = os.getenv("GRAPH_TENANT_ID")
