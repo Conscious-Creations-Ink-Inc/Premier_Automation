@@ -1,9 +1,16 @@
+import base64
 import json
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
+import msal
+import requests
+
+from config import settings
 from pipeline.models import Attachment, RawEmail
+
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 
 class Mailbox(ABC):
@@ -58,22 +65,96 @@ class LocalFolderMailbox(Mailbox):
 
 
 class GraphMailbox(Mailbox):
-    """Real Microsoft Graph API connector — not implemented until Premier grants mailbox access.
+    """Real Microsoft Graph API connector (client-credentials / app-only auth).
 
     Needs: an Azure AD app registration scoped to the receiving mailbox, Mail.Read + Mail.ReadWrite
-    application permissions with admin consent, and an Application Access Policy restricting this
-    app to only the one mailbox. See BuildPlan/STAGE_1_INGEST_AND_TRIAGE.md and
-    ourDocs/JOE_FOLLOWUPS_CHECKLIST.md item #4.
+    application permissions with admin consent, and — before pointing this at Premier's real
+    mailbox — an Application Access Policy restricting this app to only the one mailbox (not yet
+    in place for the test tenant; see BuildPlan/STAGE_1_INGEST_AND_TRIAGE.md and
+    ourDocs/JOE_FOLLOWUPS_CHECKLIST.md item #4).
     """
 
-    def __init__(self, tenant_id: str, client_id: str, client_secret: str, mailbox_address: str):
-        raise NotImplementedError(
-            "GraphMailbox requires real Graph API credentials and an Application Access Policy "
-            "scoping this app to the receiving mailbox — see JOE_FOLLOWUPS_CHECKLIST.md #4."
+    def __init__(
+        self,
+        tenant_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        mailbox_address: Optional[str] = None,
+    ):
+        self.tenant_id = tenant_id or settings.GRAPH_TENANT_ID
+        self.client_id = client_id or settings.GRAPH_CLIENT_ID
+        self.client_secret = client_secret or settings.GRAPH_CLIENT_SECRET
+        self.mailbox_address = mailbox_address or settings.GRAPH_MAILBOX_ADDRESS
+        missing = [
+            name for name, value in [
+                ("tenant_id", self.tenant_id), ("client_id", self.client_id),
+                ("client_secret", self.client_secret), ("mailbox_address", self.mailbox_address),
+            ] if not value
+        ]
+        if missing:
+            raise ValueError(f"GraphMailbox is missing required config: {', '.join(missing)} (check .env)")
+        self._app = msal.ConfidentialClientApplication(
+            self.client_id,
+            authority=settings.GRAPH_AUTHORITY_TEMPLATE.format(tenant_id=self.tenant_id),
+            client_credential=self.client_secret,
         )
 
+    def _access_token(self) -> str:
+        result = self._app.acquire_token_silent(settings.GRAPH_SCOPE, account=None)
+        if not result:
+            result = self._app.acquire_token_for_client(scopes=settings.GRAPH_SCOPE)
+        if "access_token" not in result:
+            raise RuntimeError(
+                f"Graph API auth failed: {result.get('error')}: {result.get('error_description')}"
+            )
+        return result["access_token"]
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self._access_token()}"}
+
     def fetch_new(self) -> List[RawEmail]:
-        raise NotImplementedError
+        headers = self._headers()
+        url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/mailFolders/Inbox/messages"
+        params = {"$top": 50, "$select": "id,receivedDateTime,subject,from,body,hasAttachments"}
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        return [self._to_raw_email(msg, headers) for msg in resp.json().get("value", [])]
+
+    def _to_raw_email(self, msg: dict, headers: dict) -> RawEmail:
+        sender_address = msg.get("from", {}).get("emailAddress", {}).get("address", "") or ""
+        body = msg.get("body", {})
+        body_content = body.get("content")
+        is_html = body.get("contentType") == "html"
+        attachments = self._fetch_attachments(msg["id"], headers) if msg.get("hasAttachments") else []
+        return RawEmail(
+            email_id=msg["id"],
+            received_at=msg["receivedDateTime"],
+            sender_address=sender_address,
+            sender_domain=sender_address.split("@")[-1] if "@" in sender_address else "",
+            subject=msg.get("subject", ""),
+            body_html=body_content if is_html else None,
+            body_text=body_content if not is_html else None,
+            attachments=attachments,
+        )
+
+    def _fetch_attachments(self, message_id: str, headers: dict) -> List[Attachment]:
+        url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages/{message_id}/attachments"
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        attachments = []
+        for att in resp.json().get("value", []):
+            if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
+                attachments.append(Attachment(
+                    filename=att["name"],
+                    content_type=att.get("contentType", "application/octet-stream"),
+                    content_bytes=base64.b64decode(att["contentBytes"]),
+                ))
+        return attachments
 
     def mark_processed(self, email_id: str, folder: str) -> None:
-        raise NotImplementedError
+        # `folder` is a Graph well-known folder name (e.g. "archive", "deleteditems") or a real
+        # folder id. Resolving Premier's actual processed-mail folder structure is still pending
+        # real mailbox access — see JOE_FOLLOWUPS_CHECKLIST.md item #4.
+        url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages/{email_id}/move"
+        resp = requests.post(url, headers=self._headers(), json={"destinationId": folder}, timeout=30)
+        resp.raise_for_status()

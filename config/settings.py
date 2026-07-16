@@ -1,6 +1,10 @@
+import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 # --- Paths -------------------------------------------------------------
 
@@ -68,6 +72,15 @@ CBD_ADR_RECEIPT_WINDOW_DAYS = 30
 # --- Stage 6: Build & Log -------------------------------------------------
 
 STAGED_BY_USER = "CC-Automation"
+
+# --- Graph API (real mailbox connector) --------------------------------------
+
+GRAPH_TENANT_ID = os.getenv("GRAPH_TENANT_ID")
+GRAPH_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
+GRAPH_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
+GRAPH_MAILBOX_ADDRESS = os.getenv("GRAPH_MAILBOX_ADDRESS")  # still pending from Premier/test tenant setup
+GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]   # app-only permissions, consented on the app registration
+GRAPH_AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
 
 # --- Orchestrators ------------------------------------------------------------
 
