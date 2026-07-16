@@ -131,6 +131,28 @@ def test_rule0_wins_over_rule1_even_with_a_table_present():
     assert result.category == TriageCategory.ROUTE
 
 
+def test_shipment_number_extracted_when_present():
+    email = make_email(
+        sender_address="notify@authoritylogistics.com",
+        sender_domain="authoritylogistics.com",
+        subject="Inbound Confirmation - shipment 50052 / PO 208491",
+        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>208491</td><td>LI-1</td><td>1</td></tr></table>",
+    )
+    result = triage(email)
+    assert result.extracted_shipment_hint == "50052"
+
+
+def test_shipment_number_none_when_absent():
+    email = make_email(
+        sender_address="gm@hgivirginiabeach-example.com",
+        sender_domain="hgivirginiabeach-example.com",
+        subject="RE: PO 212448 confirmation",
+        body_text="Yes, we received it, thanks.",
+    )
+    result = triage(email)
+    assert result.extracted_shipment_hint is None
+
+
 def test_two_po_numbers_in_one_table_both_captured():
     email = make_email(
         sender_address="notify@atlaslogistics.com",

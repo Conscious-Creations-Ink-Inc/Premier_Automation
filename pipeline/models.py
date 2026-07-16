@@ -48,6 +48,7 @@ class TriagedEmail:
     category: TriageCategory
     matched_rule: str
     extracted_po_hints: List[str]
+    extracted_shipment_hint: Optional[str] = None   # None for property/vendor confirmations — no shipment number
     reason: str = ""
 
 
