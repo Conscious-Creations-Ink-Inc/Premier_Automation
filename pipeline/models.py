@@ -11,6 +11,7 @@ class NotificationType(str, Enum):
     INBOUND_NOTIFICATION = "inbound_notification"
     PROPERTY_CONFIRMATION = "property_confirmation"
     VENDOR_CONFIRMATION = "vendor_confirmation"
+    ORDER_CANCELLATION = "order_cancellation"
     UNKNOWN = "unknown"
 
 

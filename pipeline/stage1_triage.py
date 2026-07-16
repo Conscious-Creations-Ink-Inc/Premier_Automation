@@ -9,6 +9,7 @@ from pipeline.models import NotificationType, RawEmail, TriageCategory, TriagedE
 PO_TOKEN_RE = re.compile(settings.PO_TOKEN_REGEX)
 STATUS_WORDS_RE = re.compile(r"\b(delivered|shipped|picked up)\b", re.IGNORECASE)
 INVENTORY_WORDS_RE = re.compile(r"\b(inventory|warehouse receipt)\b", re.IGNORECASE)
+CANCELLATION_RE = re.compile(settings.CANCELLATION_KEYWORDS_REGEX, re.IGNORECASE)
 
 
 def _extract_po_hints(email: RawEmail) -> List[str]:
@@ -47,6 +48,14 @@ def triage(email: RawEmail) -> TriagedEmail:
     """
     po_hints = _extract_po_hints(email)
     combined_text = " ".join(t for t in [email.subject, email.body_text] if t)
+
+    if CANCELLATION_RE.search(combined_text):
+        return TriagedEmail(
+            email=email, notification_type=NotificationType.ORDER_CANCELLATION,
+            category=TriageCategory.ROUTE, matched_rule="rule_0_order_cancellation",
+            extracted_po_hints=po_hints,
+            reason="order cancellation notice — requires manual PO update in Spitfire, not a delivery event",
+        )
 
     if email.sender_domain in settings.WAREHOUSE_SENDER_DOMAINS and _has_table(email.body_html):
         return TriagedEmail(

@@ -104,6 +104,33 @@ def test_rule6_no_po_reference_is_routed():
     assert result.extracted_po_hints == []
 
 
+def test_rule0_cancellation_is_routed_regardless_of_sender():
+    email = make_email(
+        sender_address="notify@authoritylogistics.com",
+        sender_domain="authoritylogistics.com",
+        subject="Please cancel PO 213987 — no longer required",
+        body_text="This order has been cancelled and is no longer required.",
+    )
+    result = triage(email)
+    assert result.notification_type == NotificationType.ORDER_CANCELLATION
+    assert result.category == TriageCategory.ROUTE
+    assert result.matched_rule == "rule_0_order_cancellation"
+    assert "manual PO update" in result.reason
+
+
+def test_rule0_wins_over_rule1_even_with_a_table_present():
+    email = make_email(
+        sender_address="notify@atlaslogistics.com",
+        sender_domain="atlaslogistics.com",
+        subject="Cancellation notice for PO 208491",
+        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>208491</td><td>LI-1</td><td>1</td></tr></table>",
+        body_text="This shipment is cancelled, void, please disregard.",
+    )
+    result = triage(email)
+    assert result.notification_type == NotificationType.ORDER_CANCELLATION
+    assert result.category == TriageCategory.ROUTE
+
+
 def test_two_po_numbers_in_one_table_both_captured():
     email = make_email(
         sender_address="notify@atlaslogistics.com",
