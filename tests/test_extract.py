@@ -1,15 +1,18 @@
 import io
 import os
 
+import docx
 import pytest
 from openpyxl import Workbook
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
+from reportlab.platypus import Image as PdfImage
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
 from config import settings
 from pipeline.stage3_extract import ai_fallback
 from pipeline.stage3_extract.base import ExtractionSource, PartialFields
+from pipeline.stage3_extract.docx_adapter import DOCX_CONTENT_TYPE, DocxAdapter
 from pipeline.stage3_extract.excel_adapter import EXCEL_CONTENT_TYPE, ExcelAdapter
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 from pipeline.stage3_extract.html_adapter import HtmlAdapter
@@ -19,7 +22,7 @@ from pipeline.stage3_extract.ocr_adapter import (
     OcrResult,
     TesseractDocumentIntelligenceClient,
 )
-from pipeline.stage3_extract.pdf_adapter import PdfAdapter
+from pipeline.stage3_extract.pdf_adapter import PdfAdapter, _has_text_layer
 
 TESSERACT_AVAILABLE = os.path.exists(settings.TESSERACT_CMD_PATH)
 
@@ -36,6 +39,43 @@ def make_pdf_bytes(rows):
     table = Table(rows)
     table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.black)]))
     doc.build([table])
+    return buf.getvalue()
+
+
+def make_pdf_with_embedded_image_bytes(image_bytes, width=400, height=200):
+    """A PDF with a raster image drawn on the page and no real text layer — the 'photographed
+    POD saved/printed as PDF' shape, as opposed to make_pdf_bytes' native vector-text table."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter)
+    doc.build([PdfImage(io.BytesIO(image_bytes), width=width, height=height)])
+    return buf.getvalue()
+
+
+def make_docx_table_bytes(rows):
+    document = docx.Document()
+    table = document.add_table(rows=len(rows), cols=len(rows[0]))
+    for i, row in enumerate(rows):
+        for j, cell_text in enumerate(row):
+            table.cell(i, j).text = str(cell_text)
+    buf = io.BytesIO()
+    document.save(buf)
+    return buf.getvalue()
+
+
+def make_docx_with_image_bytes(image_bytes, paragraph_text="Delivery photo attached"):
+    document = docx.Document()
+    document.add_paragraph(paragraph_text)
+    document.add_picture(io.BytesIO(image_bytes))
+    buf = io.BytesIO()
+    document.save(buf)
+    return buf.getvalue()
+
+
+def make_docx_text_bytes(text):
+    document = docx.Document()
+    document.add_paragraph(text)
+    buf = io.BytesIO()
+    document.save(buf)
     return buf.getvalue()
 
 
@@ -199,6 +239,92 @@ def test_tesseract_client_reads_a_real_rendered_image():
     assert r.po_number == "213987"
     assert r.spec_code == "LI-12"
     assert r.extraction_source == "ocr"
+
+
+@pytest.mark.skipif(not TESSERACT_AVAILABLE, reason="Tesseract not installed on this machine")
+def test_tesseract_client_reads_a_scanned_pdf_via_rasterization():
+    # A "photographed POD saved as PDF" (real dummy test samples arrived in exactly this shape:
+    # a raster image dropped onto a page, no vector text) has no text layer, so PdfAdapter
+    # correctly declines it and OcrAdapter takes over — but the raw PDF bytes aren't an image
+    # pytesseract/PIL can open directly, so the client must rasterize each page first.
+    image_bytes = make_pod_image_bytes(["Delivery Confirmation", "PO 213987", "Spec LI-12", "Qty received: 1"])
+    pdf_bytes = make_pdf_with_embedded_image_bytes(image_bytes)
+    assert not _has_text_layer(pdf_bytes)
+
+    records = OcrAdapter(client=TesseractDocumentIntelligenceClient()).extract(
+        source(source_type="attachment", content_type="application/pdf", content_bytes=pdf_bytes)
+    )
+    assert len(records) == 1
+    r = records[0]
+    assert r.po_number == "213987"
+    assert r.spec_code == "LI-12"
+    assert r.extraction_source == "ocr"
+
+
+# --- DocxAdapter (real Word-doc format, found via real dummy test samples) ---
+
+def test_docx_native_table_extraction():
+    docx_bytes = make_docx_table_bytes([["PO", "Spec", "Qty"], ["213987", "LI-12", "1"]])
+    records = DocxAdapter().extract(
+        source(source_type="attachment", content_type=DOCX_CONTENT_TYPE, content_bytes=docx_bytes)
+    )
+    assert len(records) == 1
+    r = records[0]
+    assert r.po_number == "213987"
+    assert r.spec_code == "LI-12"
+    assert r.quantity_received == 1.0
+    assert r.extraction_source == "docx"
+
+
+def test_docx_embedded_image_routes_through_mock_ocr():
+    # A photographed POD pasted directly into a Word doc — the shape every real docx sample
+    # turned out to be. The image's own content doesn't matter here (the mock client ignores
+    # it), only that python-docx can embed and later recover a real image from word/media/.
+    image_bytes = make_pod_image_bytes(["irrelevant to the mock"])
+    docx_bytes = make_docx_with_image_bytes(image_bytes)
+    fixture = OcrResult(tables=[[["PO", "Spec", "Qty"], ["208491", "LI-1", "2"]]])
+
+    records = DocxAdapter(ocr_client=MockDocumentIntelligenceClient(fixture=fixture)).extract(
+        source(source_type="attachment", content_type=DOCX_CONTENT_TYPE, content_bytes=docx_bytes)
+    )
+    assert len(records) == 1
+    assert records[0].po_number == "208491"
+    assert records[0].extraction_source == "docx"
+
+
+def test_docx_plain_text_fallback_when_no_table_or_image():
+    docx_bytes = make_docx_text_bytes("the mirrors arrived today, PO 212448")
+    records = DocxAdapter().extract(
+        source(source_type="attachment", content_type=DOCX_CONTENT_TYPE, content_bytes=docx_bytes)
+    )
+    assert len(records) == 1
+    assert records[0].po_number == "212448"
+    assert records[0].extraction_source == "docx"
+
+
+@pytest.mark.skipif(not TESSERACT_AVAILABLE, reason="Tesseract not installed on this machine")
+def test_docx_embedded_image_via_real_tesseract():
+    image_bytes = make_pod_image_bytes(["Delivery Confirmation", "PO 213987", "Spec LI-12", "Qty received: 1"])
+    docx_bytes = make_docx_with_image_bytes(image_bytes)
+    records = DocxAdapter(ocr_client=TesseractDocumentIntelligenceClient()).extract(
+        source(source_type="attachment", content_type=DOCX_CONTENT_TYPE, content_bytes=docx_bytes)
+    )
+    assert len(records) == 1
+    r = records[0]
+    assert r.po_number == "213987"
+    assert r.spec_code == "LI-12"
+    assert r.extraction_source == "docx"
+
+
+# --- FreetextAdapter must not claim attachments (see ingest_orchestrator.run_adapters) -------
+
+def test_freetext_adapter_does_not_claim_attachments():
+    # Regression guard: FreetextAdapter used to return can_handle=True unconditionally, so an
+    # attachment type no adapter recognized was silently mislabeled as an empty extraction
+    # (po_number="", extraction_source="freetext") instead of correctly yielding nothing.
+    unrecognized = source(source_type="attachment", content_type="application/zip", content_bytes=b"whatever")
+    assert FreetextAdapter().can_handle(unrecognized) is False
+    assert FreetextAdapter().can_handle(source(body_text="hello")) is True
 
 
 # --- ExcelAdapter ------------------------------------------------------------

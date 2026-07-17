@@ -147,6 +147,21 @@ def test_quantity_conflict_across_sources_keeps_both_flagged():
     assert {r.quantity_received for r in records} == {2.0, 5.0}
 
 
+def test_unrecognized_attachment_type_is_not_staged_as_a_fake_record():
+    # Regression guard for a real bug found via real dummy test documents: an attachment type
+    # no adapter recognizes must be ignored, never staged as a fabricated empty ExtractedRecord.
+    email = make_email(
+        email_id="msg-unknown-attachment-1",
+        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
+        subject="Inbound - PO 213987",
+        attachments=[Attachment(filename="archive.zip", content_type="application/zip", content_bytes=b"whatever")],
+    )
+    c = new_conn()
+    count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
+    assert count == 0
+    assert pending_records(c) == []
+
+
 def test_one_corrupt_attachment_does_not_block_the_others():
     good_pdf = make_pdf_bytes([["PO", "Spec", "Qty"], ["300111", "AB-1", "3"]])
     email = make_email(

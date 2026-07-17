@@ -55,8 +55,22 @@ class TesseractDocumentIntelligenceClient(DocumentIntelligenceClient):
 
     def analyze(self, content_bytes: bytes) -> OcrResult:
         from PIL import Image
-        image = Image.open(io.BytesIO(content_bytes))
-        text = self._pytesseract.image_to_string(image)
+
+        if content_bytes[:4] == b"%PDF":
+            # A scanned/photographed POD saved as PDF has no text layer (that's exactly why
+            # OcrAdapter routed it here — see _has_text_layer) but pdfplumber can still
+            # rasterize each page to a real image for Tesseract, same as Azure Document
+            # Intelligence would read the PDF's pages directly in production.
+            import pdfplumber
+            texts = []
+            with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
+                for page in pdf.pages:
+                    image = page.to_image(resolution=200).original
+                    texts.append(self._pytesseract.image_to_string(image))
+            text = "\n".join(texts)
+        else:
+            image = Image.open(io.BytesIO(content_bytes))
+            text = self._pytesseract.image_to_string(image)
         # Tesseract has no real table-structure detection — deliberately returns no tables,
         # so OcrAdapter correctly falls through to free-text extraction over the raw OCR text,
         # exercising that path with genuinely messy real text instead of a hand-typed stand-in.
@@ -108,44 +122,59 @@ class OcrAdapter(ExtractionAdapter):
         result = self._analyze_with_retry(source.content_bytes, source.source_email_id)
         if result is None:
             return [_empty_ocr_failure_record(source)]
-
-        records = []
-        for table in result.tables:
-            if not table or len(table) < 2:
-                continue
-            column_map = map_headers(table[0])
-            if not column_map:
-                continue
-            for row in table[1:]:
-                records.append(build_record_from_row(source, row, column_map, "ocr"))
-
-        if not records:
-            # Azure/OCR responded fine, it just found no recognizable table — a genuinely
-            # different case from "the service was unavailable," so it must never reuse that
-            # reason. Falls through to free-text regex over whatever raw text exists (often
-            # nothing at all for a true photographed image, per STAGE_3_EXTRACT.md).
-            text_source = ExtractionSource(
-                source_email_id=source.source_email_id, email_date=source.email_date,
-                source_type="body", body_text=result.raw_text,
-            )
-            records = FreetextAdapter().extract(text_source)
-            for r in records:
-                r.extraction_source = "ocr"
-
-        for r in records:
-            r.extraction_confidence = min(r.extraction_confidence, settings.AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP)
-
-        return records
+        return records_from_ocr_result(source, result, extraction_source="ocr")
 
     def _analyze_with_retry(self, content_bytes: bytes, email_id: str) -> Optional[OcrResult]:
-        attempts = settings.AZURE_OCR_RETRY_COUNT + 1
-        for attempt in range(attempts):
-            try:
-                return self.client.analyze(content_bytes)
-            except Exception as e:
-                if attempt < attempts - 1:
-                    time.sleep(settings.AZURE_OCR_RETRY_BACKOFF_SECONDS)
-                    continue
-                _log(f"OCR service unavailable for {email_id} after {attempts} attempts: {e}")
-                return None
-        return None
+        return analyze_with_retry(self.client, content_bytes, email_id)
+
+
+def analyze_with_retry(
+    client: DocumentIntelligenceClient, content_bytes: bytes, email_id: str
+) -> Optional[OcrResult]:
+    """Shared retry wrapper so any adapter that needs to OCR embedded image content (not just
+    OcrAdapter's own direct attachments — see DocxAdapter) gets the same retry/give-up behavior."""
+    attempts = settings.AZURE_OCR_RETRY_COUNT + 1
+    for attempt in range(attempts):
+        try:
+            return client.analyze(content_bytes)
+        except Exception as e:
+            if attempt < attempts - 1:
+                time.sleep(settings.AZURE_OCR_RETRY_BACKOFF_SECONDS)
+                continue
+            _log(f"OCR service unavailable for {email_id} after {attempts} attempts: {e}")
+            return None
+    return None
+
+
+def records_from_ocr_result(
+    source: ExtractionSource, result: OcrResult, extraction_source: str = "ocr"
+) -> List[ExtractedRecord]:
+    """Turns one OcrResult into ExtractedRecords — shared so DocxAdapter's embedded-image path
+    gets identical table/fallback/confidence-cap handling to OcrAdapter's own attachment path."""
+    records = []
+    for table in result.tables:
+        if not table or len(table) < 2:
+            continue
+        column_map = map_headers(table[0])
+        if not column_map:
+            continue
+        for row in table[1:]:
+            records.append(build_record_from_row(source, row, column_map, extraction_source))
+
+    if not records:
+        # Azure/OCR responded fine, it just found no recognizable table — a genuinely
+        # different case from "the service was unavailable," so it must never reuse that
+        # reason. Falls through to free-text regex over whatever raw text exists (often
+        # nothing at all for a true photographed image, per STAGE_3_EXTRACT.md).
+        text_source = ExtractionSource(
+            source_email_id=source.source_email_id, email_date=source.email_date,
+            source_type="body", body_text=result.raw_text,
+        )
+        records = FreetextAdapter().extract(text_source)
+        for r in records:
+            r.extraction_source = extraction_source
+
+    for r in records:
+        r.extraction_confidence = min(r.extraction_confidence, settings.AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP)
+
+    return records

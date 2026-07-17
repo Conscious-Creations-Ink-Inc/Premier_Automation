@@ -8,6 +8,7 @@ from pipeline.models import DeliveryEvent, ExtractedRecord, TriageCategory
 from pipeline.stage1_ingest import fetch_new_emails
 from pipeline.stage1_triage import triage
 from pipeline.stage3_extract.base import ExtractionAdapter, ExtractionSource
+from pipeline.stage3_extract.docx_adapter import DocxAdapter
 from pipeline.stage3_extract.excel_adapter import ExcelAdapter
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 from pipeline.stage3_extract.html_adapter import HtmlAdapter
@@ -34,14 +35,22 @@ def _mark_processed_safely(mailbox: Mailbox, email_id: str, folder: str) -> None
 
 
 def build_default_adapters(ocr_client: Optional[DocumentIntelligenceClient] = None) -> List[ExtractionAdapter]:
-    """The fixed dispatch order from STAGE_3_EXTRACT.md. `ocr_client` lets callers swap in
-    Tesseract or the real Azure client instead of the default fixture-based mock."""
-    return [HtmlAdapter(), PdfAdapter(), OcrAdapter(client=ocr_client), ExcelAdapter(), FreetextAdapter()]
+    """The fixed dispatch order from STAGE_3_EXTRACT.md, extended with DocxAdapter (discovered
+    as a real, plausible attachment format via real dummy test documents — not in the original
+    discovery-doc sample set). `ocr_client` lets callers swap in Tesseract or the real Azure
+    client instead of the default fixture-based mock, for both OcrAdapter and DocxAdapter's own
+    embedded-image fallback."""
+    return [
+        HtmlAdapter(), PdfAdapter(), DocxAdapter(ocr_client=ocr_client),
+        OcrAdapter(client=ocr_client), ExcelAdapter(), FreetextAdapter(),
+    ]
 
 
 def run_adapters(source: ExtractionSource, adapters: Optional[List[ExtractionAdapter]] = None) -> List[ExtractedRecord]:
     """First adapter whose can_handle() returns True wins. One adapter failing is logged and
-    treated as 'found nothing', never lets one bad source abort the rest of the delivery."""
+    treated as 'found nothing', never lets one bad source abort the rest of the delivery.
+    An attachment type no adapter recognizes is also logged, not silently staged as an empty
+    record — see FreetextAdapter, which intentionally does not claim attachments."""
     for adapter in adapters or build_default_adapters():
         try:
             if adapter.can_handle(source):
@@ -49,6 +58,10 @@ def run_adapters(source: ExtractionSource, adapters: Optional[List[ExtractionAda
         except Exception as e:
             _log(f"{adapter.__class__.__name__} failed on {source.source_email_id}: {e}")
             return []
+    _log(
+        f"no adapter recognized source for {source.source_email_id} "
+        f"(source_type={source.source_type}, filename={source.filename}, content_type={source.content_type})"
+    )
     return []
 
 

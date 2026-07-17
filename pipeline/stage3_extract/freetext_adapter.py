@@ -17,10 +17,14 @@ extract_fields_from_text = regex_extract_fields
 
 
 class FreetextAdapter(ExtractionAdapter):
-    """The adapter of last resort — always handles something, even if every field ends up None."""
+    """The adapter of last resort for body content — always handles a body source, even if
+    every field ends up None. Deliberately does NOT claim attachments: it never looks at
+    content_bytes, so an unrecognized attachment type must fall through to nothing (logged
+    by the Ingest Orchestrator) rather than being silently mislabeled as an empty 'freetext'
+    extraction — see ORCHESTRATOR_DESIGN.md's "never guess when uncertain" principle."""
 
     def can_handle(self, source: ExtractionSource) -> bool:
-        return True
+        return source.source_type == "body"
 
     def extract(self, source: ExtractionSource) -> List[ExtractedRecord]:
         text = source.body_text or source.body_html or ""
