@@ -89,6 +89,35 @@ def make_xlsx_bytes(rows):
     return buf.getvalue()
 
 
+# --- Shared regex helpers (base.py) — hardened after real dummy test documents -------------
+
+def test_quantity_regex_does_not_misread_a_date_as_a_fraction():
+    # Regression guard: real PDF samples were browser prints of scanned PODs, and the print
+    # header's date ("7/18/26") was being misread as a quantity fraction ("7 of 18"). A date has
+    # three slash-separated numbers; a real quantity fraction only ever has two.
+    from pipeline.stage3_extract.base import regex_extract_fields
+    assert regex_extract_fields("7/18/26, 1:27 AM").quantity_received is None
+    assert regex_extract_fields("received 11 of 12 chairs").quantity_received == 11.0
+    assert regex_extract_fields("shipped 11/12 units").quantity_received == 11.0
+
+
+def test_spec_regex_matches_a_letter_fused_onto_the_numeric_segment():
+    # Regression guard: real sample raw_sample_03 has spec code "GR-350a-WTF" — a real spec code
+    # whose numeric segment has a trailing letter, which the original digits-only pattern missed.
+    from pipeline.stage3_extract.base import regex_extract_fields
+    assert regex_extract_fields("Main Drapery Fabric GR-350a-WTF POD").spec_code == "GR-350a-WTF"
+    assert regex_extract_fields("spec LI-12, nothing else").spec_code == "LI-12"
+
+
+def test_strip_print_chrome_removes_boilerplate_but_keeps_real_content():
+    from pipeline.stage3_extract.base import strip_print_chrome
+    raw = "7/18/26, 1:27 AM\nfile:///C:/fake/pdf_sample_01.html 1/1\nPO 213987 Spec LI-12 Qty 1"
+    cleaned = strip_print_chrome(raw)
+    assert "7/18/26" not in cleaned
+    assert "file:///" not in cleaned
+    assert "PO 213987 Spec LI-12 Qty 1" in cleaned
+
+
 # --- HtmlAdapter -----------------------------------------------------------
 
 def test_html_clean_warehouse_table_full_confidence():
@@ -140,10 +169,10 @@ def test_pdf_browser_print_chrome_is_not_meaningful_text():
     # the exact shape found in the real samples). That trivial boilerplate was making
     # _has_text_layer wrongly report True, so PdfAdapter grabbed it as "content" instead of
     # correctly declining and routing to OcrAdapter.
-    from pipeline.stage3_extract.pdf_adapter import _is_meaningful_text
+    from pipeline.stage3_extract.base import is_meaningful_text
     chrome_text = "7/18/26, 1:27 AM\nfile:///C:/Users/DELL/AppData/Local/Temp/pwrap/pdf_sample_01.html 1/1"
-    assert not _is_meaningful_text(chrome_text)
-    assert _is_meaningful_text("PO 213987 Spec LI-12 Qty 1")
+    assert not is_meaningful_text(chrome_text)
+    assert is_meaningful_text("PO 213987 Spec LI-12 Qty 1")
 
 
 def test_pdf_with_only_print_chrome_and_an_embedded_image_routes_to_ocr():

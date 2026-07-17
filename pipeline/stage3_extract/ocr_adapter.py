@@ -6,7 +6,13 @@ from typing import List, Optional
 
 from config import settings
 from pipeline.models import ExtractedRecord
-from pipeline.stage3_extract.base import ExtractionAdapter, ExtractionSource, build_record_from_row, map_headers
+from pipeline.stage3_extract.base import (
+    ExtractionAdapter,
+    ExtractionSource,
+    build_record_from_row,
+    map_headers,
+    strip_print_chrome,
+)
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/tiff", "image/bmp"}
@@ -168,7 +174,7 @@ def records_from_ocr_result(
         # nothing at all for a true photographed image, per STAGE_3_EXTRACT.md).
         text_source = ExtractionSource(
             source_email_id=source.source_email_id, email_date=source.email_date,
-            source_type="body", body_text=result.raw_text,
+            source_type="body", body_text=strip_print_chrome(result.raw_text),
         )
         records = FreetextAdapter().extract(text_source)
         for r in records:

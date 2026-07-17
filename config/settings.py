@@ -45,8 +45,13 @@ COLUMN_SYNONYMS = {
     "vendor_name": ["Vendor", "Supplier"],
 }
 HEADER_MATCH_THRESHOLD = 85   # RapidFuzz ratio, 0-100 — fuzzy header matching against COLUMN_SYNONYMS
-SPEC_TOKEN_REGEX = r"\b([A-Z]{2,4}-\d{2,4}(?:-[A-Z]{1,4})?)\b"
-QTY_TOKEN_REGEX = r"\b(\d+)\s*(?:of|/)\s*(\d+)\b"
+SPEC_TOKEN_REGEX = r"\b([A-Z]{2,4}-\d{2,4}[A-Za-z]?(?:-[A-Z]{1,4})?)\b"
+# ^ trailing [A-Za-z]? added after real dummy test data: "GR-350a-WTF" has a letter fused onto
+# the numeric segment — a real, plausible spec-code shape our original digits-only match missed.
+QTY_TOKEN_REGEX = r"(?<!\d/)\b(\d+)\s*(?:of|/)\s*(\d+)\b(?!\s*/\s*\d)"
+# ^ guarded against dates after real dummy test data: "7/18/26" was being misread as a quantity
+# fraction "7/18". The guards reject a match that's part of a longer d/d/d chain (a date has
+# three slash-separated numbers; a real quantity fraction like "11/12" only ever has two).
 
 ENABLE_AI_FALLBACK = False   # checklist #1b — off until Premier explicitly permits Claude on real content
 ANTHROPIC_MODEL = "claude-sonnet-5"

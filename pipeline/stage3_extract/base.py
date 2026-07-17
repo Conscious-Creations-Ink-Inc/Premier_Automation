@@ -10,6 +10,33 @@ from pipeline.models import ExtractedRecord
 
 SUB_SPEC_PATTERN = re.compile(r"^(?P<parent>[A-Z0-9]+-\d+-[A-Z]+)-(?P<suffix>[A-Z]+)$")
 
+# A browser "print to PDF" of a scanned/photographed POD (or a photo's OCR text, since OCR
+# rasterizes the whole page including this chrome) leaves behind its own print header/footer —
+# a timestamp line, and a file:// path + optional page-number line. Found via real dummy test
+# documents: every one of them had exactly this shape, and it was polluting quantity/spec-code
+# extraction with false positives (a date's "M/D" or a page number's "N/M" misread as a
+# quantity fraction). Shared here so both PdfAdapter's text-layer check and any OCR raw-text
+# fallback (see ocr_adapter.records_from_ocr_result) strip/ignore it identically.
+_PRINT_CHROME_LINE_RE = re.compile(
+    r"^\d{1,2}/\d{1,2}/\d{2,4},?\s+\d{1,2}:\d{2}\s*(AM|PM)$|^file:///\S+(\s+\d+/\d+)?$",
+    re.IGNORECASE,
+)
+
+
+def is_meaningful_text(text: str) -> bool:
+    """True if `text` has any real content beyond recognized browser print-to-PDF chrome."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    real_lines = [ln for ln in lines if not _PRINT_CHROME_LINE_RE.match(ln)]
+    return bool(" ".join(real_lines).strip())
+
+
+def strip_print_chrome(text: str) -> str:
+    """Removes recognized browser print-to-PDF chrome lines before regex field extraction runs
+    over OCR'd/extracted text, so a leftover timestamp or page number can't be misread as a
+    quantity or spec code."""
+    lines = [ln for ln in text.splitlines() if not _PRINT_CHROME_LINE_RE.match(ln.strip())]
+    return "\n".join(lines)
+
 
 @dataclass
 class PartialFields:
