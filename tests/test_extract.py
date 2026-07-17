@@ -133,6 +133,40 @@ def test_pdf_native_table_extraction():
     assert records[0].extraction_source == "pdf"
 
 
+def test_pdf_browser_print_chrome_is_not_meaningful_text():
+    # Regression guard for a real bug found via real dummy test documents: every real PDF
+    # sample was a browser "print to PDF" of a scanned/photographed POD, and its only text was
+    # the browser's own print header (a timestamp line, and a file:// path + page number line —
+    # the exact shape found in the real samples). That trivial boilerplate was making
+    # _has_text_layer wrongly report True, so PdfAdapter grabbed it as "content" instead of
+    # correctly declining and routing to OcrAdapter.
+    from pipeline.stage3_extract.pdf_adapter import _is_meaningful_text
+    chrome_text = "7/18/26, 1:27 AM\nfile:///C:/Users/DELL/AppData/Local/Temp/pwrap/pdf_sample_01.html 1/1"
+    assert not _is_meaningful_text(chrome_text)
+    assert _is_meaningful_text("PO 213987 Spec LI-12 Qty 1")
+
+
+def test_pdf_with_only_print_chrome_and_an_embedded_image_routes_to_ocr():
+    # End-to-end version of the same regression: a PDF whose only vector text is browser print
+    # chrome, with the real content as an embedded raster image, must be declined by PdfAdapter
+    # so OcrAdapter (not PdfAdapter) is the one that ends up reading the actual image.
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas as pdf_canvas
+    image_bytes = make_pod_image_bytes(["Delivery Confirmation", "PO 213987", "Spec LI-12", "Qty received: 1"])
+    buf = io.BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=letter)
+    c.drawString(50, 800, "7/18/26, 1:27 AM")
+    c.drawString(50, 785, "file:///C:/fake/path/pdf_sample_01.html 1/1")
+    c.drawImage(ImageReader(io.BytesIO(image_bytes)), 50, 400, width=400, height=200)
+    c.save()
+    pdf_bytes = buf.getvalue()
+
+    assert not _has_text_layer(pdf_bytes)
+    assert not PdfAdapter().can_handle(
+        source(source_type="attachment", content_type="application/pdf", content_bytes=pdf_bytes)
+    )
+
+
 # --- FreetextAdapter ----------------------------------------------------------
 
 def test_freetext_po_only_confidence_floored_to_zero():

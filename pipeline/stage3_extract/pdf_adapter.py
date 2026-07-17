@@ -1,4 +1,5 @@
 import io
+import re
 from typing import List
 
 import pdfplumber
@@ -12,11 +13,28 @@ from pipeline.stage3_extract.base import (
 )
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 
+# A browser "print to PDF" of a scanned/photographed POD leaves behind its own print header/
+# footer (a timestamp line, and a file:// path + page number line) as real vector text, even
+# though the actual page content is a raster image. Found via real dummy test documents: every
+# one of them had exactly this shape, and extract_text() returning that boilerplate made
+# _has_text_layer wrongly report True, so PdfAdapter grabbed the browser chrome as if it were
+# the document's real content instead of correctly routing to OcrAdapter.
+_PRINT_CHROME_LINE_RE = re.compile(
+    r"^\d{1,2}/\d{1,2}/\d{2,4},?\s+\d{1,2}:\d{2}\s*(AM|PM)$|^file:///\S+(\s+\d+/\d+)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_meaningful_text(text: str) -> bool:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    real_lines = [ln for ln in lines if not _PRINT_CHROME_LINE_RE.match(ln)]
+    return bool(" ".join(real_lines).strip())
+
 
 def _has_text_layer(content_bytes: bytes) -> bool:
     try:
         with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
-            return any((page.extract_text() or "").strip() for page in pdf.pages)
+            return any(_is_meaningful_text(page.extract_text() or "") for page in pdf.pages)
     except Exception:
         return False
 
