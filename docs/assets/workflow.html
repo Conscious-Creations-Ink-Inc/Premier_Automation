@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premier Receiver Automation - Workflow</title>
+</head>
+<body>
+<style>
+  :root {
+    --bg:#F5F7F9; --surface:#FFFFFF; --surface-2:#EDF1F5; --inset:#F0F3F7;
+    --ink:#14202E; --ink-2:#3C4A5C; --muted:#68788C; --line:#D9E0E9;
+    --accent:#0E7490; --accent-ink:#0B5563; --accent-weak:#E0F0F2;
+    --good:#15803D; --good-weak:#E3F2E9; --good-line:#B7DEC5;
+    --warn:#B45309; --warn-weak:#F8ECDB; --warn-line:#EBD3AF;
+    --bad:#B4241C; --bad-weak:#F7E4E2; --bad-line:#EEC4C0;
+    --shadow:0 1px 2px rgba(20,32,46,.04), 0 6px 20px rgba(20,32,46,.06);
+    --font-sans:"Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono:ui-monospace, "Cascadia Code", "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --r:14px; --r-sm:9px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0A111C; --surface:#111C2B; --surface-2:#182537; --inset:#0E1928;
+      --ink:#E7EDF5; --ink-2:#AEBDCF; --muted:#7E8FA4; --line:#24344A;
+      --accent:#2CBCCE; --accent-ink:#7FD9E4; --accent-weak:#0F313A;
+      --good:#48C77F; --good-weak:#123021; --good-line:#1E5236;
+      --warn:#E09A44; --warn-weak:#33240F; --warn-line:#5A4222;
+      --bad:#F0776E; --bad-weak:#361B1A; --bad-line:#5C2C29;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 26px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg:#F5F7F9; --surface:#FFFFFF; --surface-2:#EDF1F5; --inset:#F0F3F7;
+    --ink:#14202E; --ink-2:#3C4A5C; --muted:#68788C; --line:#D9E0E9;
+    --accent:#0E7490; --accent-ink:#0B5563; --accent-weak:#E0F0F2;
+    --good:#15803D; --good-weak:#E3F2E9; --good-line:#B7DEC5;
+    --warn:#B45309; --warn-weak:#F8ECDB; --warn-line:#EBD3AF;
+    --bad:#B4241C; --bad-weak:#F7E4E2; --bad-line:#EEC4C0;
+    --shadow:0 1px 2px rgba(20,32,46,.04), 0 6px 20px rgba(20,32,46,.06);
+  }
+  :root[data-theme="dark"] {
+    --bg:#0A111C; --surface:#111C2B; --surface-2:#182537; --inset:#0E1928;
+    --ink:#E7EDF5; --ink-2:#AEBDCF; --muted:#7E8FA4; --line:#24344A;
+    --accent:#2CBCCE; --accent-ink:#7FD9E4; --accent-weak:#0F313A;
+    --good:#48C77F; --good-weak:#123021; --good-line:#1E5236;
+    --warn:#E09A44; --warn-weak:#33240F; --warn-line:#5A4222;
+    --bad:#F0776E; --bad-weak:#361B1A; --bad-line:#5C2C29;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 26px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--font-sans);
+    line-height:1.5; -webkit-font-smoothing:antialiased; }
+  .page { max-width:1060px; margin:0 auto; padding:44px 22px 72px; }
+
+  .eyebrow { font-family:var(--font-mono); font-size:11.5px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent-ink); font-weight:600; }
+  h1 { font-size:clamp(26px,4.4vw,40px); line-height:1.08; letter-spacing:-.02em; margin:12px 0 0;
+    text-wrap:balance; font-weight:700; }
+  .lede { font-size:clamp(15px,1.9vw,18px); color:var(--ink-2); max-width:64ch; margin:14px 0 0; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:22px; padding-top:20px; border-top:1px solid var(--line); }
+  .key { display:inline-flex; align-items:center; gap:8px; font-size:12.5px; color:var(--ink-2); }
+  .dot { width:10px; height:10px; border-radius:3px; flex:none; }
+
+  .sec-label { font-family:var(--font-mono); font-size:11.5px; letter-spacing:.13em; text-transform:uppercase;
+    color:var(--muted); font-weight:600; margin:54px 0 16px; display:flex; align-items:center; gap:12px; }
+  .sec-label::after { content:""; height:1px; flex:1; background:var(--line); }
+
+  /* flow spine */
+  .flow { display:flex; flex-direction:column; }
+  .conn { display:flex; justify-content:center; color:var(--muted); padding:3px 0; }
+  .conn.warn { color:var(--warn); }
+
+  .stage { background:var(--surface); border:1px solid var(--line); border-radius:var(--r);
+    box-shadow:var(--shadow); padding:18px 20px; }
+  .stage-top { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .node { font-family:var(--font-mono); font-size:12px; font-weight:700; color:var(--surface);
+    background:var(--accent); width:30px; height:30px; border-radius:8px; display:grid; place-items:center; flex:none; }
+  .stage.calm .node { background:var(--muted); }
+  .stage-name { font-family:var(--font-mono); font-size:13px; letter-spacing:.05em; text-transform:uppercase;
+    font-weight:700; color:var(--ink); }
+  .tag { margin-left:auto; font-family:var(--font-mono); font-size:10.5px; letter-spacing:.04em; text-transform:uppercase;
+    font-weight:600; padding:3px 9px; border-radius:20px; border:1px solid var(--line); color:var(--muted); }
+  .tag.built { color:var(--accent-ink); background:var(--accent-weak); border-color:transparent; }
+  .stage p { margin:12px 0 0; color:var(--ink-2); font-size:14.5px; max-width:70ch; }
+
+  .chips { display:flex; flex-wrap:wrap; gap:7px; margin-top:14px; }
+  .chip { font-family:var(--font-mono); font-size:11.5px; padding:4px 10px; border-radius:7px;
+    background:var(--inset); border:1px solid var(--line); color:var(--ink-2); white-space:nowrap; }
+  .chip.k { color:var(--accent-ink); border-color:var(--accent-weak); background:var(--accent-weak); }
+
+  /* fork */
+  .fork { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:640px){ .fork { grid-template-columns:1fr; } }
+  .branch { border-radius:var(--r); padding:16px 18px; border:1px solid var(--line); background:var(--surface); box-shadow:var(--shadow); }
+  .branch.good { border-color:var(--good-line); background:var(--good-weak); }
+  .branch.warn { border-color:var(--warn-line); background:var(--warn-weak); }
+  .branch h4 { margin:0; font-size:14px; display:flex; align-items:center; gap:8px; }
+  .branch.good h4 { color:var(--good); }
+  .branch.warn h4 { color:var(--warn); }
+  .branch .path { margin-top:10px; display:flex; flex-direction:column; gap:6px; }
+  .step-line { display:flex; align-items:center; gap:8px; font-size:13.5px; color:var(--ink-2); }
+  .step-line .m { font-family:var(--font-mono); font-size:11px; color:var(--muted); }
+  .glyph { flex:none; }
+
+  /* human review centerpiece */
+  .review { border:1.5px solid var(--warn-line); border-radius:calc(var(--r) + 4px); background:var(--surface);
+    box-shadow:var(--shadow); overflow:hidden; }
+  .review-head { padding:16px 20px; background:var(--warn-weak); border-bottom:1px solid var(--warn-line);
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .review-head .node { background:var(--warn); }
+  .review-head h3 { margin:0; font-size:16px; letter-spacing:-.01em; }
+  .review-head .who { margin-left:auto; font-size:12.5px; color:var(--warn); font-weight:600; }
+  .review-body { padding:20px; }
+  .review-body > p { margin:0 0 16px; color:var(--ink-2); font-size:14.5px; max-width:74ch; }
+
+  .drawer { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:680px){ .drawer { grid-template-columns:1fr; } }
+  .panel { background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:14px 15px; }
+  .panel h5 { margin:0 0 10px; font-family:var(--font-mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--muted); font-weight:700; }
+  .field-row { display:flex; justify-content:space-between; gap:10px; padding:5px 0; font-size:13px;
+    border-bottom:1px dashed var(--line); }
+  .field-row:last-child { border-bottom:0; }
+  .field-row .lbl { font-family:var(--font-mono); font-size:11.5px; color:var(--muted); }
+  .field-row .val { font-family:var(--font-mono); font-size:12px; color:var(--ink); text-align:right; }
+  .field-row .val.miss { color:var(--warn); }
+  .flagnote { margin-top:12px; font-size:12.5px; color:var(--warn); background:var(--warn-weak);
+    border:1px solid var(--warn-line); border-radius:7px; padding:8px 10px; }
+
+  .cand { display:flex; align-items:flex-start; gap:9px; padding:9px 10px; border:1px solid var(--line);
+    border-radius:8px; margin-bottom:8px; background:var(--surface); font-size:13px; }
+  .cand:last-child { margin-bottom:0; }
+  .cand.on { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .radio { width:15px; height:15px; border-radius:50%; border:2px solid var(--muted); flex:none; margin-top:2px; position:relative; }
+  .cand.on .radio { border-color:var(--accent); }
+  .cand.on .radio::after { content:""; position:absolute; inset:2.5px; border-radius:50%; background:var(--accent); }
+  .cand .code { font-family:var(--font-mono); font-size:12px; color:var(--ink); }
+  .cand .sig { font-family:var(--font-mono); font-size:10.5px; color:var(--accent-ink); background:var(--accent-weak);
+    padding:1px 6px; border-radius:5px; margin-left:6px; }
+  .cand .sub { color:var(--muted); font-size:11.5px; margin-top:2px; }
+
+  .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; align-items:center; }
+  .btn { font-family:var(--font-sans); font-size:13.5px; font-weight:600; padding:9px 16px; border-radius:9px;
+    border:1px solid transparent; cursor:default; display:inline-flex; align-items:center; gap:7px; }
+  .btn.approve { background:var(--good); color:#fff; }
+  .btn.cancel { background:var(--surface); color:var(--bad); border-color:var(--bad-line); }
+  .btn.ghost { background:transparent; color:var(--accent-ink); border-color:var(--accent-weak); }
+  .btn .hint { font-weight:400; opacity:.85; font-size:12px; }
+
+  .outcomes { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:560px){ .outcomes { grid-template-columns:1fr; } }
+  .outcome { display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:var(--r-sm); font-size:13.5px; }
+  .outcome.good { background:var(--good-weak); border:1px solid var(--good-line); color:var(--good); }
+  .outcome.bad { background:var(--bad-weak); border:1px solid var(--bad-line); color:var(--bad); }
+  .outcome strong { color:var(--ink); font-weight:650; }
+  .audit { margin-top:14px; font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:8px; }
+
+  /* mapping grid */
+  .map { display:grid; grid-template-columns:repeat(auto-fit,minmax(188px,1fr)); gap:12px; }
+  .mcard { background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:15px 16px; box-shadow:var(--shadow); }
+  .mcard .num { font-family:var(--font-mono); font-size:11px; font-weight:700; color:var(--accent-ink); }
+  .mcard .said { font-size:13.5px; color:var(--ink-2); margin:7px 0 12px; }
+  .mcard .arrow-to { font-family:var(--font-mono); font-size:11px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .mcard .to { font-weight:650; color:var(--ink); font-size:13.5px; margin-top:3px; }
+
+  /* supporting views */
+  .views { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+  .view { background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:17px 18px; box-shadow:var(--shadow); }
+  .view h4 { margin:0 0 6px; font-size:15px; display:flex; align-items:center; gap:9px; }
+  .view p { margin:0; color:var(--ink-2); font-size:13.5px; }
+  .buckets { display:flex; gap:6px; margin-top:12px; flex-wrap:wrap; }
+  .bucket { font-family:var(--font-mono); font-size:10.5px; padding:4px 8px; border-radius:6px; font-weight:600; }
+  .bucket.g { background:var(--good-weak); color:var(--good); border:1px solid var(--good-line); }
+  .bucket.a { background:var(--warn-weak); color:var(--warn); border:1px solid var(--warn-line); }
+  .bucket.r { background:var(--bad-weak); color:var(--bad); border:1px solid var(--bad-line); }
+  .ico { width:26px; height:26px; border-radius:7px; display:grid; place-items:center; background:var(--accent-weak);
+    color:var(--accent-ink); flex:none; }
+
+  /* architecture */
+  .arch { background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:20px; box-shadow:var(--shadow); }
+  .arch-row { display:flex; align-items:stretch; gap:12px; flex-wrap:wrap; }
+  .tier { flex:1 1 210px; background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:14px 15px; }
+  .tier .t { font-family:var(--font-mono); font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:700; }
+  .tier .n { font-size:15px; font-weight:650; margin:6px 0 4px; }
+  .tier .d { font-size:12.5px; color:var(--ink-2); }
+  .link { display:grid; place-items:center; color:var(--muted); font-family:var(--font-mono); font-size:18px; flex:none; }
+  @media (max-width:720px){ .link { transform:rotate(90deg); padding:2px 0; } }
+  .arch-note { margin-top:14px; font-size:12.5px; color:var(--ink-2); background:var(--accent-weak);
+    border:1px solid transparent; border-radius:8px; padding:10px 12px; }
+
+  .foot { margin-top:44px; padding-top:18px; border-top:1px solid var(--line); font-size:12.5px; color:var(--muted); }
+  svg.ar { display:block; }
+</style>
+
+<div class="page">
+
+  <header>
+    <div class="eyebrow">Conscious Creations · Premier Receiver Automation</div>
+    <h1>From a messy delivery email to a verified PO receipt</h1>
+    <p class="lede">This is the flow we're building a dashboard for. Most emails reconcile on their own; the ones that can't — low confidence, or missing a spec, quantity, POD or PO — surface to a person who <strong>approves</strong> or <strong>cancels</strong> them. That review is the heart of the tool.</p>
+
+    <div class="legend">
+      <span class="key"><span class="dot" style="background:var(--accent)"></span> Automated step</span>
+      <span class="key"><span class="dot" style="background:var(--good)"></span> Delivered / Approved</span>
+      <span class="key"><span class="dot" style="background:var(--warn)"></span> In-transit / Flagged for review</span>
+      <span class="key"><span class="dot" style="background:var(--bad)"></span> Cancelled / Exception</span>
+    </div>
+  </header>
+
+  <div class="sec-label">The core flow</div>
+
+  <div class="flow">
+
+    <div class="stage">
+      <div class="stage-top">
+        <span class="node">01</span>
+        <span class="stage-name">Emails arrive</span>
+        <span class="tag">synthetic for now</span>
+      </div>
+      <p>Delivery-status mails land from vendors, warehouses, carriers and properties — any format, no fixed template, often several per order and several statuses for the same one.</p>
+      <div class="chips">
+        <span class="chip">warehouse inbound</span><span class="chip">carrier POD</span>
+        <span class="chip">property confirmation</span><span class="chip">vendor reply</span><span class="chip">cancellation</span>
+      </div>
+    </div>
+
+    <div class="conn" aria-hidden="true"><svg class="ar" width="16" height="26" viewBox="0 0 16 26"><line x1="8" y1="0" x2="8" y2="18" stroke="currentColor" stroke-width="2"/><path d="M2.5 16.5 L8 23 L13.5 16.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <div class="stage">
+      <div class="stage-top">
+        <span class="node">02</span>
+        <span class="stage-name">Parse &amp; extract</span>
+        <span class="tag built">built · stages 1–3</span>
+      </div>
+      <p>Read every body and attachment (HTML, PDF, scans via OCR, Excel). Detect the status keyword, then pull only the fields that matter for reconciling against the purchase order.</p>
+      <div class="chips">
+        <span class="chip">delivered</span><span class="chip">received</span><span class="chip">out for delivery</span><span class="chip">cancelled</span>
+      </div>
+      <div class="chips">
+        <span class="chip k">PO #</span><span class="chip k">Spec ID</span><span class="chip k">POD</span><span class="chip k">description</span><span class="chip k">quantity</span>
+      </div>
+    </div>
+
+    <div class="conn" aria-hidden="true"><svg class="ar" width="16" height="26" viewBox="0 0 16 26"><line x1="8" y1="0" x2="8" y2="18" stroke="currentColor" stroke-width="2"/><path d="M2.5 16.5 L8 23 L13.5 16.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <div class="stage calm">
+      <div class="stage-top">
+        <span class="node">03</span>
+        <span class="stage-name">Reconcile against the PO</span>
+        <span class="tag">mock · stages 4–5</span>
+      </div>
+      <p>Match each record to a Purchase Order line by <strong>PO&nbsp;+ spec&nbsp;+ description</strong>, then score how sure we are. The spec resolves the exact line; a fuzzy description match adds a second signal.</p>
+      <div class="chips">
+        <span class="chip">confidence: high</span><span class="chip">medium</span><span class="chip">low</span><span class="chip">none</span>
+      </div>
+    </div>
+
+    <div class="conn" aria-hidden="true"><svg class="ar" width="16" height="20" viewBox="0 0 16 20"><line x1="8" y1="0" x2="8" y2="14" stroke="currentColor" stroke-width="2"/><path d="M2.5 12.5 L8 19 L13.5 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <div class="fork">
+      <div class="branch good">
+        <h4><span class="glyph">✓</span> Confident &amp; complete</h4>
+        <div class="path">
+          <div class="step-line"><span class="m">→</span> All three signals match, nothing missing</div>
+          <div class="step-line"><span class="m">→</span> Auto-approved, no human needed</div>
+          <div class="step-line"><span class="m">→</span> <strong>Staged PO receipt</strong> created</div>
+        </div>
+      </div>
+      <div class="branch warn">
+        <h4><span class="glyph">⚠</span> Low confidence or missing info</h4>
+        <div class="path">
+          <div class="step-line"><span class="m">→</span> No clear PO match, or missing spec / qty / POD</div>
+          <div class="step-line"><span class="m">→</span> <strong>Flagged → Exception Queue</strong></div>
+          <div class="step-line"><span class="m">↓</span> Goes to a person ⟶ this is what the dashboard is for</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="conn warn" aria-hidden="true"><svg class="ar" width="16" height="26" viewBox="0 0 16 26"><line x1="8" y1="0" x2="8" y2="18" stroke="currentColor" stroke-width="2"/><path d="M2.5 16.5 L8 23 L13.5 16.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <div class="review">
+      <div class="review-head">
+        <span class="node">04</span>
+        <h3>Human review — approve or cancel</h3>
+        <span class="who">operator · dashboard</span>
+      </div>
+      <div class="review-body">
+        <p>The operator opens a flagged item and sees <em>why</em> it stalled next to the candidate PO lines. They pick the right line (or fill the missing field), then decide.</p>
+
+        <div class="drawer">
+          <div class="panel">
+            <h5>What we extracted</h5>
+            <div class="field-row"><span class="lbl">PO #</span><span class="val">212456</span></div>
+            <div class="field-row"><span class="lbl">Spec ID</span><span class="val miss">— missing</span></div>
+            <div class="field-row"><span class="lbl">Description</span><span class="val">Peerless AV mount</span></div>
+            <div class="field-row"><span class="lbl">Quantity</span><span class="val">11</span></div>
+            <div class="field-row"><span class="lbl">POD date</span><span class="val">2026-07-14</span></div>
+            <div class="flagnote">⚠ Flagged: spec ID absent · description match 72% (below 80)</div>
+          </div>
+          <div class="panel">
+            <h5>Candidate PO lines — pick one</h5>
+            <div class="cand on">
+              <span class="radio"></span>
+              <span>
+                <span class="code">PO 212456 · L3 · STE-402-LT</span><span class="sig">spec + desc</span>
+                <div class="sub">Peerless-AV · ordered 12 · received 0</div>
+              </span>
+            </div>
+            <div class="cand">
+              <span class="radio"></span>
+              <span>
+                <span class="code">PO 212456 · L4 · STE-402-UP</span><span class="sig">desc</span>
+                <div class="sub">Peerless-AV · ordered 4 · received 0</div>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <span class="btn approve">Approve <span class="hint">→ create receipt</span></span>
+          <span class="btn cancel">Cancel <span class="hint">→ reason required</span></span>
+          <span class="btn ghost">Request info from vendor</span>
+        </div>
+
+        <div class="outcomes" style="margin-top:16px">
+          <div class="outcome good"><span>✓</span><span><strong>Approve</strong> — PO receipt staged, quantity updated</span></div>
+          <div class="outcome bad"><span>✕</span><span><strong>Cancel</strong> — marked failed, reason logged</span></div>
+        </div>
+        <div class="audit"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="5.9"/><path d="M8 4.4V8l2.5 1.7"/></svg> Every decision updates the dashboard counts and writes an audit row — who, when, why.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="sec-label">What you asked for, mapped to the UI</div>
+  <div class="map">
+    <div class="mcard">
+      <div class="num">STEP 1</div>
+      <div class="said">Analyse each mail + attachment, find keywords, read POD / Spec / description.</div>
+      <div class="arrow-to">▸ shows up as</div><div class="to">Extracted Records</div>
+    </div>
+    <div class="mcard">
+      <div class="num">STEP 2</div>
+      <div class="said">A tabular report of all delivery mails, in three categories.</div>
+      <div class="arrow-to">▸ shows up as</div><div class="to">Delivery Report</div>
+    </div>
+    <div class="mcard">
+      <div class="num">STEP 3</div>
+      <div class="said">Reconcile by PO / spec / description, then verify — act on the ones lacking info.</div>
+      <div class="arrow-to">▸ shows up as</div><div class="to">Reconciliation + Exception Queue</div>
+    </div>
+    <div class="mcard">
+      <div class="num">STEP 4</div>
+      <div class="said">Tidy the messy inbox — move status updates into a folder.</div>
+      <div class="arrow-to">▸ shows up as</div><div class="to">Inbox Organizer</div>
+    </div>
+    <div class="mcard">
+      <div class="num">STEP 5</div>
+      <div class="said">A template to request updates, sent to vendors automatically on a schedule.</div>
+      <div class="arrow-to">▸ shows up as</div><div class="to">Vendor Template</div>
+    </div>
+  </div>
+
+  <div class="sec-label">Supporting views</div>
+  <div class="views">
+    <div class="view">
+      <h4><span class="ico"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.6"/><line x1="1.8" y1="6.4" x2="14.2" y2="6.4"/><line x1="6.2" y1="6.4" x2="6.2" y2="13.2"/></svg></span> Delivery Report</h4>
+      <p>Every delivery mail bucketed by status, so nothing is lost in the noise.</p>
+      <div class="buckets">
+        <span class="bucket g">Delivered / Received</span>
+        <span class="bucket a">In-Transit / Out-for-Delivery</span>
+        <span class="bucket r">Cancelled / Exception</span>
+      </div>
+    </div>
+    <div class="view">
+      <h4><span class="ico"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.8 4.4A1.3 1.3 0 0 1 3.1 3.1h2.9l1.5 1.8h5.4a1.3 1.3 0 0 1 1.3 1.3v5.5a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3z"/></svg></span> Inbox Organizer</h4>
+      <p>Sweep all repetitive status-update mails into a <em>Status Updates</em> folder. The inbox keeps only order confirmations, cancellations and unclear mails.</p>
+    </div>
+    <div class="view">
+      <h4><span class="ico"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="1.8" y="3.4" width="12.4" height="9.2" rx="1.5"/><path d="M2.4 4.4 8 8.7l5.6-4.3"/></svg></span> Vendor Template</h4>
+      <p>One standard "please confirm receipt in this format" template. Send it to any vendor whose mails lack info — by hand, or automatically every N hours.</p>
+    </div>
+  </div>
+
+  <div class="sec-label">Under the hood</div>
+  <div class="arch">
+    <div class="arch-row">
+      <div class="tier">
+        <div class="t">Frontend</div>
+        <div class="n">React dashboard</div>
+        <div class="d">Vite · TypeScript · Tailwind · shadcn/ui — the screens above.</div>
+      </div>
+      <div class="link" aria-hidden="true">⇄</div>
+      <div class="tier">
+        <div class="t">Backend</div>
+        <div class="n">FastAPI</div>
+        <div class="d">Serves the data and runs the approve / cancel logic. Stages 4–7 simulated for now.</div>
+      </div>
+      <div class="link" aria-hidden="true">⇄</div>
+      <div class="tier">
+        <div class="t">Data</div>
+        <div class="n">Demo SQLite</div>
+        <div class="d">Synthetic, self-consistent, resettable — separate from the real pipeline state.</div>
+      </div>
+    </div>
+    <div class="arch-note">Stages 1–3 (parse &amp; extract) already exist in Python and are reused as-is. Stages 4–7 are mocked so we can build and demo the full flow today; the live Microsoft Graph mailbox and Spitfire ERP wire in later with no change to the UI.</div>
+  </div>
+
+  <div class="foot">Workflow overview for the Premier reconciliation dashboard · synthetic-data build · reconciliation &amp; human approval prioritised.</div>
+
+</div>
+
+</body>
+</html>
