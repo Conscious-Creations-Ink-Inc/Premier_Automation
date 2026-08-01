@@ -2,7 +2,16 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-state/*.sqlite3
+*.sqlite3
 .env
+.env.*.local
 *.log
 .pytest_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# Frontend
+node_modules/
+frontend/dist/
