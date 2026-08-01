@@ -1,0 +1,11 @@
+[project]
+name = "premier-automation"
+version = "0.1.0"
+description = "Email-parsing orchestrator for Premier Project Management's receiver process: ingests receiving emails (Graph API), triages them, extracts PO/spec/quantity data from bodies and attachments, and stages records for reconciliation."
+requires-python = ">=3.12"
+# Dependencies are managed via requirements.txt / requirements-dev.txt (no build/install step yet).
+
+[tool.pytest.ini_options]
+# Makes `from pipeline...` / `from api...` / `from config...` imports resolve;
+# run pytest from the repo root.
+pythonpath = ["."]

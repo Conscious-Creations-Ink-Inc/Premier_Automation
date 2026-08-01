@@ -1,12 +1,13 @@
+# Runtime dependencies (pipeline + dashboard API).
+# Test/dev-only tools live in requirements-dev.txt.
 beautifulsoup4
 lxml
 pdfplumber
 rapidfuzz
 openpyxl
-pytest
 python-dotenv
 msal
 requests
 python-docx
-pytesseract  # local, dev-time OCR for generating realistic test fixtures — NOT the production OCR path (that's Azure AI Document Intelligence, per Premier's confirmation)
-reportlab  # test-only: generates real in-memory PDF fixtures for test_extract.py, not a runtime dependency
+fastapi  # dashboard API layer (api/) — pydantic v2 comes with it; pipeline/ never imports api/
+uvicorn[standard]  # ASGI server for the dashboard API in dev
