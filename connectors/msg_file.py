@@ -20,6 +20,7 @@ Three things the corpus forced:
 """
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,6 +29,16 @@ import extract_msg
 from connectors.mailbox import Mailbox
 from pipeline.models import Attachment, RawEmail
 from pipeline.parsing import sniff
+
+_logger = logging.getLogger(__name__)
+
+
+def _html_of(message) -> Optional[str]:
+    """`htmlBody` as text, whichever type extract_msg hands back for this item."""
+    html = getattr(message, "htmlBody", None)
+    if isinstance(html, bytes):
+        return html.decode("utf-8", "replace")
+    return html or None
 
 # Nesting is shallow in practice (a forward of a notification that has attachments). The cap is
 # a loop guard against a malformed or maliciously self-referential item, not a real limit.
@@ -93,7 +104,7 @@ class MsgFileMailbox(Mailbox):
             try:
                 emails.append(self.read_file(path))
             except Exception as e:
-                print(f"[msg_file] failed to parse {path.name}: {type(e).__name__}: {e}")
+                _logger.warning("failed to parse %s: %s: %s", path.name, type(e).__name__, e, exc_info=True)
         return emails
 
     def mark_processed(self, email_id: str, folder: str) -> None:
@@ -106,7 +117,7 @@ class MsgFileMailbox(Mailbox):
             return
         source = self._path_by_email_id.get(email_id)
         if not source or not Path(source).exists():
-            print(f"[msg_file] mark_processed: no source file tracked for {email_id}")
+            _logger.warning("mark_processed: no source file tracked for %s", email_id)
             return
         target_dir = self.folder / folder
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -153,61 +164,124 @@ class MsgFileMailbox(Mailbox):
             attachments=attachments,
         )
 
-    def _collect_attachments(self, message, depth: int) -> List[Attachment]:
+    def _collect_attachments(
+        self,
+        message,
+        depth: int,
+        seen_digests: Optional[set] = None,
+        container_path: str = "",
+    ) -> List[Attachment]:
         """Flatten the attachment tree into one list.
 
-        A nested `.msg` contributes both its own body (as an `.html` pseudo-attachment, so the
-        HTML adapter can read it exactly like any other body) and its own attachments. Flattening
-        rather than nesting keeps `RawEmail` a flat record while losing nothing — the Delivered
+        A nested `.msg` contributes its own body (as an `.html` or `.txt` pseudo-attachment, so
+        the existing adapters read it exactly like any other body) and its own attachments.
+        Flattening keeps `RawEmail` a flat record while losing nothing — the Delivered
         Notification quoted inside the 5-Star thread still reaches the Authority parser.
+
+        **Nothing is discarded here.** Attachments this connector decides against are still
+        returned, carrying a `drop_hint` that the orchestrator turns into a ledger row. Four
+        bare `continue`s used to sit in this loop, and between them they could lose a
+        photographed POD without leaving a single trace anywhere in the system.
+
+        `seen_digests` is threaded through the recursion rather than being rebuilt per frame, so
+        a file attached both at the top level and inside a nested message is recognised as the
+        same bytes.
         """
+        if seen_digests is None:
+            seen_digests = set()
+
         if depth > MAX_NESTING_DEPTH:
-            print(f"[msg_file] nesting deeper than {MAX_NESTING_DEPTH} — stopping recursion")
-            return []
+            _logger.warning("nesting deeper than %s at %r — stopping recursion",
+                            MAX_NESTING_DEPTH, container_path or "<root>")
+            return [Attachment(
+                filename=container_path or "nested message",
+                content_type="application/octet-stream",
+                content_bytes=b"",
+                drop_hint=f"depth:exceeded {MAX_NESTING_DEPTH}",
+                container_path=container_path,
+            )]
 
         collected: List[Attachment] = []
-        seen_digests = set()
+        body_cids = sniff.referenced_cids(_html_of(message))
 
         for raw_attachment in message.attachments:
             filename = _clean_name(getattr(raw_attachment, "longFilename", None)
                                    or getattr(raw_attachment, "shortFilename", None)) or "unnamed"
             declared_type = _clean_name(getattr(raw_attachment, "mimetype", None)) or None
+            content_id = _clean_name(getattr(raw_attachment, "cid", None)) or None
+            path = f"{container_path}!/{filename}" if container_path else filename
             data = raw_attachment.data
 
             if hasattr(data, "attachments"):   # a nested Outlook item
-                nested_subject = _clean_name(getattr(data, "subject", "")) or "nested message"
-                nested_html = getattr(data, "htmlBody", None)
-                if isinstance(nested_html, bytes):
-                    nested_html = nested_html.decode("utf-8", "replace")
-                if nested_html:
-                    collected.append(Attachment(
-                        filename=f"{nested_subject[:80]}.html",
-                        content_type="text/html",
-                        content_bytes=nested_html.encode("utf-8"),
-                    ))
-                collected.extend(self._collect_attachments(data, depth + 1))
+                collected.extend(self._nested_bodies(data, path))
+                collected.extend(self._collect_attachments(data, depth + 1, seen_digests, path))
                 continue
 
             if not isinstance(data, bytes) or not data:
+                collected.append(Attachment(
+                    filename=filename, content_type=declared_type or "application/octet-stream",
+                    content_bytes=b"", content_id=content_id, drop_hint="empty:zero bytes",
+                    container_path=path,
+                ))
                 continue
 
             result = sniff.sniff(data, filename, declared_type or "")
-            if not self.keep_decorative_images and sniff.is_decorative_image(data, filename, result):
-                continue
-            # Content-hash dedupe. It collapses the corpus's two identically-named-differently
-            # PODs into one — the right outcome, since they are the same document, and it also
-            # stops the same logo being carried thirty times.
-            if result.sha256 in seen_digests:
-                continue
-            seen_digests.add(result.sha256)
-
-            collected.append(Attachment(
+            attachment = Attachment(
                 filename=filename,
                 content_type=_content_type_for(data, filename, declared_type),
                 content_bytes=data,
-            ))
+                content_id=content_id,
+                is_inline=bool(content_id and content_id.strip("<>") in body_cids),
+                sha256=result.sha256,
+                size_bytes=len(data),
+                sniffed_kind=result.kind,
+                container_path=path,
+            )
+
+            if not self.keep_decorative_images:
+                verdict = sniff.classify_image(data, filename, result, body_cids, content_id)
+                if verdict.decorative:
+                    attachment.drop_hint = f"decorative:{verdict.certainty} — {verdict.reason}"
+
+            # Content-hash dedupe — it collapses the corpus's two identically-contented PODs
+            # saved under different names. The duplicate is still reported so the ledger shows
+            # both slots and which one was actually read.
+            if attachment.drop_hint is None and result.sha256 in seen_digests:
+                attachment.drop_hint = f"duplicate:{result.sha256[:12]}"
+
+            if attachment.drop_hint is None:
+                seen_digests.add(result.sha256)
+            else:
+                attachment.content_bytes = b""   # metadata is enough for a dropped attachment
+
+            collected.append(attachment)
 
         return collected
+
+    def _nested_bodies(self, nested, path: str) -> List[Attachment]:
+        """A nested message's own body, as pseudo-attachments.
+
+        Both shapes are emitted. Reading only `htmlBody` — as this did before — means a nested
+        item that carries only plain text contributes nothing at all, silently.
+        """
+        subject = _clean_name(getattr(nested, "subject", "")) or "nested message"
+        out: List[Attachment] = []
+
+        html = _html_of(nested)
+        if html:
+            out.append(Attachment(
+                filename=f"{subject[:80]}.html", content_type="text/html",
+                content_bytes=html.encode("utf-8"), container_path=f"{path}!/body.html",
+            ))
+
+        text_body = getattr(nested, "body", None)
+        if text_body and not html:
+            out.append(Attachment(
+                filename=f"{subject[:80]}.txt", content_type="text/plain",
+                content_bytes=text_body.encode("utf-8", "replace"),
+                container_path=f"{path}!/body.txt",
+            ))
+        return out
 
 
 def _extract_address(raw: str) -> str:

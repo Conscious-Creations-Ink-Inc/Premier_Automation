@@ -147,10 +147,25 @@ def _decide_authority(
             "carrier delivered to the warehouse; waiting on the matching Inbound notification")
 
 
-def triage(email: RawEmail) -> TriagedEmail:
+def triage(email: RawEmail, evidence=None) -> TriagedEmail:
+    """Decide what this email is.
+
+    `evidence` is an `EmailEvidence` bundle from `pipeline/evidence.py` — what the attachments
+    actually contained, parsed before this ran. It is optional so every existing caller and test
+    keeps working, but the orchestrator always supplies it, and it is what turns two of the
+    corpus's rules from guesses into readings: a thread whose POs exist only inside an attached
+    spreadsheet now has those POs here, and a photographed-evidence email is only routed for OCR
+    after OCR has genuinely been tried or declined.
+    """
     body, parsed, origin = _thread_of(email)
     origin_subject = origin.subject or email.subject
     po_hints = _po_hints_across_thread(email, body)
+
+    # POs read out of the attachments rank alongside those found in the text — an attachment is
+    # not weaker evidence, it is usually the only evidence.
+    for candidate in getattr(evidence, "po_numbers", []) or []:
+        if candidate not in po_hints:
+            po_hints.append(candidate)
 
     def result(
         notification_type: NotificationType,
@@ -225,15 +240,25 @@ def triage(email: RawEmail) -> TriagedEmail:
     # the unknown rule routes a fully-machine-readable spreadsheet to a human for retyping.
     readable, images = _attachment_kinds(email)
     if readable and _looks_like_delivery_thread(email.subject, body):
+        detail = f"({', '.join(sorted(readable))})"
+        if getattr(evidence, "has_records", False):
+            # Read, not assumed. The reason string carries what was actually found, so the
+            # operator sees evidence rather than a heuristic.
+            detail = (f"({', '.join(sorted(readable))}) — read {len(evidence.records)} line(s)"
+                      f" covering PO(s) {', '.join(evidence.po_numbers) or 'none stated'}")
         return result(NotificationType.PROPERTY_CONFIRMATION, TriageCategory.HOLD,
                       "rule_5a_tracker_attachment",
-                      f"delivery thread whose identifying data is in an attachment ({', '.join(sorted(readable))})")
+                      f"delivery thread whose identifying data is in an attachment {detail}")
 
-    # Rule 5b — photographed PODs and BOLs. No text layer, so nothing here can read them; the
-    # operator needs to be told *why* it is on their queue, not just that no PO was found.
+    # Rule 5b — photographed PODs and BOLs. Reached only once the evidence pass has already
+    # tried to read them, so this says "OCR found nothing", not "we never looked".
     if images and _looks_like_delivery_thread(email.subject, body):
+        attempted = getattr(evidence, "ocr_attempted", 0)
+        how = (f"OCR read {attempted} of them and recovered no PO"
+               if attempted else "no OCR client is configured")
         return result(NotificationType.UNKNOWN, TriageCategory.ROUTE, "rule_5b_image_only_evidence",
-                      f"delivery evidence is {images} photographed attachment(s) with no text layer — needs OCR or a person")
+                      f"delivery evidence is {images} photographed attachment(s) with no text layer — "
+                      f"{how}; needs OCR or a person")
 
     # Rule 6 — a PO is referenced but nothing above recognised the shape. Better routed to a
     # person than guessed at.

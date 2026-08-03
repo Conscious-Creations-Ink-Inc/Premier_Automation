@@ -73,10 +73,23 @@ def test_nested_message_attachments_are_recursed_into(emails):
 
 def test_identical_pods_under_two_filenames_collapse_to_one(emails):
     """Two attachments on that message are byte-identical PODs saved under different names — one
-    of the two names is simply wrong. Content is truth."""
+    of the two names is simply wrong. Content is truth, so only one is read.
+
+    Both are still *reported*: the duplicate is carried with a `drop_hint` so the attachment
+    ledger shows both slots and which one was actually extracted. Removing it outright, as this
+    used to, meant a human auditing the mail could not tell the second file had ever existed.
+    """
     email = find(emails, "Verification of Fabric Receipt")
     pdfs = [a for a in email.attachments if a.filename.endswith(".pdf")]
-    assert len(pdfs) == 1
+    assert len(pdfs) == 2
+
+    readable = [a for a in pdfs if not a.drop_hint]
+    assert len(readable) == 1
+    assert readable[0].content_bytes, "the kept copy must still carry its bytes"
+
+    duplicate = next(a for a in pdfs if a.drop_hint)
+    assert duplicate.drop_hint.startswith("duplicate:")
+    assert duplicate.content_bytes == b"", "a dropped duplicate carries metadata only"
 
 
 def test_signature_logos_are_dropped_and_real_photos_are_kept(emails):
@@ -122,6 +135,32 @@ def test_the_status_report_thread_is_routed_to_a_person(emails):
     replacement PO — recognisable as delivery mail, out of scope, human only."""
     result = triage(find(emails, "Purchase Order Status Report"))
     assert result.category == TriageCategory.ROUTE
+
+
+def test_no_attachment_in_premiers_real_mail_goes_unclaimed():
+    """The headline promise, measured against their actual mail rather than my fixtures.
+
+    `no_adapter` means nothing recognised the file — a genuine coverage gap. It is distinct
+    from `unsupported_format` (a decision we made and can explain) and from `empty` (we read it
+    and it held nothing). Any occurrence here is a real production hole.
+    """
+    import tempfile
+
+    from tools.run_corpus import run
+
+    with tempfile.TemporaryDirectory() as out_dir:
+        report = run(CORPUS_DIR, Path(out_dir))
+
+    ledger = report["attachments"]
+    assert ledger["unclaimed"] == [], f"unclaimed attachments: {ledger['unclaimed']}"
+    assert ledger["orphans"] == 0, "an attachment escaped the dispatcher without a verdict"
+
+    # Every attachment accounted for, and the trackers genuinely read rather than guessed at.
+    assert len(ledger["rows"]) == 72
+    extracted = {r["filename"]: r["records_extracted"]
+                 for r in ledger["rows"] if r["disposition"] == "extracted"}
+    assert extracted.get("Cameo Receivers.xlsx") == 17
+    assert extracted.get("Public Space - Pending Receipt Confirmation Orders.xlsx") == 91
 
 
 def test_the_full_run_scores_clean():

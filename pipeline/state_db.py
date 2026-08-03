@@ -68,9 +68,55 @@ def get_connection(db_path=PIPELINE_STATE_DB_PATH) -> sqlite3.Connection:
             updated_at            TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attachment_ledger (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id              TEXT NOT NULL,
+            parent_id             INTEGER,
+            depth                 INTEGER NOT NULL DEFAULT 0,
+            ordinal               INTEGER NOT NULL DEFAULT 0,
+            container_path        TEXT NOT NULL DEFAULT '',
+            filename              TEXT NOT NULL DEFAULT '',
+            declared_content_type TEXT,
+            sniffed_kind          TEXT NOT NULL,
+            sniff_reason          TEXT NOT NULL DEFAULT '',
+            sha256                TEXT NOT NULL DEFAULT '',
+            size_bytes            INTEGER NOT NULL DEFAULT 0,
+            content_id            TEXT,
+            is_inline             INTEGER NOT NULL DEFAULT 0,
+            triage_category       TEXT,
+            claimed_by            TEXT,
+            records_extracted     INTEGER NOT NULL DEFAULT 0,
+            disposition           TEXT NOT NULL,
+            disposition_detail    TEXT NOT NULL DEFAULT '',
+            error_type            TEXT,
+            review_status         TEXT NOT NULL DEFAULT 'none',
+            first_seen_at         TEXT NOT NULL,
+            last_updated_at       TEXT,
+            UNIQUE (email_id, depth, ordinal, sha256)
+        )
+    """)
+    # The uniqueness key is (email, depth, ordinal, sha) rather than (email, sha): one corpus
+    # message carries two byte-identical PODs saved under different filenames, and both slots
+    # must appear in the ledger even though only one of them is extracted.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_ledger_email ON attachment_ledger(email_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_ledger_disposition ON attachment_ledger(disposition, review_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_ledger_sha ON attachment_ledger(sha256)")
+
     _add_missing_columns(conn)
     conn.commit()
     return conn
+
+
+def forget_message(conn: sqlite3.Connection, email_id: str) -> None:
+    """Drop the seen-marker so a message can be ingested again.
+
+    `is_new_message` records an id permanently, so an attachment we could not read today would
+    never be retried after the reader that could read it is written. This is what makes the
+    ledger's `reprocess` action possible instead of the ledger being a graveyard.
+    """
+    conn.execute("DELETE FROM seen_message_ids WHERE email_id = ?", (email_id,))
+    conn.commit()
 
 
 # Columns added after the first stores were created. `CREATE TABLE IF NOT EXISTS` leaves an

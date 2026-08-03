@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Optional
@@ -10,7 +11,10 @@ import requests
 from config import settings
 from pipeline.models import Attachment, RawEmail
 
+_logger = logging.getLogger(__name__)
+
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+MAX_PAGES_PER_POLL = 20   # 20 x $top=50 = 1000 messages; a guard, not a real ceiling
 GRAPH_WELL_KNOWN_FOLDERS = {"inbox", "drafts", "sentitems", "deleteditems", "archive", "junkemail", "outbox"}
 
 
@@ -115,21 +119,61 @@ class GraphMailbox(Mailbox):
         return {"Authorization": f"Bearer {self._access_token()}"}
 
     def fetch_new(self) -> List[RawEmail]:
+        """Every message in the Inbox, following pagination, oldest first.
+
+        Three fixes over the original single-page call:
+
+        * **`@odata.nextLink` is followed.** `$top=50` with the link ignored silently lost every
+          message beyond the fiftieth in a poll (finding C11).
+        * **Oldest first**, so a poll truncated by `MAX_PAGES_PER_POLL` still makes forward
+          progress instead of re-reading the same newest page forever.
+        * **Per-message try/except.** One malformed message used to abort the whole poll, because
+          the original built the list in a comprehension (finding C8).
+        """
         headers = self._headers()
         url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/mailFolders/Inbox/messages"
-        params = {"$top": 50, "$select": "id,receivedDateTime,subject,from,body,hasAttachments"}
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        return [self._to_raw_email(msg, headers) for msg in resp.json().get("value", [])]
+        params = {
+            "$top": 50,
+            "$orderby": "receivedDateTime asc",
+            "$select": "id,internetMessageId,receivedDateTime,subject,from,body,hasAttachments",
+        }
+
+        emails: List[RawEmail] = []
+        pages = 0
+        while url and pages < MAX_PAGES_PER_POLL:
+            resp = requests.get(url, headers=headers, params=params if pages == 0 else None, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            for msg in payload.get("value", []):
+                try:
+                    emails.append(self._to_raw_email(msg, headers))
+                except Exception as e:
+                    _logger.warning("skipping message %s: %s: %s",
+                                    msg.get("id"), type(e).__name__, e, exc_info=True)
+            url = payload.get("@odata.nextLink")
+            pages += 1
+
+        if url:
+            _logger.warning("poll truncated after %s pages; more mail remains in the Inbox", pages)
+        return emails
 
     def _to_raw_email(self, msg: dict, headers: dict) -> RawEmail:
         sender_address = msg.get("from", {}).get("emailAddress", {}).get("address", "") or ""
         body = msg.get("body", {})
         body_content = body.get("content")
         is_html = body.get("contentType") == "html"
-        attachments = self._fetch_attachments(msg["id"], headers) if msg.get("hasAttachments") else []
+
+        # Graph reports hasAttachments=false for a message whose only images are inline, so
+        # relying on it alone loses every pasted-in photograph.
+        has_inline = bool(body_content and "cid:" in body_content)
+        attachments = (self._fetch_attachments(msg["id"], headers, body_content)
+                       if msg.get("hasAttachments") or has_inline else [])
+
+        # internetMessageId is stable; the folder-scoped `id` changes the moment a message is
+        # moved — which this pipeline does to every message it processes. Using `id` as the
+        # dedupe key meant moved mail could be re-ingested (finding C5).
         return RawEmail(
-            email_id=msg["id"],
+            email_id=msg.get("internetMessageId") or f"graph:{msg['id']}",
             received_at=msg["receivedDateTime"],
             sender_address=sender_address,
             sender_domain=sender_address.split("@")[-1] if "@" in sender_address else "",
@@ -137,21 +181,98 @@ class GraphMailbox(Mailbox):
             body_html=body_content if is_html else None,
             body_text=body_content if not is_html else None,
             attachments=attachments,
+            provider_message_id=msg["id"],
         )
 
-    def _fetch_attachments(self, message_id: str, headers: dict) -> List[Attachment]:
-        url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages/{message_id}/attachments"
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        attachments = []
-        for att in resp.json().get("value", []):
-            if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
-                attachments.append(Attachment(
-                    filename=att["name"],
-                    content_type=att.get("contentType", "application/octet-stream"),
-                    content_bytes=base64.b64decode(att["contentBytes"]),
-                ))
+    def _fetch_attachments(
+        self, message_id: str, headers: dict, body_content: Optional[str] = None
+    ) -> List[Attachment]:
+        """All three attachment kinds Graph can return, paginated.
+
+        `itemAttachment` — an attached Outlook message — was silently discarded, and it is how a
+        forwarded notification arrives, the single most common shape in Premier's mail
+        (finding C12). Its bytes come from the `/$value` endpoint and are handed on as a `.msg`,
+        which the container adapter unwraps.
+
+        `referenceAttachment` — a OneDrive/SharePoint link — carries no content and fetching it
+        would need `Files.Read.All` and a separate consent conversation. It is recorded with its
+        URL so a person can open it, rather than vanishing.
+        """
+        from pipeline.parsing import sniff
+
+        base = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages/{message_id}/attachments"
+        url = base
+        cids = sniff.referenced_cids(body_content)
+        attachments: List[Attachment] = []
+        pages = 0
+
+        while url and pages < MAX_PAGES_PER_POLL:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            for att in payload.get("value", []):
+                try:
+                    parsed = self._to_attachment(att, base, headers, cids)
+                    if parsed is not None:
+                        attachments.append(parsed)
+                except Exception as e:
+                    _logger.warning("skipping attachment %s on %s: %s: %s",
+                                    att.get("name"), message_id, type(e).__name__, e, exc_info=True)
+            url = payload.get("@odata.nextLink")
+            pages += 1
         return attachments
+
+    def _to_attachment(
+        self, att: dict, base_url: str, headers: dict, cids: set
+    ) -> Optional[Attachment]:
+        from pipeline.parsing import sniff
+
+        odata_type = att.get("@odata.type", "")
+        name = att.get("name") or "unnamed"
+        content_id = att.get("contentId")
+        is_inline = bool(att.get("isInline")) or bool(content_id and str(content_id).strip("<>") in cids)
+
+        if odata_type == "#microsoft.graph.fileAttachment":
+            data = base64.b64decode(att["contentBytes"])
+        elif odata_type == "#microsoft.graph.itemAttachment":
+            # The item's raw bytes; `$value` returns the .msg/.eml stream itself.
+            resp = requests.get(f"{base_url}/{att['id']}/$value", headers=headers, timeout=60)
+            resp.raise_for_status()
+            data = resp.content
+            if not name.lower().endswith((".msg", ".eml")):
+                name = f"{name}.msg"
+        elif odata_type == "#microsoft.graph.referenceAttachment":
+            return Attachment(
+                filename=name,
+                content_type="application/x-reference",
+                content_bytes=b"",
+                content_id=content_id,
+                is_inline=is_inline,
+                drop_hint=f"reference:cloud link — {att.get('sourceUrl') or 'no URL supplied'}",
+            )
+        else:
+            _logger.warning("unrecognised attachment type %s on %s", odata_type, name)
+            return Attachment(
+                filename=name, content_type=att.get("contentType") or "application/octet-stream",
+                content_bytes=b"", drop_hint=f"reference:unhandled Graph type {odata_type}",
+            )
+
+        result = sniff.sniff(data, name, att.get("contentType") or "")
+        attachment = Attachment(
+            filename=name,
+            content_type=att.get("contentType") or "application/octet-stream",
+            content_bytes=data,
+            content_id=content_id,
+            is_inline=is_inline,
+            sha256=result.sha256,
+            size_bytes=len(data),
+            sniffed_kind=result.kind,
+        )
+        verdict = sniff.classify_image(data, name, result, cids, content_id)
+        if verdict.decorative:
+            attachment.drop_hint = f"decorative:{verdict.certainty} — {verdict.reason}"
+            attachment.content_bytes = b""
+        return attachment
 
     def _resolve_folder_id(self, folder_name: str, headers: dict) -> str:
         """Graph's /move endpoint only accepts a well-known folder name (inbox, archive, ...) or
@@ -178,6 +299,12 @@ class GraphMailbox(Mailbox):
         return folder_id
 
     def mark_processed(self, email_id: str, folder: str) -> None:
+        """`email_id` here is the provider id, not `RawEmail.email_id`.
+
+        Those diverged when the dedupe key moved to `internetMessageId` (finding C5): Graph's
+        /move endpoint only understands its own folder-scoped id, while the dedupe key has to be
+        the one that survives the move. The orchestrator passes `provider_message_id`.
+        """
         headers = self._headers()
         destination_id = self._resolve_folder_id(folder, headers)
         url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages/{email_id}/move"

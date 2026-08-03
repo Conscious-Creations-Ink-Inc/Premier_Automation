@@ -5,10 +5,12 @@ from typing import Dict, List, Optional, Tuple
 
 from config import settings
 from connectors.mailbox import Mailbox
-from pipeline import extracted_records_store, stage2_accumulate, state_db
+from pipeline import attachment_ledger, evidence, extracted_records_store, stage2_accumulate, state_db
 from pipeline.models import DeliveryEvent, ExtractedRecord, TriageCategory
 from pipeline.stage1_ingest import fetch_new_emails
+from pipeline.parsing import text
 from pipeline.stage1_triage import triage
+from pipeline.stage3_extract import containers, dispatch
 from pipeline.stage3_extract.base import ExtractionAdapter, ExtractionSource
 from pipeline.stage3_extract.docx_adapter import DocxAdapter
 from pipeline.stage3_extract.excel_adapter import ExcelAdapter
@@ -16,6 +18,8 @@ from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 from pipeline.stage3_extract.html_adapter import HtmlAdapter
 from pipeline.stage3_extract.ocr_adapter import DocumentIntelligenceClient, OcrAdapter
 from pipeline.stage3_extract.pdf_adapter import PdfAdapter
+from pipeline.stage3_extract.text_adapter import TextAdapter
+from pipeline.stage3_extract.unsupported_adapter import UnsupportedFormatAdapter
 
 
 def _log(message: str) -> None:
@@ -26,26 +30,69 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _mark_processed_safely(mailbox: Mailbox, email_id: str, folder: str) -> None:
+def _mark_processed_safely(mailbox: Mailbox, email, folder: str) -> None:
     """A folder-move failure (transient Graph hiccup, etc.) must never crash the run — the email
     is already durably captured in our own state by the time this is called; worst case it just
     sits in Inbox and gets looked at again next poll (seen_message_ids still skips reprocessing it)."""
+    handle = getattr(email, "provider_message_id", None) or getattr(email, "email_id", email)
     try:
-        mailbox.mark_processed(email_id, folder)
+        mailbox.mark_processed(handle, folder)
     except Exception as e:
-        _log(f"failed to move {email_id} to '{folder}': {e}")
+        _log(f"failed to move {handle} to '{folder}': {e}")
 
 
 def build_default_adapters(ocr_client: Optional[DocumentIntelligenceClient] = None) -> List[ExtractionAdapter]:
-    """The fixed dispatch order from STAGE_3_EXTRACT.md, extended with DocxAdapter (discovered
-    as a real, plausible attachment format via real dummy test documents — not in the original
-    discovery-doc sample set). `ocr_client` lets callers swap in Tesseract or the real Azure
-    client instead of the default fixture-based mock, for both OcrAdapter and DocxAdapter's own
-    embedded-image fallback."""
+    """The dispatch cascade, most specific first.
+
+    `ocr_client` swaps in Azure AI Vision or Tesseract in place of the default mock, for both
+    OcrAdapter and DocxAdapter's embedded-image fallback.
+
+    `UnsupportedFormatAdapter` is deliberately last. It claims the kinds we recognise but do not
+    read (.doc, .pptx, .7z, .rar, and anything unidentified), so those end with a stated reason
+    on the exception queue instead of being indistinguishable from a coverage gap.
+    """
     return [
         HtmlAdapter(), PdfAdapter(), DocxAdapter(ocr_client=ocr_client),
-        OcrAdapter(client=ocr_client), ExcelAdapter(), FreetextAdapter(),
+        OcrAdapter(client=ocr_client), ExcelAdapter(), TextAdapter(),
+        FreetextAdapter(), UnsupportedFormatAdapter(),
     ]
+
+
+def _stamp_triage_category(conn, email, category: str) -> None:
+    """Backfill the triage verdict onto rows written before triage ran.
+
+    The ledger is populated first precisely so routed and hidden mail is recorded at all; the
+    verdict simply is not known yet at that moment."""
+    for attachment in email.attachments:
+        if attachment.ledger_id is not None:
+            conn.execute(
+                "UPDATE attachment_ledger SET triage_category = ? WHERE id = ?",
+                (category, attachment.ledger_id),
+            )
+    conn.commit()
+
+
+def _enforce_attachment_limits(email) -> Optional[str]:
+    """Flag limit breaches, marking the offending attachments rather than removing them.
+
+    Returns a reason when the email as a whole must be quarantined. There were no limits at all
+    before this: a 200 MB attachment was read into memory, base64-encoded, and written into a
+    SQLite TEXT column.
+    """
+    live = [a for a in email.attachments if not a.drop_hint]
+    total = sum(a.size_bytes or len(a.content_bytes or b"") for a in live)
+
+    for attachment in live:
+        size = attachment.size_bytes or len(attachment.content_bytes or b"")
+        if size > settings.MAX_ATTACHMENT_BYTES:
+            attachment.drop_hint = f"oversize:{size} bytes exceeds {settings.MAX_ATTACHMENT_BYTES}"
+            attachment.content_bytes = b""
+
+    if len(live) > settings.MAX_ATTACHMENTS_PER_EMAIL:
+        return f"{len(live)} attachments exceeds {settings.MAX_ATTACHMENTS_PER_EMAIL}"
+    if total > settings.MAX_EMAIL_ATTACHMENT_BYTES:
+        return f"{total} total bytes exceeds {settings.MAX_EMAIL_ATTACHMENT_BYTES}"
+    return None
 
 
 def run_adapters(source: ExtractionSource, adapters: Optional[List[ExtractionAdapter]] = None) -> List[ExtractedRecord]:
@@ -105,9 +152,12 @@ def _sources_for_delivery_event(event: DeliveryEvent) -> List[ExtractionSource]:
                 source_type="body", body_html=email.body_html, body_text=email.body_text, **common,
             ))
         for att in email.attachments:
+            if att.drop_hint:
+                continue   # already ledgered with a terminal disposition at ingest
             sources.append(ExtractionSource(
                 source_type="attachment", filename=att.filename,
-                content_type=att.content_type, content_bytes=att.content_bytes, **common,
+                content_type=att.content_type, content_bytes=att.content_bytes,
+                ledger_id=att.ledger_id, container_path=att.container_path, **common,
             ))
     return sources
 
@@ -228,26 +278,52 @@ def process_new_mail(
     if conn is None:
         conn = state_db.get_connection()
     adapters = build_default_adapters(ocr_client=ocr_client)
+    evidence_cache = evidence.EvidenceCache()
     staged_count = 0
     try:
         released_events: List[DeliveryEvent] = []
 
         for email in fetch_new_emails(mailbox, conn=conn):
             try:
-                triaged = triage(email)
+                oversize = _enforce_attachment_limits(email)
+
+                # Ledger every attachment *before* anything branches. ROUTE and HIDE mail exits
+                # without reaching extraction, so anything recorded further down structurally
+                # cannot see it — and ROUTE is where the interesting failures land, since a
+                # photographed POD with no readable text ends up there.
+                attachment_ledger.observe(conn, email, None, _now_iso())
+
+                # Then read the attachments, and only then decide whether the mail matters.
+                # Two corpus threads carry no PO in any body because every PO is inside an
+                # attached spreadsheet; triaging before opening it can only ever be a guess.
+                email_evidence = evidence.gather(
+                    conn, email, text.body_text_of(email), adapters, now=_now_iso(),
+                ) if not oversize else evidence.EmailEvidence(email_id=email.email_id)
+                evidence_cache.put(email_evidence)
+
+                triaged = triage(email, evidence=email_evidence)
+                _stamp_triage_category(conn, email, triaged.category.value)
+
+                if oversize:
+                    _log(f"quarantined {email.email_id}: {oversize}")
+                    attachment_ledger.close_undispatched(conn, email, _now_iso())
+                    _mark_processed_safely(mailbox, email, settings.MAILBOX_FOLDER_QUARANTINE)
+                    continue
                 if triaged.category == TriageCategory.ROUTE:
                     _log(f"routed, no accumulation: {email.email_id} — {triaged.reason}")
-                    _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_ROUTED)
+                    attachment_ledger.close_undispatched(conn, email, _now_iso())
+                    _mark_processed_safely(mailbox, email, settings.MAILBOX_FOLDER_ROUTED)
                     continue
                 if triaged.category == TriageCategory.HIDE:
                     # discarded — Stage 1's job is done, nothing more happens with it
-                    _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_HIDDEN)
+                    attachment_ledger.close_undispatched(conn, email, _now_iso())
+                    _mark_processed_safely(mailbox, email, settings.MAILBOX_FOLDER_HIDDEN)
                     continue
                 released_events.extend(stage2_accumulate.process_triaged_email(conn, triaged, _now_iso()))
-                _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_PROCESSED)
+                _mark_processed_safely(mailbox, email, settings.MAILBOX_FOLDER_PROCESSED)
             except Exception as e:
                 _log(f"failed to triage/accumulate {email.email_id}: {e}")
-                _mark_processed_safely(mailbox, email.email_id, settings.MAILBOX_FOLDER_ERRORS)
+                _mark_processed_safely(mailbox, email, settings.MAILBOX_FOLDER_ERRORS)
                 continue
 
         released_events.extend(stage2_accumulate.sweep_stale_holds(conn, datetime.now(timezone.utc)))
@@ -256,7 +332,15 @@ def process_new_mail(
             try:
                 raw_records: List[ExtractedRecord] = []
                 for src in _sources_for_delivery_event(event):
-                    for record in run_adapters(src, adapters):
+                    if src.source_type == "attachment":
+                        # Already read during the evidence pass, before triage — re-reading it
+                        # would duplicate the work and, for images, the OCR spend.
+                        produced = evidence_cache.records_for(src.source_email_id, event.key.po_number)
+                    else:
+                        produced = dispatch.dispatch_source(
+                            conn, src, adapters, budget=containers.Budget.fresh(), now=_now_iso(),
+                        )
+                    for record in produced:
                         if not _belongs_to_event(record, event):
                             continue
                         record.shipment_number = record.shipment_number or event.key.shipment_number
@@ -268,6 +352,10 @@ def process_new_mail(
             except Exception as e:
                 _log(f"failed to extract for delivery {event.key}: {e}")
                 continue
+
+        # Anything still open belongs to a HOLD whose event has not fired. Settling it here is
+        # what keeps attachment_ledger.orphans() meaningful as a leak detector.
+        attachment_ledger.close_open_rows(conn, _now_iso())
     finally:
         if owns_connection:
             conn.close()

@@ -34,6 +34,32 @@ class Attachment:
     content_type: str
     content_bytes: bytes
 
+    # --- Provenance. All defaulted, so every existing positional constructor still works.
+
+    content_id: Optional[str] = None
+    is_inline: bool = False
+    """From the mail source. Together with the body's `cid:` references these are what tell a
+    signature logo apart from a photograph someone attached — see parsing/sniff.classify_image."""
+
+    sha256: str = ""
+    size_bytes: int = 0
+    sniffed_kind: str = ""
+    """Recorded at ingest, while the bytes are still in hand. A dropped attachment has its
+    `content_bytes` cleared to avoid carrying a logo or a duplicate around, so re-sniffing it
+    later yields `unknown` — which would make the ledger useless for exactly the rows a person
+    most needs to understand."""
+
+    drop_hint: Optional[str] = None
+    """Set when the connector decided not to hand this on: `"decorative:tiny"`,
+    `"duplicate:<sha>"`, `"oversize"`, `"empty"`. The attachment is still carried, so the
+    orchestrator can record *why* it was dropped. Silently discarding one at ingest is how a
+    photographed POD used to disappear without trace."""
+
+    ledger_id: Optional[int] = None
+    container_path: str = ""
+    """Position inside nested containers, e.g. `"outer.msg!/inner.zip!/pod.pdf"`, so a record
+    extracted four levels down can still be traced back to the file it came from."""
+
 
 @dataclass
 class RawEmail:
@@ -45,6 +71,13 @@ class RawEmail:
     body_html: Optional[str]
     body_text: Optional[str]
     attachments: List[Attachment] = field(default_factory=list)
+
+    provider_message_id: Optional[str] = None
+    """The mail provider's own handle for this message, when it differs from `email_id`.
+
+    Graph's folder-scoped `id` changes the moment a message is moved — and this pipeline moves
+    every message it processes — so it cannot be the dedupe key; `internetMessageId` is. But
+    Graph's /move endpoint only accepts its own id, so both have to be carried (finding C5)."""
 
 
 @dataclass

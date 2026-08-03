@@ -73,6 +73,12 @@ class ExtractionSource:
     multi-PO source read without this filter stages every line once per PO on the document:
     one email covering two POs produced four records where two were correct (finding C1)."""
 
+    ledger_id: Optional[int] = None
+    container_path: str = ""
+    """Which `attachment_ledger` row this source is, and where it sits inside any containers.
+    The dispatcher writes the outcome back against `ledger_id`, which is what guarantees every
+    attachment ends with a recorded verdict."""
+
 
 class ExtractionAdapter(ABC):
     @abstractmethod

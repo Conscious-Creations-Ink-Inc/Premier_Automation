@@ -1,5 +1,6 @@
 import io
 import time
+from pathlib import Path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -85,19 +86,127 @@ class TesseractDocumentIntelligenceClient(DocumentIntelligenceClient):
         return OcrResult(tables=[], raw_text=text, confidence=0.5)
 
 
-class RealDocumentIntelligenceClient(DocumentIntelligenceClient):
-    """Actual Azure AI Document Intelligence call — not implemented until Premier's Azure
-    resource/key exist. See ourDocs/JOE_FOLLOWUPS_CHECKLIST.md."""
+class AzureVisionClient(DocumentIntelligenceClient):
+    """Azure AI Vision — the Image Analysis `read` feature, called over REST.
 
-    def __init__(self, endpoint: Optional[str] = None, api_key: Optional[str] = None):
-        self.endpoint = endpoint or settings.AZURE_DOC_INTELLIGENCE_ENDPOINT
-        self.api_key = api_key or settings.AZURE_DOC_INTELLIGENCE_KEY
+    Complete and ready; it needs only `AZURE_VISION_ENDPOINT` and `AZURE_VISION_KEY`, which are
+    blank in `.env` until Premier provisions the resource. While they are blank `build_client`
+    resolves to the mock, so nothing here runs and photographed PODs route to a person.
+
+    Deliberately no SDK: one authenticated POST against `/computervision/imageanalysis:analyze`
+    is the whole contract, and `requests` is already a dependency.
+
+    **Known limit, and it is the reason to keep this swappable:** Vision's Read returns text
+    lines with bounding boxes, *not* table structure. That is sufficient for a carrier POD —
+    `parsing/pod.py` recovers delivery date, carrier, tracking and signature from running text —
+    but a photographed packing-slip *table* comes back as loose lines with no column alignment.
+    If those turn out to be common, Azure AI Document Intelligence's prebuilt-layout model is
+    the better service and slots in behind this same interface.
+
+    A PDF cannot be posted to the Image Analysis endpoint, so scanned PDFs are rasterised
+    page-by-page first, exactly as the Tesseract client does.
+    """
+
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ):
+        self.endpoint = (endpoint or settings.AZURE_VISION_ENDPOINT or "").rstrip("/")
+        self.api_key = api_key or settings.AZURE_VISION_KEY
+        self.timeout = timeout or settings.AZURE_VISION_TIMEOUT_SECONDS
+        if not self.endpoint or not self.api_key:
+            raise ValueError(
+                "AzureVisionClient needs AZURE_VISION_ENDPOINT and AZURE_VISION_KEY. Both are "
+                "blank until the Azure AI Vision resource is provisioned — set them in .env."
+            )
 
     def analyze(self, content_bytes: bytes) -> OcrResult:
-        raise NotImplementedError(
-            "RealDocumentIntelligenceClient requires a provisioned Azure Document Intelligence "
-            "resource endpoint + key — see ourDocs/JOE_FOLLOWUPS_CHECKLIST.md."
+        if content_bytes[:4] == b"%PDF":
+            return self._analyze_pdf(content_bytes)
+        return OcrResult(tables=[], raw_text=self._read_image(content_bytes), confidence=0.8)
+
+    def _analyze_pdf(self, content_bytes: bytes) -> OcrResult:
+        import pdfplumber
+
+        texts = []
+        with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
+            for page in pdf.pages[: settings.OCR_MAX_PAGES]:
+                buffer = io.BytesIO()
+                page.to_image(resolution=200).original.save(buffer, format="PNG")
+                texts.append(self._read_image(buffer.getvalue()))
+        return OcrResult(tables=[], raw_text="\n".join(texts), confidence=0.8)
+
+    def _read_image(self, image_bytes: bytes) -> str:
+        import requests
+
+        if len(image_bytes) > settings.OCR_MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"image is {len(image_bytes)} bytes, above Azure Vision's "
+                f"{settings.OCR_MAX_IMAGE_BYTES}-byte limit"
+            )
+        response = requests.post(
+            f"{self.endpoint}/computervision/imageanalysis:analyze",
+            params={"api-version": settings.AZURE_VISION_API_VERSION, "features": "read"},
+            headers={
+                "Ocp-Apim-Subscription-Key": self.api_key,
+                "Content-Type": "application/octet-stream",
+            },
+            data=image_bytes,
+            timeout=self.timeout,
         )
+        response.raise_for_status()
+        return _text_from_vision_response(response.json())
+
+
+def _text_from_vision_response(payload: dict) -> str:
+    """Flatten Vision's block/line structure to text, one line per line, blocks separated.
+
+    Line order is reading order, which is what the POD grammar's label/value patterns assume.
+    """
+    blocks = (payload.get("readResult") or {}).get("blocks") or []
+    chunks = []
+    for block in blocks:
+        lines = [line.get("text", "") for line in block.get("lines", [])]
+        if lines:
+            chunks.append("\n".join(lines))
+    return "\n\n".join(chunks)
+
+
+# Kept under its old name so existing imports and tests keep resolving.
+RealDocumentIntelligenceClient = AzureVisionClient
+
+
+def build_client(preference: Optional[str] = None) -> DocumentIntelligenceClient:
+    """Resolve the OCR client: `auto` | `azure` | `tesseract` | `mock`.
+
+    `auto` prefers Azure when it is configured, falls back to Tesseract when the binary is
+    present, and otherwise returns the mock — so a machine with no OCR at all still runs, and
+    photographed evidence lands on the exception queue instead of failing the pass.
+    """
+    choice = (preference or settings.OCR_CLIENT or "auto").lower()
+
+    if choice == "mock":
+        return MockDocumentIntelligenceClient()
+    if choice == "azure":
+        return AzureVisionClient()
+    if choice == "tesseract":
+        return TesseractDocumentIntelligenceClient()
+
+    if settings.AZURE_VISION_ENDPOINT and settings.AZURE_VISION_KEY:
+        try:
+            return AzureVisionClient()
+        except Exception as e:
+            _log(f"Azure Vision unavailable ({e}); falling back")
+    try:
+        client = TesseractDocumentIntelligenceClient()
+        if Path(settings.TESSERACT_CMD_PATH).exists():
+            return client
+    except Exception:
+        pass
+    _log("no OCR client configured — images and scans will be routed for human review")
+    return MockDocumentIntelligenceClient()
 
 
 def _empty_ocr_failure_record(source: ExtractionSource) -> ExtractedRecord:

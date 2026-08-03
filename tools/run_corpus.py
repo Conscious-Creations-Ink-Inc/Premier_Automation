@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from connectors.msg_file import MsgFileMailbox
-from pipeline import extracted_records_store, ingest_orchestrator, stage2_accumulate, state_db
+from pipeline import attachment_ledger, evidence, extracted_records_store, ingest_orchestrator, stage2_accumulate, state_db
 from pipeline.models import TriageCategory
 from pipeline.parsing import text, thread
 from pipeline.vendors import authority
@@ -126,10 +126,17 @@ def run(corpus_dir: Path, out_dir: Path) -> dict:
 
     conn = state_db.get_connection(":memory:")
     per_email: List[dict] = []
+    evidence_cache = evidence.EvidenceCache()
+    adapters = ingest_orchestrator.build_default_adapters()
     try:
         released = []
         for email in emails:
-            triaged = triage(email)
+            # Same order as process_new_mail: ledger every attachment, read them, and only then
+            # decide whether the mail matters. Two corpus threads carry no PO in any body.
+            attachment_ledger.observe(conn, email, None, _now())
+            email_evidence = evidence.gather(conn, email, text.body_text_of(email), adapters, now=_now())
+            evidence_cache.put(email_evidence)
+            triaged = triage(email, evidence=email_evidence)
             row = {
                 "file": file_by_id.get(email.email_id, email.email_id),
                 "subject": email.subject,
@@ -152,18 +159,27 @@ def run(corpus_dir: Path, out_dir: Path) -> dict:
         # Mirrors process_new_mail's extraction loop exactly, including the cross-source
         # reconcile — without it, an Inbound and the Delivered notice bundled with it both stage
         # their lines and the run reports twice the receipts the pipeline would really create.
-        adapters = ingest_orchestrator.build_default_adapters()
         records_by_file: Dict[str, list] = defaultdict(list)
         for event in released:
             raw = []
             for source in ingest_orchestrator._sources_for_delivery_event(event):
-                for record in ingest_orchestrator.run_adapters(source, adapters):
+                if source.source_type == "attachment":
+                    produced = evidence_cache.records_for(source.source_email_id, event.key.po_number)
+                else:
+                    produced = ingest_orchestrator.dispatch.dispatch_source(
+                        conn, source, adapters,
+                        budget=ingest_orchestrator.containers.Budget.fresh(), now=_now(),
+                    )
+                for record in produced:
                     if not ingest_orchestrator._belongs_to_event(record, event):
                         continue
                     record.shipment_number = record.shipment_number or event.key.shipment_number
                     raw.append(record)
             for record in ingest_orchestrator.reconcile_cross_source_duplicates(raw):
                 records_by_file[file_by_id.get(record.source_email_id, record.source_email_id)].append(record)
+
+        attachment_ledger.close_open_rows(conn, _now())
+        ledger = _ledger_snapshot(conn, file_by_id)
     finally:
         conn.close()
 
@@ -176,6 +192,7 @@ def run(corpus_dir: Path, out_dir: Path) -> dict:
         "corpus": str(corpus_dir),
         "emails": len(emails),
         "score": scored,
+        "attachments": ledger,
         "detail": per_email,
     }
 
@@ -187,6 +204,37 @@ def run(corpus_dir: Path, out_dir: Path) -> dict:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _ledger_snapshot(conn, file_by_id: Dict[str, str]) -> dict:
+    """Every attachment across the corpus, with the verdict it ended on.
+
+    This is the headline evidence for "nothing is silently dropped": the 30 signature logos are
+    visibly dropped *for a stated reason* rather than merely absent, and any attachment in
+    Premier's real mail that ends at `no_adapter` is a genuine coverage gap — which is what
+    `tests/test_corpus.py` asserts against.
+    """
+    rows = []
+    for record in attachment_ledger._query(conn, "SELECT * FROM attachment_ledger ORDER BY email_id, depth, ordinal"):
+        rows.append({
+            "file": file_by_id.get(record.email_id, record.email_id),
+            "filename": record.filename,
+            "container_path": record.container_path,
+            "depth": record.depth,
+            "kind": record.sniffed_kind,
+            "size_bytes": record.size_bytes,
+            "disposition": record.disposition,
+            "detail": record.disposition_detail,
+            "claimed_by": record.claimed_by,
+            "records_extracted": record.records_extracted,
+        })
+    return {
+        "rows": rows,
+        "by_disposition": attachment_ledger.counts_by_disposition(conn),
+        "by_kind": attachment_ledger.counts_by_kind(conn),
+        "orphans": len(attachment_ledger.orphans(conn)),
+        "unclaimed": [r["filename"] for r in rows if r["disposition"] == attachment_ledger.NO_ADAPTER],
+    }
 
 
 def _parsed_line_count(email, triaged) -> Optional[int]:
@@ -272,6 +320,63 @@ def _score(per_email: List[dict]) -> dict:
     }
 
 
+def _attachment_section(ledger: dict) -> List[str]:
+    if not ledger:
+        return []
+
+    rows = ledger["rows"]
+    lines = [
+        "## Attachments",
+        "",
+        f"**{len(rows)} attachment(s)** across the corpus, every one with a recorded verdict. "
+        f"Orphans (attachments that escaped without one): **{ledger['orphans']}** — this must be zero.",
+        "",
+        "| Verdict | Count | Meaning |",
+        "|---|---|---|",
+    ]
+    meanings = {
+        "extracted": "read, and produced records",
+        "empty": "read cleanly, held nothing extractable",
+        "container_expanded": "an archive or message; its members have their own rows",
+        "dropped_decorative": "signature logo or inline chrome",
+        "dropped_duplicate": "byte-identical to one already read",
+        "dropped_oversize": "breached an attachment limit",
+        "not_dispatched": "the email was routed or hidden before extraction",
+        "awaiting_release": "held pending the delivery event that will release it",
+        "no_adapter": "**nothing claimed it — a real coverage gap**",
+        "unsupported_format": "recognised, deliberately not read",
+        "encrypted": "password-protected",
+        "corrupt": "unreadable or truncated",
+        "unreadable": "an adapter claimed it and failed",
+    }
+    for disposition, count in sorted(ledger["by_disposition"].items(), key=lambda kv: -kv[1]):
+        lines.append(f"| `{disposition}` | {count} | {meanings.get(disposition, '')} |")
+
+    lines += ["", "| Detected kind | Count |", "|---|---|"]
+    for kind, count in sorted(ledger["by_kind"].items(), key=lambda kv: -kv[1]):
+        lines.append(f"| `{kind}` | {count} |")
+
+    if ledger["unclaimed"]:
+        lines += ["", "### Unclaimed — a coverage gap", ""]
+        lines += [f"- `{name}`" for name in ledger["unclaimed"]]
+    else:
+        lines += ["", "No attachment in Premier's real mail went unclaimed.", ""]
+
+    read = [r for r in rows if r["disposition"] in ("extracted", "empty", "container_expanded")]
+    if read:
+        lines += ["", "### What was actually read", "",
+                  "| File | Attachment | Kind | Size | Verdict | Adapter | Records |",
+                  "|---|---|---|---|---|---|---|"]
+        for r in sorted(read, key=lambda r: -r["records_extracted"]):
+            lines.append(
+                f"| {r['file'][:34]} | {(r['container_path'] or r['filename'])[:38]} | "
+                f"`{r['kind']}` | {r['size_bytes']:,} | {r['disposition']} | "
+                f"{r['claimed_by'] or ''} | {r['records_extracted']} |"
+            )
+    lines.append("")
+    return lines
+
+
 def _markdown(report: dict) -> str:
     score = report["score"]
     lines = [
@@ -316,6 +421,8 @@ def _markdown(report: dict) -> str:
         lines += ["## Failures", ""] + [f"- {f}" for f in score["failures"]] + [""]
     else:
         lines += ["No failures.", ""]
+
+    lines += _attachment_section(report.get("attachments") or {})
 
     if score["unlabelled_files"]:
         lines += ["## Unlabelled files (no ground truth recorded)", ""]

@@ -61,6 +61,35 @@ QTY_TOKEN_REGEX = r"(?<!\d/)\b(\d+)\s*(?:of|/)\s*(\d+)\b(?!\s*/\s*\d)"
 # fraction "7/18". The guards reject a match that's part of a longer d/d/d chain (a date has
 # three slash-separated numbers; a real quantity fraction like "11/12" only ever has two).
 
+# --- Attachment limits ------------------------------------------------------
+# There were no limits at all: a 200 MB attachment was read into memory, base64-encoded, and
+# written into a SQLite TEXT column. Breaching any of these is never a silent drop — the
+# attachment is recorded in the ledger with the reason and the mail is quarantined.
+
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024          # one file
+MAX_EMAIL_ATTACHMENT_BYTES = 100 * 1024 * 1024   # all files on one email
+MAX_ATTACHMENTS_PER_EMAIL = 100
+MAX_CONTAINER_DEPTH = 4                          # zip inside msg inside zip …
+MAX_CONTAINER_MEMBERS = 50                       # members of any one container
+MAX_CONTAINER_MEMBERS_TOTAL = 200                # across an email's whole container tree
+MAX_EXPANDED_BYTES = 100 * 1024 * 1024           # total uncompressed, shared across the tree
+MAX_ZIP_COMPRESSION_RATIO = 200                  # file_size / compress_size — the bomb guard
+
+# --- OCR --------------------------------------------------------------------
+# Production OCR is Azure AI Vision's Read API, called over REST. Both values are read from the
+# environment and are blank until Premier provisions the resource; while they are blank the
+# client selection below resolves to the Mock and photographed PODs route to a person with a
+# stated reason rather than silently yielding nothing.
+
+AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT") or None
+AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY") or None
+AZURE_VISION_API_VERSION = "2024-02-01"
+AZURE_VISION_TIMEOUT_SECONDS = 30
+
+OCR_CLIENT = os.getenv("PREMIER_OCR_CLIENT", "auto")   # auto | azure | tesseract | mock
+OCR_MAX_IMAGE_BYTES = 20 * 1024 * 1024   # Azure Vision's own per-image ceiling
+OCR_MAX_PAGES = 10                       # a scanned PDF is rasterised page by page; cap the spend
+
 ENABLE_AI_FALLBACK = False   # checklist #1b — off until Premier explicitly permits Claude on real content
 ANTHROPIC_MODEL = "claude-sonnet-5"
 AI_FALLBACK_CONFIDENCE_CAP = 0.5
@@ -95,6 +124,7 @@ MAILBOX_FOLDER_HIDDEN = "Hidden"        # TriageCategory.HIDE — pure noise, co
 MAILBOX_FOLDER_ROUTED = "Routed"        # TriageCategory.ROUTE — sent to the human exception queue
 MAILBOX_FOLDER_PROCESSED = "Processed"  # SURFACE/HOLD — captured into our own state, safe to move
 MAILBOX_FOLDER_ERRORS = "Errors"        # triage/accumulate raised — needs a human look, never retried silently forever
+MAILBOX_FOLDER_QUARANTINE = "Quarantine"  # breached an attachment limit — held intact for a person
 
 # --- Graph API (real mailbox connector) --------------------------------------
 
