@@ -6,6 +6,8 @@ from typing import List, Optional
 
 from config import settings
 from pipeline.models import ExtractedRecord
+from pipeline.parsing import pod as pod_parser
+from pipeline.parsing import sniff
 from pipeline.stage3_extract.base import (
     ExtractionAdapter,
     ExtractionSource,
@@ -115,13 +117,21 @@ class OcrAdapter(ExtractionAdapter):
         self.client = client or MockDocumentIntelligenceClient()
 
     def can_handle(self, source: ExtractionSource) -> bool:
+        """Claim by byte sniff, not by declared content type.
+
+        The corpus's five photographed PODs (`IMG_2479.jpeg` and siblings, ~3 MB each) arrive
+        with `mimetype=None`, so the previous content-type allowlist rejected every one of them
+        — the OCR path had never actually seen a real photo (finding C13). Sniffing also covers
+        HEIC, which phones now produce by default.
+        """
         if source.source_type != "attachment" or source.content_bytes is None:
             return False
-        if source.content_type in IMAGE_CONTENT_TYPES:
+        kind = sniff.sniff(source.content_bytes, source.filename or "", source.content_type or "").kind
+        if kind == sniff.KIND_IMAGE:
             return True
-        if source.content_type == "application/pdf":
+        if kind == sniff.KIND_PDF:
             from pipeline.stage3_extract.pdf_adapter import _has_text_layer
-            return not _has_text_layer(source.content_bytes)  # only if PdfAdapter found nothing
+            return not _has_text_layer(source.content_bytes)   # a scan, not a native PDF
         return False
 
     def extract(self, source: ExtractionSource) -> List[ExtractedRecord]:
@@ -166,6 +176,26 @@ def records_from_ocr_result(
             continue
         for row in table[1:]:
             records.append(build_record_from_row(source, row, column_map, extraction_source))
+
+    if not records and result.raw_text:
+        # A photographed POD or BOL is a labelled form, not a table, so it never survives the
+        # table pass. Reading it with the carrier-POD grammar recovers the delivery date,
+        # signature and reference line that the free-text pass below would miss entirely.
+        document = pod_parser.parse_pod(strip_print_chrome(result.raw_text))
+        if document is not None and (document.po_numbers or document.delivery_date):
+            from pipeline.stage3_extract.pdf_adapter import records_from_pod
+            records = records_from_pod(document, source)
+            for r in records:
+                r.extraction_source = f"{extraction_source}:carrier_pod"
+
+    if not records and not (result.raw_text or "").strip():
+        # OCR responded and returned nothing at all — which is what the default Mock client
+        # does, and what a real client does on an unreadable photo. There is nothing to
+        # extract, so nothing is emitted. Fabricating an empty record here staged one bogus
+        # row per pallet photo (six of them on one corpus message), each of which would have
+        # to be dismissed by hand in the exception queue.
+        _log(f"OCR returned no text and no tables for {source.source_email_id} ({source.filename})")
+        return []
 
     if not records:
         # Azure/OCR responded fine, it just found no recognizable table — a genuinely

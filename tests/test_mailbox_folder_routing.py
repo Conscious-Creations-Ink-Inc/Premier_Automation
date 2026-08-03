@@ -2,6 +2,7 @@ import json
 
 from connectors.mailbox import LocalFolderMailbox
 from pipeline import extracted_records_store, ingest_orchestrator, state_db
+from tests import corpus_fixtures as fx
 
 
 def write_email(folder, **overrides):
@@ -34,11 +35,11 @@ def test_dummy_emails_are_sorted_into_the_right_folders_after_one_pass(tmp_path)
         sender_address="marketing@wayfair.com", sender_domain="wayfair.com",
         subject="It's delivery day!", body_text="Your order is arriving today.",
     )
+    inbound = fx.inbound_email(email_id="msg-processed-1", po_numbers=("208491",))
     write_email(
         tmp_path, email_id="msg-processed-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 213987",
-        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>213987</td><td>LI-12</td><td>1</td></tr></table>",
+        sender_address=inbound.sender_address, sender_domain=inbound.sender_domain,
+        subject=inbound.subject, body_html=inbound.body_html,
     )
 
     mailbox = LocalFolderMailbox(tmp_path)
@@ -46,7 +47,7 @@ def test_dummy_emails_are_sorted_into_the_right_folders_after_one_pass(tmp_path)
     count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
 
     assert count == 1
-    assert [r.record.po_number for r in extracted_records_store.get_pending(c)] == ["213987"]
+    assert [r.record.po_number for r in extracted_records_store.get_pending(c)] == ["208491"]
 
     assert not (tmp_path / "msg-hidden-1.json").exists()
     assert not (tmp_path / "msg-routed-1.json").exists()

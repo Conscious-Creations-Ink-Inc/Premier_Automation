@@ -47,6 +47,8 @@ def _serialize_triaged_email(te: TriagedEmail) -> str:
         "extracted_po_hints": te.extracted_po_hints,
         "extracted_shipment_hint": te.extracted_shipment_hint,
         "reason": te.reason,
+        "origin_sender_address": te.origin_sender_address,
+        "notification_number": te.notification_number,
     })
 
 
@@ -75,6 +77,8 @@ def _deserialize_triaged_email(payload: str) -> TriagedEmail:
         extracted_po_hints=data["extracted_po_hints"],
         extracted_shipment_hint=data["extracted_shipment_hint"],
         reason=data["reason"],
+        origin_sender_address=data.get("origin_sender_address"),
+        notification_number=data.get("notification_number"),
     )
 
 

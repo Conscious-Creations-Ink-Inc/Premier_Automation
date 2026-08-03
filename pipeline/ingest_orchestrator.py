@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+
+from rapidfuzz import fuzz
 from typing import Dict, List, Optional, Tuple
 
 from config import settings
@@ -47,53 +49,148 @@ def build_default_adapters(ocr_client: Optional[DocumentIntelligenceClient] = No
 
 
 def run_adapters(source: ExtractionSource, adapters: Optional[List[ExtractionAdapter]] = None) -> List[ExtractedRecord]:
-    """First adapter whose can_handle() returns True wins. One adapter failing is logged and
-    treated as 'found nothing', never lets one bad source abort the rest of the delivery.
-    An attachment type no adapter recognizes is also logged, not silently staged as an empty
-    record — see FreetextAdapter, which intentionally does not claim attachments."""
+    """Walk the cascade until an adapter both claims the source and returns something.
+
+    A failing adapter is logged and the cascade *continues* to the next one. The previous
+    version returned `[]` on the first exception, which aborted the rest of the cascade and
+    contradicted its own docstring (finding C10) — a PDF whose table pass raised would never
+    reach the text pass that could have read it.
+
+    An adapter that claims a source and legitimately finds nothing also falls through, so a
+    body with an unrecognised table shape still gets a look from the free-text adapter.
+    """
+    claimed_by = None
     for adapter in adapters or build_default_adapters():
         try:
-            if adapter.can_handle(source):
-                return adapter.extract(source)
+            if not adapter.can_handle(source):
+                continue
+            claimed_by = adapter.__class__.__name__
+            records = adapter.extract(source)
+            if records:
+                return records
         except Exception as e:
-            _log(f"{adapter.__class__.__name__} failed on {source.source_email_id}: {e}")
-            return []
-    _log(
-        f"no adapter recognized source for {source.source_email_id} "
-        f"(source_type={source.source_type}, filename={source.filename}, content_type={source.content_type})"
-    )
+            _log(f"{adapter.__class__.__name__} failed on {source.source_email_id}: {type(e).__name__}: {e}")
+            continue
+
+    if claimed_by is None:
+        _log(
+            f"no adapter recognized source for {source.source_email_id} "
+            f"(source_type={source.source_type}, filename={source.filename}, content_type={source.content_type})"
+        )
     return []
 
 
 def _sources_for_delivery_event(event: DeliveryEvent) -> List[ExtractionSource]:
     """Body + every attachment, independently — each bundled email in the event contributes
-    its own sources (see ORCHESTRATOR_DESIGN.md)."""
+    its own sources (see ORCHESTRATOR_DESIGN.md).
+
+    Every source carries the event's PO in `only_po`, plus the email's sender and subject. The
+    PO filter is what stops a multi-PO document being staged once per PO: notice 239260 covers
+    206725 and 207665, releases as two events, and without the filter each event staged all
+    thirteen of its lines (finding C1). Sender and subject are what let a vendor parser
+    recognise the format at all.
+    """
     sources = []
     for te in event.emails:
         email = te.email
+        common = {
+            "source_email_id": email.email_id,
+            "email_date": email.received_at,
+            "sender_address": te.origin_sender_address or email.sender_address,
+            "subject": email.subject,
+            "only_po": event.key.po_number,
+        }
         if email.body_html or email.body_text:
             sources.append(ExtractionSource(
-                source_email_id=email.email_id, email_date=email.received_at,
-                source_type="body", body_html=email.body_html, body_text=email.body_text,
+                source_type="body", body_html=email.body_html, body_text=email.body_text, **common,
             ))
         for att in email.attachments:
             sources.append(ExtractionSource(
-                source_email_id=email.email_id, email_date=email.received_at,
                 source_type="attachment", filename=att.filename,
-                content_type=att.content_type, content_bytes=att.content_bytes,
+                content_type=att.content_type, content_bytes=att.content_bytes, **common,
             ))
     return sources
 
 
+def _belongs_to_event(record: ExtractedRecord, event: DeliveryEvent) -> bool:
+    """Second line of defence behind `only_po`.
+
+    Adapters that cannot filter by PO themselves — a carrier POD names a PO but a free-text
+    pass may name none — still hand back records that must not be attributed to the wrong
+    delivery. A record with no PO is adopted by the event (it is evidence *for* this delivery,
+    which is why it was in the bundle) and stamped with the event's PO; a record naming a
+    different PO is dropped, because that PO has its own event.
+    """
+    if not record.po_number:
+        record.po_number = event.key.po_number
+        return True
+    return record.po_number == event.key.po_number
+
+
+DESCRIPTION_MATCH_THRESHOLD = 85   # rapidfuzz token_set_ratio
+
+
+def _group_records(records: List[ExtractedRecord]) -> Dict[Tuple, List[ExtractedRecord]]:
+    """Group records that describe the same PO line, across sources of differing richness.
+
+    The two Authority notices for one delivery state different things about the same goods: the
+    Inbound gives a spec *and* a Spitfire line number, the Delivered gives a spec only. So the
+    spec is the primary key — using the line number first would leave the two ungrouped and
+    stage every line twice.
+
+    Lines with no spec at all are the awkward case: Authority puts prose in `Part #`
+    ("Accessory Pocket", "Toe Kick Planter"), and two such rows on one PO are different items.
+    They are separated by line number where stated, and otherwise matched on description, which
+    is how the Delivered notice's `Custom Accessory Pocket` finds the Inbound row it belongs to.
+    """
+    groups: Dict[Tuple, List[ExtractedRecord]] = {}
+    for record in records:
+        # The *full* spec, sub-part suffix included — never the parent. A lamp arrives as
+        # STE-402-LT-B (11 bases) and STE-402-LT-SH (12 shades), which are Spitfire lines 300
+        # and 301: separate receivable lines that legitimately have different quantities.
+        # Grouping them by their shared parent STE-402-LT merged two real lines into one and
+        # reported the difference as a quantity conflict. The parent is for Stage 4's match
+        # lookup; it is not an identity.
+        spec = record.spec_code or record.parent_spec_code
+        if spec:
+            groups.setdefault(("spec", record.po_number, spec), []).append(record)
+            continue
+
+        description = (record.item_description or "").strip().lower()
+        placed = False
+        for key, members in groups.items():
+            if key[0] not in ("line", "desc") or key[1] != record.po_number:
+                continue
+            if record.po_line_number is not None and key[0] == "line" and key[2] != record.po_line_number:
+                continue   # the source told us these are different lines
+            if description and any(
+                fuzz.token_set_ratio(description, (m.item_description or "").lower()) >= DESCRIPTION_MATCH_THRESHOLD
+                for m in members
+            ):
+                members.append(record)
+                placed = True
+                break
+        if placed:
+            continue
+
+        if record.po_line_number is not None:
+            key = ("line", record.po_number, record.po_line_number)
+        else:
+            key = ("desc", record.po_number, description[:120])
+        groups.setdefault(key, []).append(record)
+    return groups
+
+
 def reconcile_cross_source_duplicates(records: List[ExtractedRecord]) -> List[ExtractedRecord]:
-    """Groups by (po_number, parent_spec_code). Agreeing quantities (or one missing) -> keep
-    only the highest-confidence record, log the rest as discarded duplicates. Disagreeing
-    quantities -> keep all, flagged +quantity_conflict, never silently pick one. See
-    ORCHESTRATOR_DESIGN.md."""
-    groups: Dict[Tuple[str, Optional[str]], List[ExtractedRecord]] = {}
-    for r in records:
-        key = (r.po_number, r.parent_spec_code or r.spec_code)
-        groups.setdefault(key, []).append(r)
+    """Agreeing quantities (or one missing) -> keep only the highest-confidence record, log the
+    rest as discarded duplicates. Disagreeing quantities -> keep all, flagged
+    +quantity_conflict, never silently pick one. See ORCHESTRATOR_DESIGN.md.
+
+    This is what collapses a Delivered notice and its matching Inbound into one set of records.
+    Both describe the same goods; the Inbound wins on confidence because it states the Spitfire
+    line number and the Delivered does not.
+    """
+    groups = _group_records(records)
 
     result = []
     for key, group in groups.items():
@@ -160,7 +257,9 @@ def process_new_mail(
                 raw_records: List[ExtractedRecord] = []
                 for src in _sources_for_delivery_event(event):
                     for record in run_adapters(src, adapters):
-                        record.shipment_number = event.key.shipment_number
+                        if not _belongs_to_event(record, event):
+                            continue
+                        record.shipment_number = record.shipment_number or event.key.shipment_number
                         raw_records.append(record)
 
                 for record in reconcile_cross_source_duplicates(raw_records):

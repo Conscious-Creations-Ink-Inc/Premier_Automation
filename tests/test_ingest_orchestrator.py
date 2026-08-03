@@ -4,6 +4,7 @@ from connectors.mailbox import Mailbox
 from pipeline import extracted_records_store, ingest_orchestrator, state_db
 from pipeline.models import Attachment, RawEmail
 from pipeline.stage3_extract.excel_adapter import EXCEL_CONTENT_TYPE
+from tests import corpus_fixtures as fx
 from tests.test_extract import make_pdf_bytes
 
 
@@ -43,19 +44,25 @@ def pending_records(c):
 
 
 def test_clean_warehouse_delivery_staged_end_to_end():
-    email = make_email(
-        email_id="msg-warehouse-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 213987",
-        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>213987</td><td>LI-12</td><td>1</td></tr></table>",
-    )
+    email = fx.inbound_email(email_id="msg-warehouse-1", notice="239475",
+                             po_numbers=("208491",), shipment="50052 : 1")
     c = new_conn()
     mailbox = FakeMailbox([email])
     count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
     assert count == 1
-    records = pending_records(c)
-    assert records[0].po_number == "213987"
-    assert records[0].spec_code == "LI-12"
+    record = pending_records(c)[0]
+    assert record.po_number == "208491"
+    assert record.spec_code == "STE-402-LT-B"
+    # The Inbound format states the Spitfire line number outright, which is what makes the
+    # downstream match exact instead of fuzzy.
+    assert record.po_line_number == 300
+    assert record.quantity_received == 11.0 and record.unit_of_measure == "EA"
+    # 11 CTN is the carton count from the Package column, never the receivable quantity.
+    assert record.package_quantity == 11.0 and record.package_uom == "CTN"
+    assert record.carrier_name == "Nolan Transportation"
+    assert record.tracking_number == "8840455"
+    assert record.pod_stated_date == "2025-10-01"
+    assert record.received_by == "Miguel C."
     assert mailbox.processed_calls == [("msg-warehouse-1", "Processed")]
 
 
@@ -98,12 +105,7 @@ def test_triage_failure_moves_email_to_errors_folder(monkeypatch):
 
 
 def test_mailbox_move_failure_does_not_crash_the_run(monkeypatch):
-    email = make_email(
-        email_id="msg-warehouse-2",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 213987",
-        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>213987</td><td>LI-12</td><td>1</td></tr></table>",
-    )
+    email = fx.inbound_email(email_id="msg-warehouse-2", po_numbers=("208491",))
 
     class FlakyMailbox(FakeMailbox):
         def mark_processed(self, email_id, folder):
@@ -112,17 +114,17 @@ def test_mailbox_move_failure_does_not_crash_the_run(monkeypatch):
     c = new_conn()
     count = ingest_orchestrator.process_new_mail(FlakyMailbox([email]), conn=c)
     assert count == 1
-    assert pending_records(c)[0].po_number == "213987"
+    assert pending_records(c)[0].po_number == "208491"
 
 
 def test_same_delivery_in_body_and_attachment_deduplicates_to_one():
-    pdf_bytes = make_pdf_bytes([["PO", "Spec", "Qty"], ["208491", "LI-1", "2"]])
-    email = make_email(
-        email_id="msg-dup-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 208491",
-        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>208491</td><td>LI-1</td><td>2</td></tr></table>",
-        attachments=[Attachment(filename="pod.pdf", content_type="application/pdf", content_bytes=pdf_bytes)],
+    """The Inbound body and its packing-slip PDF describe the same line. Agreeing quantities
+    collapse to the higher-confidence record rather than staging two receipts."""
+    pdf_bytes = make_pdf_bytes([["PO", "Spec", "Qty"], ["208491", "STE-402-LT-B", "11"]])
+    email = fx.inbound_email(
+        email_id="msg-dup-1", po_numbers=("208491",),
+        attachments=[Attachment(filename="Packing Slip - Inbound 239336.pdf",
+                                content_type="application/pdf", content_bytes=pdf_bytes)],
     )
     c = new_conn()
     count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
@@ -131,46 +133,46 @@ def test_same_delivery_in_body_and_attachment_deduplicates_to_one():
 
 
 def test_quantity_conflict_across_sources_keeps_both_flagged():
-    pdf_bytes = make_pdf_bytes([["PO", "Spec", "Qty"], ["208491", "LI-1", "5"]])
-    email = make_email(
-        email_id="msg-conflict-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 208491",
-        body_html="<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr><tr><td>208491</td><td>LI-1</td><td>2</td></tr></table>",
-        attachments=[Attachment(filename="pod.pdf", content_type="application/pdf", content_bytes=pdf_bytes)],
+    """Disagreeing quantities are never silently resolved — both records are staged and flagged,
+    because the corpus shows quantities legitimately disagreeing (overage, split part
+    shipments) and picking one would be a guess."""
+    pdf_bytes = make_pdf_bytes([["PO", "Spec", "Qty"], ["208491", "STE-402-LT-B", "5"]])
+    email = fx.inbound_email(
+        email_id="msg-conflict-1", po_numbers=("208491",),
+        attachments=[Attachment(filename="Packing Slip.pdf",
+                                content_type="application/pdf", content_bytes=pdf_bytes)],
     )
     c = new_conn()
     count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
     assert count == 2
     records = pending_records(c)
     assert all("+quantity_conflict" in r.extraction_source for r in records)
-    assert {r.quantity_received for r in records} == {2.0, 5.0}
+    assert {r.quantity_received for r in records} == {11.0, 5.0}
 
 
 def test_unrecognized_attachment_type_is_not_staged_as_a_fake_record():
     # Regression guard for a real bug found via real dummy test documents: an attachment type
     # no adapter recognizes must be ignored, never staged as a fabricated empty ExtractedRecord.
-    email = make_email(
-        email_id="msg-unknown-attachment-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 213987",
-        attachments=[Attachment(filename="archive.zip", content_type="application/zip", content_bytes=b"whatever")],
+    email = fx.inbound_email(
+        email_id="msg-unknown-attachment-1", po_numbers=("208491",),
+        lines=[{"po": "208491", "line": "1", "part": "", "item": "no quantity, no spec"}],
+        attachments=[Attachment(filename="archive.zip", content_type="application/zip",
+                                content_bytes=b"whatever")],
     )
     c = new_conn()
     count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
-    assert count == 0
-    assert pending_records(c) == []
+    records = pending_records(c)
+    assert all(r.extraction_source != "unknown" for r in records)
+    assert not any("archive.zip" in (r.raw_snippet or "") for r in records)
 
 
 def test_one_corrupt_attachment_does_not_block_the_others():
-    good_pdf = make_pdf_bytes([["PO", "Spec", "Qty"], ["300111", "AB-1", "3"]])
-    email = make_email(
-        email_id="msg-mixed-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - PO 300111",
-        body_text="Inbound received for PO 300111.",
+    good_pdf = make_pdf_bytes([["PO", "Spec", "Qty"], ["208491", "LOB-203-PI", "3"]])
+    email = fx.inbound_email(
+        email_id="msg-mixed-1", po_numbers=("208491",),
         attachments=[
-            Attachment(filename="corrupt.xlsx", content_type=EXCEL_CONTENT_TYPE, content_bytes=b"not a real xlsx"),
+            Attachment(filename="corrupt.xlsx", content_type=EXCEL_CONTENT_TYPE,
+                       content_bytes=b"PKnot a real xlsx"),
             Attachment(filename="pod.pdf", content_type="application/pdf", content_bytes=good_pdf),
         ],
     )
@@ -178,4 +180,4 @@ def test_one_corrupt_attachment_does_not_block_the_others():
     count = ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=c)
     assert count >= 1
     records = pending_records(c)
-    assert any(r.po_number == "300111" and r.spec_code == "AB-1" for r in records)
+    assert any(r.spec_code == "LOB-203-PI" for r in records)

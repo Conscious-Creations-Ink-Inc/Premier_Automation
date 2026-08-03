@@ -12,6 +12,12 @@ class NotificationType(str, Enum):
     PROPERTY_CONFIRMATION = "property_confirmation"
     VENDOR_CONFIRMATION = "vendor_confirmation"
     ORDER_CANCELLATION = "order_cancellation"
+    WAREHOUSE_STATUS_REPORT = "warehouse_status_report"
+    """The periodic Purchase Order Status Report — same sender as the receiver trigger, told
+    apart only by its subject. Recognised so it can be discarded rather than scraped."""
+    LOSS_OR_CLAIM = "loss_or_claim"
+    """Lost/damaged goods, claims, credit memos, replacement POs. Reads like delivery mail and
+    is out of Phase 1 scope, so it must be recognised and handed to a person, never processed."""
     UNKNOWN = "unknown"
 
 
@@ -50,6 +56,16 @@ class TriagedEmail:
     extracted_po_hints: List[str]
     extracted_shipment_hint: Optional[str] = None   # None for property/vendor confirmations — no shipment number
     reason: str = ""
+
+    origin_sender_address: Optional[str] = None
+    """Who actually sent the payload, recovered from the quoted chain. Every message Premier
+    handed over is a `Fw:` from an internal expeditor, so `email.sender_address` is
+    `premierpm.com` on all of them and useless for routing (see parsing/thread.py)."""
+
+    notification_number: Optional[str] = None
+    """The originator's own reference (Authority inbound # / Authority #). Two files in the
+    corpus are the same notice 239336 — one direct, one forwarded — arriving under different
+    Message-IDs; this is what lets Stage 2 see them as one event."""
 
 
 # --- Stage 2: Accumulate -------------------------------------------------
@@ -92,6 +108,28 @@ class ExtractedRecord:
     extraction_source: str
     extraction_confidence: float
     raw_snippet: str
+
+    # --- Fields below carry defaults so the positional constructors already in the adapters
+    # keep working. They were added once the real June corpus showed the Authority Logistics
+    # format hands over more than the design assumed.
+
+    po_line_number: Optional[int] = None
+    """The Spitfire line number, when the source states it outright — the Authority Inbound
+    `PO # / Line #` cell reads `208491 : 300`. This turns Stage 4 from a fuzzy description
+    search into an exact lookup, so it is the single most valuable field on the record."""
+
+    received_by: Optional[str] = None
+    """Warehouse staffer who signed the goods in ("Miguel C.") or the POD's `Signed for by`."""
+
+    package_quantity: Optional[float] = None
+    package_uom: Optional[str] = None
+    """Cartons/pallets/skids — deliberately kept apart from `quantity_received`. An Inbound
+    header reads `Quantity: 41 CTN` while the line row reads `11 EA`; receiving the carton
+    count against the PO line is the failure mode this split exists to prevent."""
+
+    notification_number: Optional[str] = None
+    """Authority's own reference — the inbound # for a Class A notice, the Authority # for a
+    Class B one. Retained for audit and for tying a record back to the notice that produced it."""
 
 
 @dataclass

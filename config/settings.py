@@ -19,11 +19,19 @@ SPITFIRE_MOCK_DB_PATH = STATE_DIR / "mock_spitfire.sqlite3"
 
 # --- Stage 1: Ingest & Triage -------------------------------------------
 
-WAREHOUSE_SENDER_DOMAINS = ["authoritylogistics.com", "hospitalitylogistics.com", "atlaslogistics.com"]
-FREIGHT_SENDER_DOMAINS = ["fedex.com", "ups.com", "dhl.com", "rxo.com", "oldominion.com"]
-VENDOR_CONFIRMATION_DOMAINS = ["pbhhospitality.com", "coraseal.com"]
-# ^ realistic placeholders matching the vendors/carriers named in the discovery docs — swap for
-# Premier's real domain lists once real samples arrive (checklist #5); nothing else needs to change.
+# Observed in the real June corpus (Documents/Premier_Delivery_Email_Corpus_Analysis.md §5).
+# Still partial — Premier owes us their full vendor/property lists (checklist item B7) — but
+# these are verified against actual message headers rather than invented, which the previous
+# placeholder lists were not (finding C6).
+
+INTERNAL_DOMAINS = ["premierpm.com"]
+WAREHOUSE_SENDER_DOMAINS = ["authoritylogistics.com", "crownwms.com"]
+FREIGHT_SENDER_DOMAINS = ["fedex.com", "ups.com", "dhl.com", "rxo.com", "oldominion.com", "globaltranz.com"]
+VENDOR_CONFIRMATION_DOMAINS = ["5starinterior.com", "knoxtile.com", "goarmstrong.com", "firstfinish.net"]
+PROPERTY_DOMAINS = ["remingtonhotels.com", "cameobeverlyhills.com"]
+
+# Kept for the generic adapters. Triage no longer uses these — `pipeline/parsing/tokens.py`
+# owns the token grammar now, so the stages cannot disagree about what a PO is (finding C4).
 PO_TOKEN_REGEX = r"\bPO\s?#?\s?(\d{5,7})\b"
 SHIPMENT_TOKEN_REGEX = r"\bshipment\s?#?\s?(\d{4,10})\b"
 CANCELLATION_KEYWORDS_REGEX = r"\b(cancel(?:led|lation)?|void(?:ed)?|terminat(?:e|ed)|no longer (?:needed|required))\b"

@@ -1,8 +1,15 @@
 # Code Analysis Findings — 2026-08-02
 
 End-to-end trace of the orchestrator (stages 1–3 executed against `sample_data/`, full test
-suite run: 90 passed / 3 skipped). **Report only — none of these are fixed yet.** Findings
-marked **[NEW]** are not in the tech-debt register of `PREMIER_AUTOMATION.md`.
+suite run: 90 passed / 3 skipped). Findings marked **[NEW]** are not in the tech-debt register
+of `PREMIER_AUTOMATION.md`.
+
+> **Status update, 2026-08-03.** The ingest-and-parse work closed C1, C2, C3, C4, C6, C10, C13
+> and go-live blockers 1–3 and 5, and added the `.msg` intake the verdict below says does not
+> exist. See "Resolved" at the end of this file for what changed and what each fix now rests on.
+> Everything not listed there is still open. Suite is now 185 passed / 3 skipped, and
+> `python -m tools.run_corpus` scores the 14 real June messages 14/14 on triage, 7/7 on lines
+> parsed and 7/7 on records staged.
 
 ## Verdict
 
@@ -96,3 +103,61 @@ per-vendor config registry.
 3. C3 — adapters never produce POD date / carrier / tracking
 4. Stages 4–7 don't exist in the pipeline layer (only as demo mocks)
 5. No entry point / scheduler; no `.msg` ingestion if Outlook-file intake is required
+
+---
+
+## Resolved — 2026-08-03 (ingest and parsing)
+
+All of the below were verified against Premier's real June corpus
+(`Documents/Premier/5,8 june`), not against invented samples. Run `python -m tools.run_corpus`
+to reproduce; it writes a scored report to `D:\Premier\dev_reports\corpus_regression.md`.
+
+**New capability**
+
+- **`.msg` intake exists** — `connectors/msg_file.py` implements the same `Mailbox` interface as
+  `GraphMailbox`, so the corpus exercises the production code path rather than a parallel one.
+  Recurses into nested messages (the 5-Star thread's attached Delivered Notification carries the
+  FedEx PODs), strips the NULs `extract_msg` leaves on filenames, and dedupes attachments by
+  content hash — which collapses the two byte-identical PODs saved under different names.
+- **`pipeline/parsing/`** — one shared token grammar (PO, spec, quantity/UOM, dates, shipment,
+  tracking), boilerplate stripping, thread splitting, content sniffing, table classification,
+  carrier-POD and confirmation-grid parsing. Each stage previously carried its own regex.
+- **`pipeline/vendors/authority.py`** — the Class A/B grammars, deterministic, no fuzzy matching.
+
+**Findings closed**
+
+- **C1** — `ExtractionSource.only_po` plus `_belongs_to_event` filter records to the event's PO.
+  A two-PO notice now stages each line once.
+- **C2** — `MsgFileMailbox.mark_processed` tracks the source path by the id it issued rather than
+  assuming filename equals id. `read_only=True` makes a regression run leave the folder untouched.
+- **C3** — `pod_stated_date`, `carrier_name`, `tracking_number` and `delivery_location` are
+  populated from the Authority header block, the carrier POD and the tracker's own columns.
+  `received_by`, `po_line_number`, `package_quantity`/`package_uom` and `notification_number`
+  were added alongside; `state_db` and `extracted_records_store` carry them, and
+  `test_models.py` now fails if a model field has no column.
+- **C4** — `tokens.PO_LABELLED_RE` is case-insensitive and covers `PO#`, `P.O.#`, `PO:`,
+  `Purchase Order`, and comma/`+`-joined lists under one label.
+- **C6** — sender lists replaced with domains observed in real headers, and triage no longer
+  keys on domain at all: the rule key is (sender local part, subject grammar), resolved on the
+  origin hop recovered from the quoted chain.
+- **C10** — a failing adapter no longer aborts the cascade.
+- **C13** — dispatch is by byte sniff, so the corpus's `mimetype=None` tracker and phone photos
+  reach an adapter. HEIC is covered.
+
+**Go-live blockers**
+
+1. C6 — done. 2. C1 — done. 3. C3 — done. 5. `.msg` ingestion — done; **no scheduler or
+production entry point yet** (`run_pipeline.py` is still a stub). Blocker 4 (stages 4–7 existing
+only as demo mocks in `api/services/`) is untouched.
+
+**Still open**
+
+C5, C7, C8, C9, C11, C12, C14–C16, the dead-settings list, and everything under
+"Structural". Two behaviours are deliberate rather than fixed:
+
+- OCR yields nothing for photographed PODs because no OCR client is provisioned. Those messages
+  route to a person with a reason that says so (`rule_5b_image_only_evidence`), instead of being
+  dismissed as "no PO found".
+- A Delivered notice with no matching Inbound is held and released by the grace sweep. Premier
+  still owes us a written rule on whether that should become a receiver — the corpus contains
+  one such case, annotated "straightforward, WH rec'd".

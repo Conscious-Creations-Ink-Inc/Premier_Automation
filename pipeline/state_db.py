@@ -58,13 +58,42 @@ def get_connection(db_path=PIPELINE_STATE_DB_PATH) -> sqlite3.Connection:
             extraction_source     TEXT NOT NULL,
             extraction_confidence REAL NOT NULL,
             raw_snippet           TEXT,
+            po_line_number        INTEGER,
+            received_by           TEXT,
+            package_quantity      REAL,
+            package_uom           TEXT,
+            notification_number   TEXT,
             status                TEXT NOT NULL DEFAULT 'pending',
             created_at            TEXT NOT NULL,
             updated_at            TEXT
         )
     """)
+    _add_missing_columns(conn)
     conn.commit()
     return conn
+
+
+# Columns added after the first stores were created. `CREATE TABLE IF NOT EXISTS` leaves an
+# existing table untouched, so a database created before these fields existed would silently
+# drop them on write — which is exactly what a line number, the most valuable field the
+# Authority format gives us, must never do.
+_LATER_COLUMNS = {
+    "extracted_records": [
+        ("po_line_number", "INTEGER"),
+        ("received_by", "TEXT"),
+        ("package_quantity", "REAL"),
+        ("package_uom", "TEXT"),
+        ("notification_number", "TEXT"),
+    ],
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _LATER_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, sql_type in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 def is_new_message(conn: sqlite3.Connection, email_id: str, now: str) -> bool:

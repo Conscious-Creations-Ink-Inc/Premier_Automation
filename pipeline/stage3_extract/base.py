@@ -62,6 +62,17 @@ class ExtractionSource:
     content_type: Optional[str] = None
     content_bytes: Optional[bytes] = None
 
+    sender_address: Optional[str] = None
+    subject: Optional[str] = None
+    """Envelope sender and subject of the email this source came from. A vendor parser cannot
+    identify a format without them — the Authority grammars key on (sender local part, subject),
+    and an attachment carries neither on its own."""
+
+    only_po: Optional[str] = None
+    """Restrict extraction to one PO. The orchestrator runs one `DeliveryEvent` per PO, so a
+    multi-PO source read without this filter stages every line once per PO on the document:
+    one email covering two POs produced four records where two were correct (finding C1)."""
+
 
 class ExtractionAdapter(ABC):
     @abstractmethod

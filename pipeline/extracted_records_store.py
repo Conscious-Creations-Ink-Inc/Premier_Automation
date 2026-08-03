@@ -8,7 +8,11 @@ _COLUMNS = (
     "sub_spec_suffix", "item_description", "vendor_name", "carrier_name", "tracking_number",
     "quantity_received", "unit_of_measure", "pod_stated_date", "email_date", "delivery_location",
     "comments", "extraction_source", "extraction_confidence", "raw_snippet",
+    "po_line_number", "received_by", "package_quantity", "package_uom", "notification_number",
 )
+# Every field on ExtractedRecord must appear here — a field the record carries but the store
+# does not is silently lost between Stage 3 and Stage 4. `test_models.py` asserts the two stay
+# in step so adding a model field without a column fails loudly instead of quietly.
 
 
 def write_pending(conn: sqlite3.Connection, record: ExtractedRecord, now: str) -> int:
