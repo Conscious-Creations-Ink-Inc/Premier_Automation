@@ -272,3 +272,88 @@ def test_idempotency_second_call_with_same_id_is_skipped():
     conn.execute("CREATE TABLE seen_message_ids (email_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL)")
     assert state_db.is_new_message(conn, "msg-dup-1", "2026-06-08T14:00:00Z") is True
     assert state_db.is_new_message(conn, "msg-dup-1", "2026-06-08T14:05:00Z") is False
+
+
+# --- Rule 5c: internal chatter -----------------------------------------------
+# Twelve of the fourteen emails in Premier's live manual queue were all-associates broadcasts and
+# calendar invites, every one of them reading "no PO reference found anywhere in the thread".
+# True, and useless — they buried the two entries that were real work.
+
+def broadcast(**overrides):
+    defaults = dict(
+        email_id="msg-broadcast",
+        sender_address="LaurieChapman@premierpm.com",
+        sender_domain="premierpm.com",
+        subject="Premier Monthly Celebration",
+        body_html="<p>Join us Friday in the Dallas office. Cake at 3pm.</p>",
+    )
+    defaults.update(overrides)
+    return make_email(**defaults)
+
+
+def test_an_internal_broadcast_is_hidden_not_queued():
+    result = triage(broadcast())
+    assert result.category == TriageCategory.HIDE
+    assert result.matched_rule == "rule_5c_internal_noise"
+
+
+def test_a_calendar_invite_is_hidden():
+    assert triage(broadcast(subject="Canceled: Voting Holiday Reward")).category == TriageCategory.HIDE
+
+
+def test_signature_logos_already_dropped_at_ingest_do_not_block_the_rule():
+    """A broadcast drags along five copies of the Premier signature logo. The connector drops
+    them before triage — `drop_hint` set, bytes cleared — so they must not read as attachments
+    worth keeping the mail in the queue for."""
+    email = broadcast()
+    email.attachments = [Attachment(filename=f"image00{i}.png", content_type="image/png",
+                                    content_bytes=b"", content_id=f"image00{i}.png",
+                                    is_inline=True, drop_hint="decorative:known_hash")
+                         for i in range(1, 6)]
+    assert triage(email).matched_rule == "rule_5c_internal_noise"
+
+
+def test_a_broadcast_that_happens_to_use_delivery_words_is_left_alone():
+    """The rule will not hide anything whose text could be about a delivery, even when every
+    other signal says chatter. `You've joined the Premier PM All Associates group` is a live
+    example: it matched delivery vocabulary at triage and so stays a person's problem."""
+    result = triage(broadcast(subject="You've joined the Premier PM All Associates group",
+                              body_html="<p>Please confirm your membership.</p>"))
+    assert result.matched_rule != "rule_5c_internal_noise"
+
+
+# The other direction matters more: a delivery hidden is a receiver nobody creates.
+
+def test_internal_mail_naming_a_po_is_never_hidden():
+    result = triage(broadcast(subject="Quick question on PO 212448"))
+    assert result.category != TriageCategory.HIDE
+
+
+def test_internal_mail_with_delivery_vocabulary_is_never_hidden():
+    """`Fw: Cameo Harbour Delivery` is internal and carries no PO either — and it is real work."""
+    result = triage(broadcast(subject="Fw: Cameo Harbour Delivery",
+                              body_html="<p>Photos of the pallet attached, please confirm receipt.</p>"))
+    assert result.category != TriageCategory.HIDE
+
+
+def test_internal_mail_carrying_a_photograph_is_never_hidden():
+    email = broadcast(subject="Fw: Cameo Harbour Delivery",
+                      body_html="<p>Delivered this morning, see photos.</p>")
+    email.attachments = [Attachment(filename="IMG_2479.jpeg", content_type="image/jpeg",
+                                    content_bytes=b"\xff\xd8\xff" + b"\x00" * (700 * 1024))]
+    assert triage(email).category != TriageCategory.HIDE
+
+
+def test_external_mail_is_never_hidden_by_this_rule():
+    """A vendor with nothing recognisable in it is still a person's problem, not chatter."""
+    result = triage(broadcast(sender_address="someone@5starinterior.com",
+                              sender_domain="5starinterior.com",
+                              subject="Hello"))
+    assert result.matched_rule != "rule_5c_internal_noise"
+
+
+def test_internal_mail_carrying_a_readable_attachment_is_never_hidden():
+    email = broadcast(subject="Updated list")
+    email.attachments = [Attachment(filename="tracker.pdf", content_type="application/pdf",
+                                    content_bytes=b"%PDF-1.4" + b"\x00" * 500)]
+    assert triage(email).matched_rule != "rule_5c_internal_noise"

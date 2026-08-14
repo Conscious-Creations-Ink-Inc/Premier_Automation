@@ -14,8 +14,14 @@ SAMPLE_ATTACHMENTS_DIR = SAMPLE_DATA_DIR / "attachments"
 PO_LINES_SEED_FILE = SAMPLE_DATA_DIR / "po_lines.json"
 
 STATE_DIR = BASE_DIR / "state"
-PIPELINE_STATE_DB_PATH = STATE_DIR / "pipeline_state.sqlite3"
-SPITFIRE_MOCK_DB_PATH = STATE_DIR / "mock_spitfire.sqlite3"
+# Two stores, one schema. Premier's live mail and the .msg test corpus are kept in separate
+# files rather than separated by a column, so no forgotten WHERE clause can ever show sample
+# data on a receiver report. `pipeline/state_db.path_for()` is the only place that chooses.
+PIPELINE_STATE_DB_PATH = STATE_DIR / "pipeline_state.sqlite3"   # LIVE mailbox. Never sample data.
+SAMPLE_STATE_DB_PATH = STATE_DIR / "sample_state.sqlite3"       # the .msg corpus. Testing only.
+# SPITFIRE_MOCK_DB_PATH was reserved for a local Spitfire simulator that was never written, and
+# nothing referenced it. The real read connector (connectors/spitfire.py) supersedes the idea:
+# PO lines are mirrored into the pipeline state DB from the live API instead of being faked.
 
 # --- Stage 1: Ingest & Triage -------------------------------------------
 
@@ -39,7 +45,16 @@ PROPERTY_REPLY_MAX_WORDS = 200   # heuristic: a short reply, not a structured ta
 
 # --- Stage 2: Accumulate -------------------------------------------------
 
-HOLD_GRACE_PERIOD_HOURS = 48
+# How long a hold-only delivery waits for a partner notice before `sweep_stale_holds` releases it.
+#
+# 48 hours is the real rule and the default. It exists so a warehouse notice arriving a day late
+# still joins its property confirmation instead of producing a second receiver — the double-count
+# that ended Premier's previous attempt. Do not lower it in code.
+#
+# Overridable by env so a demo can release held mail immediately (`PREMIER_HOLD_GRACE_HOURS=0`)
+# without editing a business rule that then ships at 0 because somebody forgot to put it back.
+# Deleting the line from `.env` is the whole revert.
+HOLD_GRACE_PERIOD_HOURS = int(os.getenv("PREMIER_HOLD_GRACE_HOURS", "48"))
 STALE_HOLD_THRESHOLD_DAYS = 14   # shared with Stage 7's stale-hold sweep
 
 # --- Stage 3: Extract -----------------------------------------------------
@@ -84,7 +99,10 @@ MAX_ZIP_COMPRESSION_RATIO = 200                  # file_size / compress_size —
 AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT") or None
 AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY") or None
 AZURE_VISION_API_VERSION = "2024-02-01"
-AZURE_VISION_TIMEOUT_SECONDS = 30
+# 30s was not enough to *upload* a 2.7 MB phone photo on a normal office uplink — the POST died
+# with a write timeout before Azure ever saw it, which reads as an OCR outage rather than a slow
+# link. The corpus photos are 2.5-3 MB each, so this is the common case, not the tail.
+AZURE_VISION_TIMEOUT_SECONDS = 180
 
 OCR_CLIENT = os.getenv("PREMIER_OCR_CLIENT", "auto")   # auto | azure | tesseract | mock
 OCR_MAX_IMAGE_BYTES = 20 * 1024 * 1024   # Azure Vision's own per-image ceiling
@@ -97,8 +115,20 @@ AI_FALLBACK_CONFIDENCE_CAP = 0.5
 AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP = 0.85
 AZURE_OCR_RETRY_COUNT = 1
 AZURE_OCR_RETRY_BACKOFF_SECONDS = 2
-AZURE_DOC_INTELLIGENCE_ENDPOINT = None   # real value pending Azure resource provisioning
-AZURE_DOC_INTELLIGENCE_KEY = None        # store in Key Vault once real infra exists — never hardcode
+
+# The provisioned resource ("premier", eastus) is a Document Intelligence resource, so it serves
+# /documentintelligence/* but NOT Vision's /computervision/* — a Vision call against it 401s.
+# DocInt is the better fit anyway: it returns real table structure (which Vision does not) and
+# reads a PDF directly instead of rasterising it page by page. The endpoint/key fall back to the
+# AZURE_VISION_* pair so one credential pair in .env drives both clients.
+AZURE_DOC_INTELLIGENCE_ENDPOINT = os.getenv("AZURE_DOC_INTELLIGENCE_ENDPOINT") or AZURE_VISION_ENDPOINT
+AZURE_DOC_INTELLIGENCE_KEY = os.getenv("AZURE_DOC_INTELLIGENCE_KEY") or AZURE_VISION_KEY
+AZURE_DOC_INTELLIGENCE_API_VERSION = "2024-11-30"
+# prebuilt-layout returns tables; prebuilt-read is text-only and ~6x cheaper per page on paid
+# tiers (identical on the free tier, which meters pages not dollars). Switch via .env.
+AZURE_DOC_INTELLIGENCE_MODEL = os.getenv("AZURE_DOC_INTELLIGENCE_MODEL", "prebuilt-layout")
+AZURE_DOC_INTELLIGENCE_POLL_SECONDS = 2      # analyze is async: 202 + poll operation-location
+AZURE_DOC_INTELLIGENCE_POLL_TIMEOUT_SECONDS = 120
 
 TESSERACT_CMD_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # dev/test OCR only — see STAGE_3_EXTRACT.md
 
@@ -135,7 +165,68 @@ GRAPH_MAILBOX_ADDRESS = os.getenv("GRAPH_MAILBOX_ADDRESS")  # still pending from
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]   # app-only permissions, consented on the app registration
 GRAPH_AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
 
+# --- Spitfire sfPMS (ERP, read-only) ------------------------------------------
+# Training instance, sfPMS 2023.0.9692.36214. `GET /api/system/version` answers anonymously from
+# outside Premier's network, so the connector needs no VPN for training; production may differ.
+# Credentials are blank until Premier provisions `svc-receiver-automation`. For this phase that
+# account needs READ permission only — purchase orders and their lines. Nothing else.
+
+SPITFIRE_BASE_URL = os.getenv("SPITFIRE_BASE_URL", "https://training.remingtonhotels.com/Training")
+SPITFIRE_UID = os.getenv("SPITFIRE_UID") or None
+SPITFIRE_PW = os.getenv("SPITFIRE_PW") or None
+# Sent on login as `SiteLogin.tzOffset` and used by Spitfire to stamp server-side dates. Wrong
+# value shifts received dates by hours, which matters because Stage 5 compares them to POD dates.
+SPITFIRE_TZ_OFFSET = float(os.getenv("SPITFIRE_TZ_OFFSET", "-5"))
+
+# `ForDocType` filter for PO discovery. Taken from Premier's own czx_TPICreate_ReceiptDoc.sql
+# (@PODTK), which is a production value and unverified on training — hence overridable and
+# optional: `resolve_po` still works without it, just with more candidates to sift.
+# NB the master plan §3.5 transcribes this as 'ff197fd-...', one character short. The .sql is right.
+SPITFIRE_PO_DOC_TYPE_KEY = os.getenv("SPITFIRE_PO_DOC_TYPE_KEY", "ff1975fd-76de-486c-888b-54e8fcd880e0")
+SPITFIRE_SEARCH_SCOPE = os.getenv("SPITFIRE_SEARCH_SCOPE", "0")   # folderDesignation; 0 = site-wide
+
+# Receipt document type, confirmed 10 Aug against TrainingsfDocSys: 76,414 documents carry it and
+# `DocTypeKey_dv` reads "Receipt". Matches @RDTK in czx_TPICreate_ReceiptDoc.sql. Read-side use
+# only for now — it identifies existing receipts so we can tell an already-received PO from a new
+# delivery. The connector still has no method that creates one.
+SPITFIRE_RECEIPT_DOC_TYPE_KEY = os.getenv(
+    "SPITFIRE_RECEIPT_DOC_TYPE_KEY", "0c9a537a-3c41-4d16-ab9f-130ef69ea6c8")
+
+# A borrowed browser session, as an alternative to SPITFIRE_UID/PW. Premier's Spitfire has Entra
+# SSO enabled, so an interactive user may have no password to put in .env at all — in that case
+# this is the only way in until `svc-receiver-automation` exists. Paste the value of the
+# `sfPMSAuth` cookie (NOT `sfSession`, which is only a session id).
+#
+# Short-lived: forms tickets lapse and Spitfire enforces an idle timeout, so this is for one-off
+# pulls, never the scheduled pipeline. Everything read is attributed to whoever owns the session.
+SPITFIRE_SESSION_COOKIE = os.getenv("SPITFIRE_SESSION_COOKIE") or None
+
+# PO discovery needs a project ID, and this account cannot enumerate projects — `POST /api/projects`
+# returns 200 with zero rows and `GET /api/projects` is 405. The IDs below were read out of
+# `TrainingsfDocSys.dbo.xsfDocHeader` and are where the June corpus POs actually live: 18 in
+# ...100003, 8 in ...100002, 2 in MRC026PB100002. Remove this once Premier grants the automation
+# account project membership, which would make /api/projects answer for itself.
+SPITFIRE_PROJECT_IDS = [
+    p.strip() for p in os.getenv(
+        "SPITFIRE_PROJECT_IDS",
+        "MRC024PB100003,MRC024PB100002,MRC026PB100002",
+    ).split(",") if p.strip()
+]
+
+SPITFIRE_READ_ONLY = True
+"""Not a runtime switch — a statement of scope. connectors/spitfire.py has no write methods at
+all, and its allowlist rejects any non-read request before a socket opens. Premier has not
+authorised a write to their ERP; when they do, that is a reviewed change to `_ALLOWED`, not a
+flag someone flips."""
+
 # --- Orchestrators ------------------------------------------------------------
 
 INGEST_ORCHESTRATOR_INTERVAL_MINUTES = 20   # our own default, not yet validated against real volume
 MATCH_ORCHESTRATOR_SCHEDULE = "daily"        # or "on_demand"
+
+INGEST_OVERLAP_MINUTES = int(os.getenv("PREMIER_INGEST_OVERLAP_MINUTES", "60"))
+"""How far behind the watermark each poll starts listing. See `stage1_ingest.listing_window_start`.
+
+Generous on purpose. Re-listing an hour of already-seen mail costs a set lookup per row, because
+`skip_ids` rejects it before anything is fetched; missing a message because a clock disagreed by
+two minutes costs a receiver nobody creates."""

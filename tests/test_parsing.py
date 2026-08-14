@@ -212,6 +212,49 @@ def test_direct_mail_is_taken_at_face_value():
     assert origin.sender_address == "warehousing@authoritylogistics.com"
 
 
+@pytest.mark.parametrize("raw, expected", [
+    # Every shape present across the corpus's 111 quoted `Sent:` headers.
+    ("Monday, December 1, 2025 2:14 PM", "2025-12-01"),
+    ("Wednesday, October 01, 2025 5:24 PM", "2025-10-01"),        # zero-padded day
+    ("Thursday, October 9, 2025 11:17:49 AM", "2025-10-09"),      # with seconds
+    ("Thursday, May 7, 2026 17:03", "2026-05-07"),                # 24-hour, no AM/PM
+    ("  Friday, September 26, 2025 11:14 AM  ", "2025-09-26"),    # surrounding whitespace
+])
+def test_a_quoted_sent_header_parses_to_a_date(raw, expected):
+    """The date a delivery timeline should show. The envelope date of a forward is the day Premier
+    forwarded it — 2026-06-06 on twelve of the fourteen files, which is how every stage of every
+    purchase order came to carry one date.
+
+    The 24-hour case is the one worth keeping: it appears six times and a format list written from
+    the obvious samples alone silently drops it.
+    """
+    assert thread.parse_sent(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", None, "yesterday", "2025-10-09", "Sent: whenever"])
+def test_an_unreadable_sent_header_is_none_rather_than_an_error(raw):
+    """This runs over mail from ~3,000 outside parties. One unfamiliar locale must not fail the
+    ingest of an otherwise readable message — the envelope date is the fallback."""
+    assert thread.parse_sent(raw) is None
+
+
+def test_the_raw_sent_header_survives_even_when_it_cannot_be_parsed():
+    """A shape we cannot read must stay visible rather than disappear, or nobody ever learns the
+    format list is short."""
+    hop = thread.ThreadHop(depth=1, sender_address="a@b.com", sender_domain="b.com",
+                           sent_raw="17 Vendémiaire an XIV", to_raw="", subject="", body="")
+    assert hop.sent_at is None
+    assert hop.sent_raw == "17 Vendémiaire an XIV"
+
+
+def test_the_forwarded_hop_carries_the_date_it_was_actually_sent():
+    """End to end on the real corpus fixture: the quoted Authority hop states its own send date,
+    months before Premier forwarded the file."""
+    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com", "Fw: x")
+    origin = thread.resolve_origin("mariagutierrez@premierpm.com", "Fw: x", parsed)
+    assert origin.sent_at == "2025-10-01"
+
+
 @pytest.mark.parametrize("subject, expected", [
     ("Fw: [External] RE: Cameo Public Space", "Cameo Public Space"),
     ("RE: FW: [External] Verification of Fabric Receipt", "Verification of Fabric Receipt"),
@@ -357,3 +400,57 @@ def test_fedex_pod_fields():
 
 def test_a_non_pod_document_is_not_parsed_as_one():
     assert pod.parse_pod("Invoice 12345\nAmount due: $400") is None
+
+
+# --- Graph itemAttachment MIME ------------------------------------------------
+# Graph returns an attached Outlook message from `/$value` as RFC-822 MIME with
+# `contentType: message/rfc822` — never as an OLE `.msg`. Exchange prepends a `Received:` chain to
+# it, and on the real Delivered Notification that chain fills the first 2,255 bytes on its own:
+# `Content-Type`, `Date`, `From`, `Message-ID` and `Subject` all sit past it. Sniffing only the
+# first 2 KB therefore saw one header name, failed the "two or more" test, and classified the one
+# attachment carrying the POD as plain text.
+
+def _exchange_mime(received_chain_bytes: int = 3000) -> bytes:
+    hop = (b"Received: from LV8PR14MB7645.namprd14.prod.outlook.com (2603:10b6:408:263::6)\r\n"
+           b" by BN8PR14MB3028.namprd14.prod.outlook.com with HTTPS; Wed, 10 Sep 2025\r\n"
+           b" 20:00:53 +0000\r\n")
+    chain = hop * (received_chain_bytes // len(hop) + 1)
+    return (chain
+            + b"Content-Type: multipart/alternative; boundary=\"x\"\r\n"
+            + b"Date: Wed, 10 Sep 2025 20:00:47 +0000\r\n"
+            + b"From: routing@authoritylogistics.com\r\n"
+            + b"Subject: 49985 - Delivered Notification - 210634\r\n"
+            + b"\r\nbody\r\n")
+
+
+def test_exchange_mime_with_a_long_received_chain_is_a_message_not_text():
+    raw = _exchange_mime()
+    assert raw.find(b"\r\nFrom:") > 2048, "fixture must reproduce the real offsets"
+    assert sniff.is_eml(raw) is True
+    assert sniff.sniff(raw, "Delivered Notification.msg", "message/rfc822").kind == sniff.KIND_MSG
+
+
+def test_a_received_only_prefix_still_reads_as_a_message():
+    """The header block can be nothing but `Received:` lines for kilobytes. No plain text file
+    carries that header, so one distinct name is enough here."""
+    assert sniff.is_eml(_exchange_mime(60_000)) is True
+
+
+def test_message_rfc822_content_type_is_honoured():
+    assert sniff.sniff(b"no headers at all, just prose", "note", "message/rfc822").kind == sniff.KIND_MSG
+
+
+def test_a_msg_filename_is_enough_when_the_bytes_are_mime():
+    """`connectors.mailbox` names every itemAttachment `.msg` regardless of its actual encoding,
+    so `.msg` has to be accepted alongside `.eml` or the container adapter never sees it."""
+    assert sniff.sniff(b"Subject: hi\r\nTo: a@b.c\r\n\r\nbody", "forwarded.msg", "").kind == sniff.KIND_MSG
+
+
+def test_ordinary_text_is_still_text():
+    assert sniff.sniff(b"Just a note about a delivery.\nNothing structured.", "notes.txt", "").kind == sniff.KIND_TEXT
+
+
+def test_a_body_quoting_a_from_line_is_not_a_message():
+    """The header block ends at the first blank line; a quoted `From:` below it must not count."""
+    body = b"Please see below.\r\n\r\nFrom: someone@example.com\r\nSubject: quoted\r\n"
+    assert sniff.is_eml(body) is False

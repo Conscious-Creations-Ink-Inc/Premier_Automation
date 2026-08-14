@@ -27,6 +27,10 @@ _DEMO_TABLES = (
         unit_of_measure TEXT NOT NULL,
         qty_ordered   REAL NOT NULL,
         qty_received  REAL NOT NULL DEFAULT 0,
+        -- Unapproved receipts. POLine and POLineSchema have carried this since the Spitfire read
+        -- landed; this table did not, so every row read back 0.0 and outstanding quantity was
+        -- overstated by exactly the in-flight amount — the double-receive the field exists to stop.
+        qty_in_transit REAL NOT NULL DEFAULT 0,
         cost_code     TEXT NOT NULL,
         project_code  TEXT NOT NULL,
         project_name  TEXT NOT NULL,
@@ -147,6 +151,24 @@ _DEMO_TABLES = (
 )
 
 
+# Columns added after the first demo databases were created. `CREATE TABLE IF NOT EXISTS` leaves
+# an existing table exactly as it was, so a developer with a database from before the column
+# existed gets a 500 on the first read — the store selects `*` and builds a POLine by name, and the
+# missing key raises. The pipeline solves this with `state_db._LATER_COLUMNS`; these tables are
+# owned here, so their migration lives here too.
+_DEMO_LATER_COLUMNS = {
+    "po_lines": [("qty_in_transit", "REAL NOT NULL DEFAULT 0")],
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _DEMO_LATER_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, sql_type in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+
+
 def get_demo_connection(db_path=None) -> sqlite3.Connection:
     """Opens (creating if needed) the dashboard database, with both the pipeline's own tables
     and the dashboard's. Callers own the connection and should close it — the FastAPI
@@ -154,6 +176,8 @@ def get_demo_connection(db_path=None) -> sqlite3.Connection:
     conn = state_db.get_connection(config.DEMO_DB_PATH if db_path is None else db_path)
     for statement in _DEMO_TABLES:
         conn.execute(statement)
+    # After the CREATEs, not before: a brand-new database has no tables to alter until they exist.
+    _add_missing_columns(conn)
     conn.commit()
     return conn
 

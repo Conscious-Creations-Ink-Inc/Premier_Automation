@@ -60,6 +60,20 @@ def get(conn: sqlite3.Connection, email_id: str) -> Optional[DemoEmail]:
     return rows[0] if rows else None
 
 
+def list_for_po(conn: sqlite3.Connection, po_number: str) -> List[DemoEmail]:
+    """Every email tied to one purchase order, newest first — the audit trail behind a PO row.
+
+    The meeting made this explicit: every email tied to a PO or invoice number is retained in both
+    directions with the status history behind it. `po_number` is nullable here, so mail that was
+    never tied to a PO simply does not appear rather than appearing under a null key.
+    """
+    return _query(
+        conn,
+        "SELECT * FROM demo_emails WHERE po_number = ? ORDER BY received_at DESC",
+        (po_number,),
+    )
+
+
 def list_pending_organize(conn: sqlite3.Connection) -> List[DemoEmail]:
     """Everything the organizer would still move — i.e. not already filed and not one of the
     mails we deliberately leave in the inbox (confirmations, cancellations, unclear)."""

@@ -19,11 +19,16 @@ DEMO_DB_PATH = settings.STATE_DIR / "demo_dashboard.sqlite3"
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
-# The Vite dev server proxies /api, so the browser normally talks same-origin. CORS is still
-# enabled so hitting :8000 directly (and /docs "Try it out") works during development.
+# Empty by default, and that is the safe answer now: the UI is served by this same process at /ui,
+# so every browser request is already same-origin and needs no grant. The list used to name the
+# Vite dev server on :5173 for the React dashboard, which no longer exists.
+#
+# Set CORS_ORIGINS only if something genuinely separate has to call /api/*, and name that origin
+# exactly — the middleware is configured with allow_credentials=True, so a wildcard here would let
+# any site read authenticated responses once this app has any authentication at all.
 CORS_ORIGINS = [
     origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
 

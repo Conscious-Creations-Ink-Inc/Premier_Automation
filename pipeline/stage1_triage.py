@@ -118,6 +118,13 @@ def _attachment_kinds(email: RawEmail) -> Tuple[set, int]:
     return readable, image_count
 
 
+def _is_internal(sender_address: Optional[str]) -> bool:
+    """Premier's own staff. Resolved on the origin hop, because every message in the mailbox is
+    forwarded from `premierpm.com` and the envelope sender says so of all of them."""
+    domain = (sender_address or "").rsplit("@", 1)[-1].strip().lower()
+    return bool(domain) and domain in {d.lower() for d in settings.INTERNAL_DOMAINS}
+
+
 def _looks_like_delivery_thread(subject: str, body: str) -> bool:
     """Guard on the rules that act on attachments alone, so an unrelated thread that happens to
     carry a spreadsheet is not pulled into the receiving pipeline."""
@@ -180,6 +187,10 @@ def triage(email: RawEmail, evidence=None) -> TriagedEmail:
             matched_rule=matched_rule, extracted_po_hints=po_hints,
             extracted_shipment_hint=shipment_hint, reason=reason,
             origin_sender_address=origin.sender_address or email.sender_address,
+            # No fallback to the envelope date here: None must stay None so the reader downstream
+            # can tell "the mail states when it was sent" from "we only know when it arrived".
+            # Collapsing them here would make a forward date indistinguishable from a real one.
+            origin_sent_at=origin.sent_at,
             notification_number=notification_number,
         )
 
@@ -249,6 +260,28 @@ def triage(email: RawEmail, evidence=None) -> TriagedEmail:
         return result(NotificationType.PROPERTY_CONFIRMATION, TriageCategory.HOLD,
                       "rule_5a_tracker_attachment",
                       f"delivery thread whose identifying data is in an attachment {detail}")
+
+    # Rule 5c — internal chatter that is not about a delivery at all. Twelve of the fourteen
+    # emails in Premier's manual queue were all-associates broadcasts and calendar invites
+    # (`Premier Monthly Celebration` five times over, `Premier Monthly Huddle`, `Canceled: Voting
+    # Holiday Reward`), each queued as "no PO reference found anywhere in the thread". True, and
+    # useless: they buried the two entries that were real work.
+    #
+    # Placed *above* 5b deliberately. `You've joined the Premier PM All Associates group` carries
+    # ten signature logos and was matching the photographed-evidence rule, so it arrived in the
+    # queue claiming to be delivery evidence.
+    #
+    # Every condition must hold, because the cost of the two mistakes is not symmetrical: a
+    # broadcast left in the queue is noise, a real delivery hidden is a receiver nobody creates.
+    # `Fw: Cameo Harbour Delivery` is internal and PO-less too, and stays — it has real photos
+    # and delivery vocabulary.
+    if (not po_hints
+            and not readable and not images
+            and _is_internal(origin.sender_address or email.sender_address)
+            and not _looks_like_delivery_thread(email.subject, body)):
+        return result(NotificationType.UNKNOWN, TriageCategory.HIDE, "rule_5c_internal_noise",
+                      "internal mail with no PO, no attachment worth reading and no delivery "
+                      "vocabulary anywhere in the thread — an announcement, not a delivery")
 
     # Rule 5b — photographed PODs and BOLs. Reached only once the evidence pass has already
     # tried to read them, so this says "OCR found nothing", not "we never looked".

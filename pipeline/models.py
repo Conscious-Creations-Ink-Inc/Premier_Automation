@@ -95,6 +95,15 @@ class TriagedEmail:
     handed over is a `Fw:` from an internal expeditor, so `email.sender_address` is
     `premierpm.com` on all of them and useless for routing (see parsing/thread.py)."""
 
+    origin_sent_at: Optional[str] = None
+    """When that payload was actually sent, `YYYY-MM-DD`, from the same quoted header block.
+
+    The counterpart to `origin_sender_address` and for the same reason: the envelope date of a
+    forward is the day it was forwarded. On the corpus that is 2026-06-06 for twelve of fourteen
+    messages, which is why every stage of every delivery timeline once showed one date. None when
+    the mail arrived direct, or when the header is in a shape `parsing.thread.parse_sent` cannot
+    read — in both cases the envelope date is the better answer."""
+
     notification_number: Optional[str] = None
     """The originator's own reference (Authority inbound # / Authority #). Two files in the
     corpus are the same notice 239336 — one direct, one forwarded — arriving under different
@@ -196,6 +205,20 @@ class POLine:
     ship_to: Optional[str]
     assigned_agent: Optional[str]
     pay_terms: Optional[str] = None   # "Net 30" | "CBD" | "ADR" — needed by Stage 5; checklist #14
+
+    qty_in_transit: float = 0.0
+    """`RelatedItemDetail.ReceiptInProgressUnits` — *"units tentatively received not yet
+    approved"*: a receipt document that exists but has not been approved through its route.
+
+    Outstanding quantity has to subtract this as well as `qty_received`, or a delivery whose
+    receipt is still awaiting approval reads as entirely un-received and gets a second receipt
+    raised against it. One physical delivery becoming two receivers is the failure that ended
+    Premier's previous attempt, and this field is the only thing in the API that reveals the
+    in-flight case. It is also column 53 ("Qty In Transit") of the receiver file spec."""
+
+    @property
+    def qty_outstanding(self) -> float:
+        return self.qty_ordered - self.qty_received - self.qty_in_transit
 
 
 @dataclass

@@ -19,6 +19,7 @@ matter of course, so both shapes have to work.
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional
 
 # Outlook renders a quoted hop as a From/Sent/To[/Cc]/Subject header block. Coming out of HTML
@@ -42,6 +43,40 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 INTERNAL_DOMAINS = {"premierpm.com"}
 
 
+# Every `Sent:` shape in the corpus, measured across its 111 quoted headers rather than guessed.
+# Three of the four were obvious; the fourth was not — six headers use 24-hour time with no AM/PM
+# marker, and a list without it silently drops them.
+_SENT_FORMATS = (
+    "%A, %B %d, %Y %I:%M %p",       # Monday, December 1, 2025 2:14 PM
+    "%A, %B %d, %Y %I:%M:%S %p",    # Thursday, October 9, 2025 11:17:49 AM
+    "%A, %B %d, %Y %H:%M",          # Thursday, May 7, 2026 17:03
+    "%A, %B %d, %Y %H:%M:%S",
+)
+
+
+def parse_sent(raw: str) -> Optional[str]:
+    """An Outlook `Sent:` header as an ISO date, or None.
+
+    Returns the date only — `YYYY-MM-DD`. These are local wall-clock strings with no zone, so the
+    time of day is not comparable across senders and pretending otherwise would invent precision.
+    The date is what a delivery timeline is asked about.
+
+    None rather than an exception on anything unrecognised: this runs over mail from ~3,000 outside
+    parties, and one unfamiliar locale must not fail the ingest of an otherwise readable message.
+    `ThreadHop.sent_raw` keeps the original either way, so a format we cannot read stays visible
+    rather than disappearing.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in _SENT_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 @dataclass
 class ThreadHop:
     """One message in the quoted chain. `depth` 0 is the newest (the delivered message itself)."""
@@ -56,6 +91,16 @@ class ThreadHop:
     @property
     def sender_local_part(self) -> str:
         return self.sender_address.split("@")[0].lower() if "@" in self.sender_address else ""
+
+    @property
+    def sent_at(self) -> Optional[str]:
+        """When this hop was actually sent, `YYYY-MM-DD`, or None.
+
+        This is the date a delivery timeline should show. The envelope date of a forwarded message
+        is the day Premier forwarded it — on the corpus that is 2026-06-06 for twelve of fourteen
+        messages, which is how every stage of every purchase order came to show one date.
+        """
+        return parse_sent(self.sent_raw)
 
 
 @dataclass

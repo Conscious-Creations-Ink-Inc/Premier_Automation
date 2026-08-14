@@ -177,8 +177,15 @@ def _stage_receipt(conn, row, po_line, note: str, now: str) -> int:
         "po_line_id": po_line.id,
         "shipment_number": record.shipment_number,
         "purchase_order": po_line.line.po_number,
-        # The line key is Spitfire's GUID for the PO line — what makes the receipt exact.
-        "item_number": po_line.line.line_key,
+        # The spec code, not the line key. This field mirrors `czx_TPI_INSERT_PO.@ItemNumber`,
+        # which is `varchar(15)` and cannot hold a 36-character GUID — and Premier's own
+        # `czx_TPICreate_ReceiptDoc` settles what belongs there by joining
+        # `TPI.ItemNumber = di.SourceItemNumber`, i.e. the spec code. The REST read confirms the
+        # same field from the other side: `SourceItemNumber` is `FIT-902-TV`, while `DocItemKey`
+        # is the GUID. Nothing is lost by the change — `po_line_id` still resolves to the row
+        # that carries `line_key`, which is what a receipt posted over REST puts in
+        # `LinkedItemKey`.
+        "item_number": po_line.line.spec_code,
         "item_description": po_line.line.description,
         "vendor": po_line.line.vendor_name,
         "carrier_name": record.carrier_name,

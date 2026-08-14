@@ -22,11 +22,12 @@ Three things the corpus forced:
 import hashlib
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import extract_msg
 
 from connectors.mailbox import Mailbox
+from pipeline import attachment_store
 from pipeline.models import Attachment, RawEmail
 from pipeline.parsing import sniff
 
@@ -91,29 +92,43 @@ class MsgFileMailbox(Mailbox):
         nothing on disk. Regression runs point this connector at Premier's original sample
         folder; without the guard, one run would scatter their source data across four
         subdirectories."""
+        self.routed_to: dict = {}
+        """email_id -> folder, for every email this instance settled, moved or not. It is the
+        run's own record of what it decided — the state tables accumulate across runs and can no
+        longer answer that question on their own."""
         self._path_by_email_id: dict = {}
 
     # --- Mailbox interface ---------------------------------------------------
 
-    def fetch_new(self) -> List[RawEmail]:
+    def fetch_new(self, skip_ids: Optional[Set[str]] = None,
+                  since: Optional[str] = None) -> List[RawEmail]:
         """One `RawEmail` per file. A file that fails to parse is skipped with a log line and
         never aborts the batch — one corrupt item must not cost us the other thirteen
-        (finding C8)."""
+        (finding C8).
+
+        `skip_ids` is honoured after parsing, not before: a `.msg` file's id only exists once the
+        file has been read, so there is nothing cheaper to decide on. It is accepted anyway so the
+        caller does not have to know which mailbox it is holding — for `GraphMailbox`, where the id
+        arrives in the listing, skipping early is what makes a poll fast.
+        """
+        skip = skip_ids or frozenset()
         emails: List[RawEmail] = []
         for path in sorted(self.folder.glob(self.pattern)):
             try:
-                emails.append(self.read_file(path))
+                email = self.read_file(path)
             except Exception as e:
                 _logger.warning("failed to parse %s: %s: %s", path.name, type(e).__name__, e, exc_info=True)
+                continue
+            if email.email_id not in skip:
+                emails.append(email)
         return emails
 
     def mark_processed(self, email_id: str, folder: str) -> None:
         """Move the source file into a sibling folder, mirroring the Graph connector's folder
         routing. Looks the path up by the id we handed out, rather than assuming the filename
         equals the id — that assumption is why `LocalFolderMailbox` silently no-ops (finding C2)."""
+        self.routed_to[email_id] = folder
         if self.read_only:
-            self.routed_to = getattr(self, "routed_to", {})
-            self.routed_to[email_id] = folder
             return
         source = self._path_by_email_id.get(email_id)
         if not source or not Path(source).exists():
@@ -252,6 +267,9 @@ class MsgFileMailbox(Mailbox):
             if attachment.drop_hint is None:
                 seen_digests.add(result.sha256)
             else:
+                # Kept before it is released, for the reason set out in `GraphMailbox._to_attachment`:
+                # a decorative misclassification must not be able to destroy a photographed POD.
+                attachment_store.put(attachment.content_bytes)
                 attachment.content_bytes = b""   # metadata is enough for a dropped attachment
 
             collected.append(attachment)

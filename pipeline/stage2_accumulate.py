@@ -58,6 +58,7 @@ def _serialize_triaged_email(te: TriagedEmail) -> str:
         "extracted_shipment_hint": te.extracted_shipment_hint,
         "reason": te.reason,
         "origin_sender_address": te.origin_sender_address,
+        "origin_sent_at": te.origin_sent_at,
         "notification_number": te.notification_number,
     })
 
@@ -95,6 +96,9 @@ def _deserialize_triaged_email(payload: str) -> TriagedEmail:
         extracted_shipment_hint=data["extracted_shipment_hint"],
         reason=data["reason"],
         origin_sender_address=data.get("origin_sender_address"),
+        # `.get`, like its neighbours: a payload written before this field existed must still
+        # deserialize rather than KeyError a stored accumulation into an unreadable state.
+        origin_sent_at=data.get("origin_sent_at"),
         notification_number=data.get("notification_number"),
     )
 

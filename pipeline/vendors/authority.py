@@ -91,21 +91,45 @@ _HEADER_LABELS = [
     "carrier", "tracking", "quantity", "weight", "from", "delivered", "signed by", "to",
 ]
 
-_LABEL_VALUE_RE_CACHE: Dict[str, re.Pattern] = {}
+# Every known label, longest first so `received date` wins over a bare `received`. The label may
+# start a line or sit mid-line — Authority renders `Delivered: 09/10/2025  Signed by:  U ALI` as
+# one line, so a line-anchored pattern finds the date and silently loses who signed for it.
+_ANY_LABEL_RE = re.compile(
+    r"(?:^|(?<=[\s>]))(" + "|".join(re.escape(label) for label in
+                                    sorted(_HEADER_LABELS, key=len, reverse=True)) + r")[ \t]*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _label_values(text: str) -> Dict[str, str]:
+    """Every `Label: value` in one pass, each value running to the next label or a blank line.
+
+    One pass rather than a regex per label, because the per-label form needed a lookahead to
+    decide where a value ended, and that lookahead lost to backtracking: `Delivered` swallowed
+    `Signed by:  U ALI` *and* the whole `To:` line after it. Splitting at the next label removes
+    the guess — a value ends where the next one begins, which is the actual rule.
+    """
+    matches = list(_ANY_LABEL_RE.finditer(text or ""))
+    values: Dict[str, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = text[match.end():end]
+        # Outlook puts the value on the line below its label (`Tracking:` does this), so one
+        # leading newline belongs to the value. A *second* one is a paragraph break and does not.
+        value = re.sub(r"^[ \t]*\r?\n", "", value, count=1)
+        blank_line = re.search(r"\r?\n[ \t]*\r?\n", value)
+        if blank_line:
+            value = value[:blank_line.start()]
+        name = match.group(1).lower()
+        collapsed = re.sub(r"\s+", " ", value).strip()
+        if collapsed and name not in values:
+            values[name] = collapsed
+    return values
 
 
 def _label_value(text: str, label: str) -> str:
-    """Read `Label: value` out of rendered text, tolerating the value landing on the next line
-    (which is how Outlook renders these blocks) and stopping at the next known label."""
-    if label not in _LABEL_VALUE_RE_CACHE:
-        _LABEL_VALUE_RE_CACHE[label] = re.compile(
-            rf"^[ \t]*{re.escape(label)}\s*:[ \t]*\n?(?P<value>(?:[^\n]*\n?){{0,3}}?)(?=\n\s*\n|\n[ \t]*[A-Z][\w #]{{2,20}}\s*:|\Z)",
-            re.IGNORECASE | re.MULTILINE,
-        )
-    match = _LABEL_VALUE_RE_CACHE[label].search(text or "")
-    if not match:
-        return ""
-    return re.sub(r"\s+", " ", match.group("value")).strip()
+    """Read one `Label: value` out of rendered text. See `_label_values`."""
+    return _label_values(text).get(label.lower(), "")
 
 
 _INBOUND_ANCHOR_RE = re.compile(r"^[ \t]*Received\s+Date\s*:", re.IGNORECASE | re.MULTILINE)
@@ -298,8 +322,10 @@ def _fill_header(notice: AuthorityNotice, all_tables: List[tbl.HtmlTable], rende
                 if key in _HEADER_LABELS and key not in from_tables:
                     from_tables[key] = value
 
+    from_text = _label_values(rendered)
+
     def get(label: str) -> str:
-        return from_tables.get(label) or _label_value(rendered, label)
+        return from_tables.get(label) or from_text.get(label, "")
 
     notice.received_date = tok.normalize_date(get("received date")) or tok.normalize_date(get("delivered"))
     notice.received_at = get("received at") or get("to") or None

@@ -174,31 +174,184 @@ def _text_from_vision_response(payload: dict) -> str:
     return "\n\n".join(chunks)
 
 
-# Kept under its old name so existing imports and tests keep resolving.
-RealDocumentIntelligenceClient = AzureVisionClient
+class AzureDocumentIntelligenceClient(DocumentIntelligenceClient):
+    """Azure AI Document Intelligence — the production OCR path, called over REST.
+
+    This is what Premier's "premier" resource (eastus) actually serves; a Vision Image Analysis
+    call against the same endpoint 401s, which is why `AzureVisionClient` below is kept only for
+    a genuine Vision resource. DocInt is the better service for this corpus regardless:
+
+    - `prebuilt-layout` returns **table structure**, so a photographed packing slip's columns
+      survive and `records_from_ocr_result` can take its table path instead of falling through
+      to free text. Vision's Read could only ever return loose lines.
+    - It accepts a **PDF directly** — no page-by-page rasterisation, so a scanned multi-page POD
+      is one call, not one call per page.
+
+    Analyze is asynchronous: POST returns 202 with an `operation-location`, which is polled until
+    the status leaves `running`. Polling GETs are not billed; only the initial POST is, and it is
+    billed per page — hence the `pages` cap below, which is the spend guard.
+
+    Deliberately no SDK: two authenticated HTTP calls are the whole contract and `requests` is
+    already a dependency.
+    """
+
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ):
+        self.endpoint = (endpoint or settings.AZURE_DOC_INTELLIGENCE_ENDPOINT or "").rstrip("/")
+        self.api_key = api_key or settings.AZURE_DOC_INTELLIGENCE_KEY
+        self.model = model or settings.AZURE_DOC_INTELLIGENCE_MODEL
+        self.timeout = timeout or settings.AZURE_VISION_TIMEOUT_SECONDS
+        if not self.endpoint or not self.api_key:
+            raise ValueError(
+                "AzureDocumentIntelligenceClient needs AZURE_DOC_INTELLIGENCE_ENDPOINT and "
+                "AZURE_DOC_INTELLIGENCE_KEY (or the AZURE_VISION_* pair they fall back to) — "
+                "set them in .env."
+            )
+
+    def analyze(self, content_bytes: bytes) -> OcrResult:
+        import requests
+
+        if len(content_bytes) > settings.OCR_MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"document is {len(content_bytes)} bytes, above the "
+                f"{settings.OCR_MAX_IMAGE_BYTES}-byte limit"
+            )
+
+        params = {"api-version": settings.AZURE_DOC_INTELLIGENCE_API_VERSION}
+        if content_bytes[:4] == b"%PDF":
+            # Caps billed pages on a long scan. Images are always one page, so the parameter is
+            # only meaningful — and only accepted without complaint — for PDFs.
+            params["pages"] = f"1-{settings.OCR_MAX_PAGES}"
+
+        response = requests.post(
+            f"{self.endpoint}/documentintelligence/documentModels/{self.model}:analyze",
+            params=params,
+            headers={
+                "Ocp-Apim-Subscription-Key": self.api_key,
+                "Content-Type": "application/octet-stream",
+            },
+            data=content_bytes,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        operation_url = response.headers.get("operation-location")
+        if not operation_url:
+            raise RuntimeError("Document Intelligence accepted the document but returned no "
+                               "operation-location to poll")
+        return _ocr_result_from_docint(self._poll(operation_url))
+
+    def _poll(self, operation_url: str) -> dict:
+        import requests
+
+        deadline = time.monotonic() + settings.AZURE_DOC_INTELLIGENCE_POLL_TIMEOUT_SECONDS
+        while True:
+            result = requests.get(
+                operation_url,
+                headers={"Ocp-Apim-Subscription-Key": self.api_key},
+                timeout=self.timeout,
+            )
+            result.raise_for_status()
+            payload = result.json()
+            status = (payload.get("status") or "").lower()
+            if status == "succeeded":
+                return payload.get("analyzeResult") or {}
+            if status == "failed":
+                error = (payload.get("error") or {}).get("message", "no message")
+                raise RuntimeError(f"Document Intelligence analysis failed: {error}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Document Intelligence still '{status}' after "
+                    f"{settings.AZURE_DOC_INTELLIGENCE_POLL_TIMEOUT_SECONDS}s"
+                )
+            time.sleep(settings.AZURE_DOC_INTELLIGENCE_POLL_SECONDS)
+
+
+def _ocr_result_from_docint(analyze_result: dict) -> OcrResult:
+    """Flatten a DocInt analyzeResult into the OcrResult the adapters already understand.
+
+    Text comes from `pages[].lines[]` rather than the flat `content` string, because the line
+    breaks are what the POD grammar's label/value patterns key off — `content` on a
+    multi-column form runs labels and values together.
+    """
+    pages = analyze_result.get("pages") or []
+
+    chunks = []
+    for page in pages:
+        lines = [line.get("content", "") for line in (page.get("lines") or [])]
+        if lines:
+            chunks.append("\n".join(lines))
+    raw_text = "\n\n".join(chunks) or (analyze_result.get("content") or "")
+
+    tables = [_grid_from_docint_table(table) for table in (analyze_result.get("tables") or [])]
+
+    confidences = [
+        word["confidence"]
+        for page in pages
+        for word in (page.get("words") or [])
+        if isinstance(word.get("confidence"), (int, float))
+    ]
+    mean = sum(confidences) / len(confidences) if confidences else 0.5
+    confidence = min(mean, settings.AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP)
+
+    return OcrResult(tables=[t for t in tables if t], raw_text=raw_text, confidence=confidence)
+
+
+def _grid_from_docint_table(table: dict) -> List[List[str]]:
+    """DocInt returns a table as a flat cell list carrying row/column indices; rebuild the grid.
+
+    Cells that span rows or columns appear once, at their origin — the rest of the span stays
+    empty, which is the honest representation: `map_headers` reads row 0 and a merged header
+    genuinely does not label the columns it visually covers.
+    """
+    rows = table.get("rowCount") or 0
+    columns = table.get("columnCount") or 0
+    if not rows or not columns:
+        return []
+    grid = [["" for _ in range(columns)] for _ in range(rows)]
+    for cell in table.get("cells") or []:
+        row, column = cell.get("rowIndex"), cell.get("columnIndex")
+        if row is None or column is None or row >= rows or column >= columns:
+            continue
+        grid[row][column] = (cell.get("content") or "").strip()
+    return grid
+
+
+# Kept under its old name so existing imports and tests keep resolving. It now points at the
+# Document Intelligence client, which is what the name always claimed.
+RealDocumentIntelligenceClient = AzureDocumentIntelligenceClient
 
 
 def build_client(preference: Optional[str] = None) -> DocumentIntelligenceClient:
-    """Resolve the OCR client: `auto` | `azure` | `tesseract` | `mock`.
+    """Resolve the OCR client: `auto` | `azure` | `vision` | `tesseract` | `mock`.
 
-    `auto` prefers Azure when it is configured, falls back to Tesseract when the binary is
-    present, and otherwise returns the mock — so a machine with no OCR at all still runs, and
-    photographed evidence lands on the exception queue instead of failing the pass.
+    `azure` is Document Intelligence — the production path, and what Premier's resource serves.
+    `vision` is the Image Analysis client, kept for a Vision-or-multi-service resource.
+
+    `auto` prefers Document Intelligence when it is configured, falls back to Tesseract when the
+    binary is present, and otherwise returns the mock — so a machine with no OCR at all still
+    runs, and photographed evidence lands on the exception queue instead of failing the pass.
     """
     choice = (preference or settings.OCR_CLIENT or "auto").lower()
 
     if choice == "mock":
         return MockDocumentIntelligenceClient()
     if choice == "azure":
+        return AzureDocumentIntelligenceClient()
+    if choice == "vision":
         return AzureVisionClient()
     if choice == "tesseract":
         return TesseractDocumentIntelligenceClient()
 
-    if settings.AZURE_VISION_ENDPOINT and settings.AZURE_VISION_KEY:
+    if settings.AZURE_DOC_INTELLIGENCE_ENDPOINT and settings.AZURE_DOC_INTELLIGENCE_KEY:
         try:
-            return AzureVisionClient()
+            return AzureDocumentIntelligenceClient()
         except Exception as e:
-            _log(f"Azure Vision unavailable ({e}); falling back")
+            _log(f"Azure Document Intelligence unavailable ({e}); falling back")
     try:
         client = TesseractDocumentIntelligenceClient()
         if Path(settings.TESSERACT_CMD_PATH).exists():

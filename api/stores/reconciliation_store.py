@@ -219,6 +219,17 @@ def receipt_for_record(conn: sqlite3.Connection, extracted_record_id: int) -> Op
         conn.row_factory = prior_factory
 
 
+def staged_po_line_ids(conn: sqlite3.Connection) -> set:
+    """Every PO line that already has a staged receipt.
+
+    Fetched for all lines at once rather than per line: the PO list view would otherwise issue one
+    query per line, and the whole point of that page is to show every PO on one screen.
+    """
+    return {row[0] for row in conn.execute(
+        "SELECT DISTINCT po_line_id FROM staged_receipts WHERE po_line_id IS NOT NULL"
+    ).fetchall()}
+
+
 def count_receipts(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM staged_receipts").fetchone()[0]
 

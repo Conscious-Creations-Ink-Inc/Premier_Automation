@@ -12,8 +12,9 @@ from pipeline.models import POLine
 
 _COLUMNS = (
     "po_number", "line_number", "line_key", "spec_code", "description", "vendor_name",
-    "unit_of_measure", "qty_ordered", "qty_received", "cost_code", "project_code",
-    "project_name", "line_status", "expected_date", "ship_to", "assigned_agent", "pay_terms",
+    "unit_of_measure", "qty_ordered", "qty_received", "qty_in_transit", "cost_code",
+    "project_code", "project_name", "line_status", "expected_date", "ship_to", "assigned_agent",
+    "pay_terms",
 )
 
 
@@ -26,7 +27,10 @@ class POLineRow:
 
     @property
     def qty_outstanding(self) -> float:
-        return self.line.qty_ordered - self.line.qty_received
+        """Delegates, so the demo store and the live Spitfire mirror cannot disagree about what
+        "outstanding" means. `POLine.qty_outstanding` also subtracts in-transit quantity; rows
+        from this table carry the field's 0.0 default, so the answer here is unchanged."""
+        return self.line.qty_outstanding
 
 
 def insert(conn: sqlite3.Connection, line: POLine) -> int:

@@ -123,9 +123,36 @@ def referenced_cids(html: Optional[str]) -> set:
     return {match.group(1).strip("<>") for match in _CID_SRC_RE.finditer(html)}
 
 
+# A header block ends at the first blank line, and nothing after it is a header. Scanning only
+# that far is what keeps a body quoting "From: someone" from reading as an RFC-822 envelope.
+MAX_HEADER_BLOCK_BYTES = 64 * 1024
+
+
+def _header_block(content_bytes: bytes) -> bytes:
+    """The candidate header block: everything up to the first blank line, capped.
+
+    The cap matters as much as the terminator. Graph hands over an `itemAttachment` as MIME, and
+    Exchange prepends a `Received:` chain to it — on the real Delivered Notification the block runs
+    to 8,087 bytes and the first 2,255 are *nothing but* `Received:` continuation lines, so
+    `Content-Type`, `Date`, `From`, `Message-ID` and `Subject` all sit past the 2 KB this used to
+    look at. That is what made the canonical POD carrier in Premier's mail read as plain text.
+    """
+    window = content_bytes[:MAX_HEADER_BLOCK_BYTES]
+    for terminator in (b"\r\n\r\n", b"\n\n"):
+        end = window.find(terminator)
+        if end != -1:
+            return window[:end]
+    return window
+
+
 def is_eml(content_bytes: bytes) -> bool:
-    """True for raw RFC-822 message bytes — two or more distinct headers in the first 2 KB."""
-    return len({m.group(1).lower() for m in _EML_RE.finditer(content_bytes[:2048])}) >= 2
+    """True for raw RFC-822 message bytes — two or more distinct headers in the header block.
+
+    A lone `Received:` also counts, because that is a header no ordinary text file carries and
+    Exchange can emit thousands of bytes of them before anything else appears.
+    """
+    names = {m.group(1).lower() for m in _EML_RE.finditer(_header_block(content_bytes))}
+    return len(names) >= 2 or names == {b"received"}
 
 # The recurring Premier/Authority signature logo. Matching on size alone would be brittle, so we
 # key on the content hash and only fall back to the heuristics below for unseen logos.
@@ -185,6 +212,17 @@ def sniff(content_bytes: Optional[bytes], filename: str = "", content_type: str 
                 return SniffResult(_disambiguate_ole2(content_bytes, filename), "ole2 compound file", digest)
             return SniffResult(kind, f"magic {magic[:8]!r}", digest)
 
+    # An RFC-822 message, before every text-shaped gate below it. Graph returns an
+    # `itemAttachment` as MIME with `contentType: message/rfc822` — never as an OLE `.msg`, which
+    # the magic table above would already have caught — and `connectors.mailbox` names those `.msg`
+    # regardless. All three signals therefore have to be honoured here or a forwarded delivery
+    # notification falls through to `TextAdapter` and reports itself empty.
+    lowered_name = filename.lower()
+    if (is_eml(content_bytes)
+            or (content_type or "").lower().startswith("message/rfc822")
+            or lowered_name.endswith((".eml", ".msg", ".mht", ".mhtml"))):
+        return SniffResult(KIND_MSG, "rfc822 message", digest)
+
     # SVG before HTML: an <svg> containing a <p> would otherwise be read as an HTML body.
     if _SVG_RE.search(head):
         return SniffResult(KIND_IMAGE, "svg root element", digest)
@@ -197,9 +235,8 @@ def sniff(content_bytes: Optional[bytes], filename: str = "", content_type: str 
     except UnicodeDecodeError:
         return SniffResult(KIND_UNKNOWN, "no magic match, not utf-8 decodable", digest)
 
-    # .eml has no magic number — it is just text that happens to begin with RFC-822 headers.
-    if is_eml(content_bytes) or filename.lower().endswith((".eml", ".mht", ".mhtml")):
-        return SniffResult(KIND_MSG, "rfc822 headers", digest)
+    # The RFC-822 test that used to live here now runs above the HTML gate, because a message is
+    # not merely a text shape — it is a container, and reaching this line at all means it is not.
     return SniffResult(KIND_TEXT, "decodes as utf-8", digest)
 
 

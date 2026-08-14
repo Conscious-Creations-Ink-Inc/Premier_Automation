@@ -196,3 +196,40 @@ def test_status_report_parses_to_a_deliberately_empty_notice():
     assert notice.kind == az.NoticeKind.STATUS_REPORT
     assert notice.lines == []
     assert az.records_from_notice(notice, "m", "2026-01-01") == []
+
+
+# --- Header labels sharing a line -------------------------------------------
+# Authority renders `Delivered: 09/10/2025  Signed by:  U ALI` as ONE line. The old per-label
+# regex was line-anchored, so `Signed by` was never found and `received_by` came back empty on
+# every Delivered notice in the mailbox — 13 of 13 records had no proof of who took the goods.
+
+_TWO_LABELS_ON_ONE_LINE = (
+    "Authority #: 49985\n\n"
+    "Carrier: GlobalTranz Enterprises, LLC\n\n"
+    "Tracking:\n\r\n        31457971\n7497809572 FEDEX\r\n\n"
+    "From: Hampton Textile Printing Inc. : 2230 Eddie Williams Drive, Johnson City, TN\n\n"
+    "Delivered: 09/10/2025  Signed by:  U ALI\n\n"
+    "To: 5-Star Interior Services, Inc. : 6840 Walthall Way, Paramount, CA\r\n\n"
+)
+
+
+def test_a_label_sharing_a_line_with_another_is_still_read():
+    assert az._label_value(_TWO_LABELS_ON_ONE_LINE, "signed by") == "U ALI"
+
+
+def test_a_value_stops_at_the_next_label_on_the_same_line():
+    """`Delivered` used to swallow `Signed by:  U ALI` and the whole `To:` line after it — the
+    end-of-value lookahead lost to backtracking."""
+    assert az._label_value(_TWO_LABELS_ON_ONE_LINE, "delivered") == "09/10/2025"
+
+
+def test_a_value_beginning_on_the_line_below_its_label_survives():
+    """Outlook renders `Tracking:` with its value on the next line; exactly one leading newline
+    belongs to the value, and a second is a paragraph break."""
+    assert az._label_value(_TWO_LABELS_ON_ONE_LINE, "tracking") == "31457971 7497809572 FEDEX"
+
+
+def test_ship_from_and_ship_to_are_not_confused_by_the_shared_line():
+    values = az._label_values(_TWO_LABELS_ON_ONE_LINE)
+    assert values["from"].startswith("Hampton Textile")
+    assert values["to"].startswith("5-Star Interior Services")

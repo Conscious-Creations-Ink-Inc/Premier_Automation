@@ -13,6 +13,13 @@ openpyxl        # .xlsx trackers
 xlrd            # legacy .xls trackers — xlrd 2.x reads BIFF only, which is exactly what we want
 python-docx     # .docx attachments
 
+# Read by the attachment viewer rather than by the extraction cascade. Neither format is mined for
+# delivery records — a deck is not a POD — but "open any attachment in the UI" means a person has
+# to be able to *look* at one without leaving the browser, and a panel that says "not previewable"
+# is the thing that promise exists to remove.
+python-pptx     # .pptx decks — slide text and tables, for reading only
+striprtf        # .rtf to plain text; RTFDE above handles the encapsulated-HTML case
+
 # Pinned explicitly rather than relied on transitively (they arrive via extract-msg and
 # pdfplumber today, but the code below now depends on them directly).
 olefile            # tells .xls from .doc inside an OLE2 container

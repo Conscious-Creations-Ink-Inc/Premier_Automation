@@ -20,6 +20,31 @@ def get_conn() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def get_pipeline_conn() -> Iterator[sqlite3.Connection]:
+    """The *pipeline* state database — what the real orchestrator writes.
+
+    Deliberately not `get_conn`, which serves the synthetic demo dashboard. The two schemas
+    overlap on `extracted_records`, so a single mixed-up dependency would quietly render demo
+    data on the pipeline pages and nobody would be able to tell from the screen.
+
+    `get_connection` creates the file and every table on first open, so the pages render empty
+    with a hint before the first run rather than 500ing.
+
+    This is Premier's **live mailbox** store. It was the `.msg` sample store until 2026-08-12,
+    back when these pages existed to inspect a corpus run; the corpus has been retired, so every
+    page now reads the same database the automation writes when it reads the real inbox. There is
+    no second store on screen any more — see `read_views.MAIL_SOURCES`.
+    """
+    from config import settings
+    from pipeline import state_db
+
+    conn = state_db.get_connection(settings.PIPELINE_STATE_DB_PATH)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def get_operator(x_operator: Optional[str] = Header(default=None)) -> str:
     """Who a decision is attributed to. The UI sends `X-Operator`; a request body may override
     it per-decision. Falls back to the configured default so the demo is never blocked on auth,

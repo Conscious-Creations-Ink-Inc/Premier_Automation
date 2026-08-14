@@ -22,6 +22,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
+from pipeline import attachment_store
 from pipeline.models import Attachment, RawEmail
 from pipeline.parsing import sniff
 
@@ -48,21 +49,30 @@ DROPPED_OVERSIZE = "dropped_oversize"
 DROPPED_DEPTH = "dropped_depth"
 DROPPED_COUNT = "dropped_count"
 DROPPED_EMPTY = "dropped_empty"       # zero bytes
+DROPPED_REFERENCE = "dropped_reference"
+"""A cloud link rather than a file — Graph's `referenceAttachment`, a OneDrive/SharePoint URL
+carrying no bytes. Distinct from `NO_ADAPTER` on purpose: nothing is missing from our readers,
+there is simply nothing to read. Fetching it would need `Files.Read.All` and a separate consent
+conversation, so the URL is recorded and a person opens it."""
 
 ALL_DISPOSITIONS = frozenset({
     OBSERVED, NOT_DISPATCHED, AWAITING_RELEASE, CONTAINER_EXPANDED, EXTRACTED, EMPTY, UNREADABLE, ENCRYPTED,
     CORRUPT, NO_ADAPTER, UNSUPPORTED_FORMAT, DROPPED_DECORATIVE, DROPPED_DUPLICATE,
-    DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT, DROPPED_EMPTY,
+    DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT, DROPPED_EMPTY, DROPPED_REFERENCE,
 })
 TERMINAL = ALL_DISPOSITIONS - {OBSERVED}
 
 NEEDS_ATTENTION = frozenset({
     UNREADABLE, ENCRYPTED, CORRUPT, NO_ADAPTER, UNSUPPORTED_FORMAT,
-    DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT,
+    DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT, DROPPED_REFERENCE,
 })
 """Dispositions a person should see. Deliberately excludes the decorative/duplicate drops,
 which are routine and correct, and `empty`, which means we read it and it genuinely held
-nothing."""
+nothing. `dropped_reference` is here because the POD may well be behind that link.
+
+`empty` stays out of *this* set because it also drives `review_status`, and a genuinely empty
+signature image is not review work. It is not ignored either — see `list_silent_on_delivery_mail`,
+which exists because "we read it and it held nothing" turned out to be a lie."""
 
 REVIEW_NONE = "none"
 REVIEW_PENDING = "pending_review"
@@ -96,6 +106,10 @@ class LedgerRow:
     triage_category: Optional[str] = None
     review_status: str = REVIEW_NONE
     parent_id: Optional[int] = None
+    first_seen_at: str = ""
+    """When this attachment was first recorded. The column has existed since the table did and two
+    queries already order by it, but it was never carried onto the row — so the manual queue built
+    its attachment items with a blank date, and the When column was empty on every one of them."""
 
 
 def _row(record: sqlite3.Row) -> LedgerRow:
@@ -107,7 +121,7 @@ def _row(record: sqlite3.Row) -> LedgerRow:
         depth=record["depth"], claimed_by=record["claimed_by"],
         records_extracted=record["records_extracted"], error_type=record["error_type"],
         triage_category=record["triage_category"], review_status=record["review_status"],
-        parent_id=record["parent_id"],
+        parent_id=record["parent_id"], first_seen_at=record["first_seen_at"] or "",
     )
 
 
@@ -176,6 +190,7 @@ def _disposition_for_hint(drop_hint: Optional[str]) -> tuple:
         "empty": DROPPED_EMPTY,
         "depth": DROPPED_DEPTH,
         "count": DROPPED_COUNT,
+        "reference": DROPPED_REFERENCE,
     }
     return mapping.get(head, NO_ADAPTER), drop_hint
 
@@ -199,10 +214,19 @@ def _insert(
     # recorded at ingest, while the bytes were still present, is the truthful one.
     kind = attachment.sniffed_kind or result.kind
     reason = result.reason if kind == result.kind else "recorded at ingest, before the bytes were released"
+
+    # Keep the bytes. Ingest used to keep none at all, so the only copy of every POD was Premier's
+    # Outlook mailbox. Two cases meet here: an attachment still holding its bytes is stored now,
+    # and one already released by the connector was stored there, before the release — the
+    # `exists` branch is what re-attaches that row to its blob.
+    digest = attachment.sha256 or result.sha256
+    blob = attachment_store.put(attachment.content_bytes)
+    if blob is None and digest and attachment_store.exists(digest):
+        blob = digest
     values = (
         email_id, parent_id, depth, ordinal, container_path, attachment.filename,
         attachment.content_type, kind, reason,
-        attachment.sha256 or result.sha256,
+        digest,
         attachment.size_bytes or len(attachment.content_bytes or b""),
         attachment.content_id, 1 if attachment.is_inline else 0,
         triage_category, None, 0, disposition, detail, None, REVIEW_NONE, now, None,
@@ -213,13 +237,24 @@ def _insert(
         values,
     )
     conn.commit()
-    if cursor.lastrowid:
-        return cursor.lastrowid
-    existing = conn.execute(
-        "SELECT id FROM attachment_ledger WHERE email_id = ? AND depth = ? AND ordinal = ? AND sha256 = ?",
-        (email_id, depth, ordinal, attachment.sha256 or result.sha256),
-    ).fetchone()
-    return existing[0] if existing else None
+    row_id = cursor.lastrowid
+    if not row_id:
+        existing = conn.execute(
+            "SELECT id FROM attachment_ledger WHERE email_id = ? AND depth = ? AND ordinal = ? AND sha256 = ?",
+            (email_id, depth, ordinal, digest),
+        ).fetchone()
+        row_id = existing[0] if existing else None
+
+    # Separate from the INSERT so a re-run of an email ingested before the store existed
+    # back-fills its blob columns rather than leaving them null for ever.
+    if row_id and blob:
+        conn.execute(
+            "UPDATE attachment_ledger SET blob_sha256 = ?, blob_stored_at = ? "
+            "WHERE id = ? AND blob_sha256 IS NULL",
+            (blob, now, row_id),
+        )
+        conn.commit()
+    return row_id
 
 
 def record_outcome(
@@ -314,6 +349,28 @@ def list_needing_attention(conn: sqlite3.Connection) -> List[LedgerRow]:
         f"SELECT * FROM attachment_ledger WHERE disposition IN ({marks}) ORDER BY first_seen_at DESC",
         tuple(sorted(NEEDS_ATTENTION)),
     )
+
+
+def list_silent_on_delivery_mail(conn: sqlite3.Connection) -> List[LedgerRow]:
+    """Attachments on delivery mail that were read successfully and yielded nothing.
+
+    `NEEDS_ATTENTION` leaves `empty` out on the reasoning that we read it and it genuinely held
+    nothing. Premier's live mail disproved that. The embedded `Delivered Notification` — the one
+    attachment carrying the POD date, the signature, the carrier, the tracking numbers and the
+    actual delivered quantity — was mis-classified as plain text, handed to `TextAdapter`, read
+    "cleanly", and recorded `empty`. It produced no records and nobody was ever told.
+
+    Restricted to `surface`/`hold` mail so an empty signature image on an all-associates broadcast
+    stays quiet: on delivery mail, an attachment that says nothing is a question, not a fact.
+    """
+    return _query(conn, f"""
+        SELECT l.* FROM attachment_ledger l
+          JOIN email_log e ON e.email_id = l.email_id
+         WHERE l.disposition = ?
+           AND l.records_extracted = 0
+           AND e.category IN ('surface', 'hold')
+         ORDER BY l.first_seen_at DESC
+    """, (EMPTY,))
 
 
 def orphans(conn: sqlite3.Connection) -> List[LedgerRow]:

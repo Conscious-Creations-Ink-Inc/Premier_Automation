@@ -82,9 +82,11 @@ hand-written JSON fixtures only.
   silently extract nothing out of the box. `RealDocumentIntelligenceClient` raises
   `NotImplementedError` (Azure not provisioned); same for the AI fallback
   (`ai_fallback.py:16`, disabled via `ENABLE_AI_FALLBACK=False`).
-- `frontend/package.json` `gen:api` writes `src/types/api.d.ts` but the real file is
-  hand-written `src/types.ts` — the two will drift.
-- `api/main.py` never mounts `frontend/dist`.
+- ~~`frontend/package.json` `gen:api` writes `src/types/api.d.ts` but the real file is
+  hand-written `src/types.ts` — the two will drift.~~ **Moot 11 Aug 2026** — the React app was
+  deleted when the three UIs were collapsed into one. No generated types remain.
+- ~~`api/main.py` never mounts `frontend/dist`.~~ **Moot 11 Aug 2026** — there is no build output
+  to mount; the UI is server-rendered at `/ui`.
 
 ## Structural (addressed by the 2026-08-02 cleanup)
 

@@ -24,7 +24,9 @@ class FakeMailbox(Mailbox):
         self._emails = emails
         self.processed_calls: List[tuple] = []
 
-    def fetch_new(self) -> List[RawEmail]:
+    def fetch_new(self, skip_ids=None, since=None) -> List[RawEmail]:
+        # Deliberately ignores `skip_ids`: it is advisory, and a connector that disregards it
+        # must still be deduplicated by `stage1_ingest.fetch_new_emails`.
         return self._emails
 
     def mark_processed(self, email_id: str, folder: str) -> None:

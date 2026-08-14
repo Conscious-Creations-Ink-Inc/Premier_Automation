@@ -29,6 +29,7 @@ class POLineSchema(BaseModel):
     unit_of_measure: str
     qty_ordered: float
     qty_received: float
+    qty_in_transit: float = 0.0   # unapproved receipts; qty_outstanding already nets these off
     qty_outstanding: float
     cost_code: str
     project_code: str
@@ -66,6 +67,17 @@ class ExtractedRecordSchema(BaseModel):
     extraction_source: str
     extraction_confidence: float
     raw_snippet: Optional[str] = None
+
+    # These five exist on `ExtractedRecord` and in the `extracted_records` table but were never
+    # added here, so the API and the review UI could not see them. `po_line_number` is the worst
+    # of the five to lose: it is the Spitfire line number stated outright by the Authority Inbound
+    # (`208491 : 300`), and it is what turns a match from a fuzzy description search into an exact
+    # lookup — precisely the field a human completing a match by hand most needs shown.
+    po_line_number: Optional[int] = None
+    received_by: Optional[str] = None
+    package_quantity: Optional[float] = None
+    package_uom: Optional[str] = None
+    notification_number: Optional[str] = None
 
 
 class ExtractedRecordRowSchema(BaseModel):
@@ -257,6 +269,56 @@ class DeliveryReport(BaseModel):
 
 
 # --- Inbox organizer -----------------------------------------------------------
+
+
+# --- Delivery status per purchase order ---------------------------------------
+# The lifecycle vocabulary is `api.services.po_status.LIFECYCLE`, not a Literal here: the statuses
+# are derived today and become M1's persisted values later, and a Literal in two files is how the
+# pipeline and the UI start disagreeing about what a status is called.
+
+
+class PoLineStatus(BaseModel):
+    line: POLineSchema
+    status: str
+    label: str
+    reason: str
+    """Why this status was inferred. Every status on this screen is a guess until M1 lands, and a
+    guess a reviewer cannot interrogate is worse than showing nothing."""
+
+
+class PoStatusRow(BaseModel):
+    po_number: str
+    vendor_name: str
+    project_code: str
+    project_name: str
+    status: str
+    label: str
+    line_count: int
+    counts_by_status: Dict[str, int]
+    qty_ordered: float
+    qty_received: float
+    qty_in_transit: float
+    qty_outstanding: float
+    last_email_at: Optional[str] = None
+    email_count: int = 0
+
+
+class PoDetail(PoStatusRow):
+    lines: List[PoLineStatus] = Field(default_factory=list)
+    emails: List[DeliveryRow] = Field(default_factory=list)
+
+
+class PoStatusReport(BaseModel):
+    generated_at: str
+    derived: bool = True
+    """False once M1 replaces the inference with persisted statuses. The UI says so on the page —
+    a client should never mistake an inferred lifecycle for a recorded one."""
+    unreachable_statuses: List[str] = Field(default_factory=list)
+    """Statuses this build cannot produce at all: the partnered-warehouse leg has no signal in the
+    data, and nothing writes to Spitfire. Listed so the UI labels them rather than a viewer
+    concluding the pipeline never gets that far."""
+    status_labels: Dict[str, str] = Field(default_factory=dict)
+    rows: List[PoStatusRow] = Field(default_factory=list)
 
 
 class InboxRow(BaseModel):

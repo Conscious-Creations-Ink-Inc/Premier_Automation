@@ -52,9 +52,10 @@ routes exceptions to Fixed-Asset Accounting.
 **Stages 1–3 are real, tested and committed. Stages 4–7 are one-line stubs.** The reason is not
 engineering capacity — **Spitfire REST/SQL access and a test environment have not been granted** 🚧.
 Every stub names the design document that specifies it; the team stopped exactly at the access
-boundary and pivoted to building an interim reconciliation dashboard (`api/` + `frontend/`) that
-*simulates* stages 4–7 against synthetic data, so the client can sign off on the matching and
-exception UX before the real integration exists. That was a sound call.
+boundary and pivoted to building an interim reconciliation surface (`api/`) that *simulates*
+stages 4–7 against synthetic data, so the client can sign off on the matching logic before the real
+integration exists. That was a sound call. Its React front end has since been retired in favour of
+one server-rendered UI — §4a.
 
 | Headline | Value |
 |---|---|
@@ -151,7 +152,9 @@ owned by Premier and maintainable beyond any one person."*
 - **Stage 3** extract (six adapters: HTML, PDF, DOCX, OCR, Excel, free text)
 - `pipeline/ingest_orchestrator.py` — Stages 1→2→3 end to end
 - `connectors/mailbox.py` — real Graph connector + local-folder test double
-- **`api/` + `frontend/`** — the interim reconciliation dashboard
+- **`api/ui/`** — the interface, seven pages behind one sidebar (see §4a)
+- **`operations/`** — the schedule, the kill switch, the live inbox read, run history
+- **`api/`** — the interim reconciliation demo surface at `/api/*`, on synthetic data
 
 ### What is blocked 🚧
 
@@ -168,12 +171,38 @@ owned by Premier and maintainable beyond any one person."*
 All seven are blocked on the same dependency. Each stub names the design document that specifies
 it — this is a paused workstream, not abandoned work.
 
+### 4a. One interface  *(11 Aug 2026)*
+
+There were three: the pipeline pages at `/ui`, a separate operations console on :8500, and a React
+dashboard on :5173. **There is now one** — `api/ui/`, served by `run_api.py` at
+<http://127.0.0.1:8000/ui>, with a Spitfire-style sidebar over seven pages.
+
+| What happened | Where it went |
+|---|---|
+| `console/` logic (schedule, kill switch, inbox read, run history) | `operations/` — unchanged, still tested |
+| `console/app.py` routes | `/ui/automation`, `/ui/inbox`, `/ui/report` in `api/ui/routes.py` |
+| `console/view.py` renderer | deleted; `api/ui/html.py` is the only renderer |
+| `AlternateUI/` React SPA | deleted — recoverable from git at `d14f407` |
+
+Two things that were true of the console and remain true here: the four `POST /ui/automation/*`
+controls parse their urlencoded bodies by hand so `python-multipart` stays out of
+`requirements.txt`, and `tests/test_operations_readonly.py` parses every operations module plus
+`api/ui/routes.py` for outbound write verbs, so nothing can grow a mailbox write unnoticed.
+
+**The corpus store and the live store are never joined.** Records renders the receipt log over
+`sample_state.sqlite3`; Receiver report renders the same builder over `pipeline_state.sqlite3`.
+They are separate pages for that reason — the report is evidence.
+
+`console/app.py` and `console/view.py` were never committed, so unlike the React app they are not
+recoverable from git.
+
 ### The interim dashboard
 
 While blocked, the team built a FastAPI + React reconciliation dashboard that simulates stages 4–7
 against synthetic data. This is **Phase-2 scope in the SoW** ("smart helpers — confidence scoring,
-an exception dashboard") delivered early. It does not advance the Phase-1 percentage, but it
-materially de-risks Stage 4:
+an exception dashboard") delivered early. Its React front end is gone (§4a); the `/api/*` service
+layer it exercised remains, and that is the part that mattered — it does not advance the Phase-1
+percentage, but it materially de-risks Stage 4:
 
 💡 **`api/services/reconcile.py` is roughly 80% of `pipeline/stage4_match.py`.** It imports the
 pipeline's own `settings.DESC_MATCH_THRESHOLD` and RapidFuzz, scores the same three signals, maps
@@ -190,8 +219,8 @@ signals → confidence identically, and has eight unit tests. **Port it; do not 
 | Cloud-AI approval (Claude + Azure Document Intelligence) | ✅ **Granted** |
 | Dedicated receiving mailbox | ✅ Set up by Joe |
 | Graph app registration + `Mail.ReadWrite` | ✅ Granted 2026-07-20 |
-| Graph **mailbox address** | 🚧 Not yet provided |
-| Graph **Application Access Policy** (scope to one mailbox) | 🚧 Not confirmed |
+| Graph **mailbox address** | ✅ `receiver@premierpm.com`, confirmed and verified by `--preflight` |
+| Graph **Application Access Policy** (scope to one mailbox) | ✅ Confirmed applied |
 | Graph `Mail.Send` | 🚧 Not granted |
 | **Spitfire Swagger + least-privilege service account** | 🚧 **PENDING** |
 | **Spitfire published SQL / cache-sync query (spec → GUID)** | 🚧 **PENDING** |
@@ -227,11 +256,12 @@ than inside it."* That is exactly what has happened.
 FastAPI + Pydantic v2 · Uvicorn 0.51 · Starlette 1.3 · httpx 0.28 · SQLite. ✅ working.
 
 ### Frontend
-React 19 · TypeScript 5.7 · Vite 6 · TanStack Query 5.62 · React Router 7.1 · Tailwind CSS 4 ·
-Recharts 3.1 · lucide-react. ✅ builds clean, `dist/` present.
+**None.** No npm, no bundler, no node_modules, no build step — the UI is Python emitting HTML, with
+one inline stylesheet and one inline script. The React/Vite/Tailwind stack was deleted on
+11 Aug 2026 (§4a).
 
 🚩 **Every Python dependency is unpinned** — no `==`, no lockfile. A transitive break will not be
-reproducible. The frontend has `package-lock.json` and is fine.
+reproducible. That is now the whole dependency risk; there is no second ecosystem to keep in step.
 
 ---
 
@@ -252,8 +282,9 @@ Premier_Automation/
 │   ├── ingest_orchestrator.py 175 — Stages 1→2→3 ✅
 │   ├── stage4_match.py … stage7_route.py   4 × 1 LOC — 🚧 STUBS
 │   └── match_orchestrator.py   1 — 🚧 STUB
-├── api/                    ~1,600 — FastAPI dashboard  (UNCOMMITTED)
-├── frontend/src/           ~1,700 — React SPA          (UNCOMMITTED)
+├── api/                    ~1,600 — FastAPI, /api/* demo surface  (UNCOMMITTED)
+│   └── ui/                    ~40 KB — THE UI: html.py (design system) + routes.py (7 pages)
+├── operations/                ~48 KB — schedule, kill switch, inbox read, run history  (UNCOMMITTED)
 ├── tests/                    ~900 committed + ~440 uncommitted
 ├── sample_data/              2 email fixtures + empty po_lines.json
 ├── state/                    SQLite files (gitignored)
@@ -261,7 +292,12 @@ Premier_Automation/
 ```
 
 ✅ **Layering is clean:** `pipeline/` never imports `api/`. The dependency arrow points one way:
-`frontend → api → pipeline → config`, with `connectors` feeding `pipeline`.
+`api/ui → api → pipeline → config`, with `connectors` feeding `pipeline` and `api/ui → operations`
+for the run controls.
+
+One deliberate exception, and it is worth knowing about: `pipeline/mail_view.py` imports
+`operations.inbox` *inside a function*, to recover a message from Graph that is in neither the cache
+nor the accumulated payload. At module scope that would invert the arrow.
 
 ---
 
@@ -301,11 +337,20 @@ Premier_Automation/
 Running alongside, sharing models and thresholds but never the same database:
 
 ```
-┌──────────────────┐  /api proxy  ┌──────────────────┐   ┌────────────────────────┐
-│ React SPA :5173  │─────────────▶│ FastAPI :8000    │──▶│ demo_dashboard.sqlite3 │
-│ 7 pages          │              │ 20 endpoints     │   │ (synthetic data only)  │
-└──────────────────┘              └──────────────────┘   └────────────────────────┘
+                              ┌──────────────────┐   ┌────────────────────────┐
+                        ┌────▶│ /ui   7 pages    │──▶│ sample_state.sqlite3   │  corpus
+                        │     │ one sidebar      │   │ (the 14 .msg files)    │
+┌──────────────────┐    │     │                  │   ├────────────────────────┤
+│ FastAPI :8000    │────┤     │                  │──▶│ pipeline_state.sqlite3 │  live
+│ run_api.py       │    │     └──────────────────┘   │ console.sqlite3        │  ops
+└──────────────────┘    │                            └────────────────────────┘
+                        │     ┌──────────────────┐   ┌────────────────────────┐
+                        └────▶│ /api/*           │──▶│ demo_dashboard.sqlite3 │  synthetic
+                              │ 20 endpoints     │   │ (nothing in /ui reads) │
+                              └──────────────────┘   └────────────────────────┘
 ```
+
+The corpus and live stores are never joined — see §4a.
 
 ### 8.2 Pipeline data flow
 
@@ -322,16 +367,26 @@ Graph Inbox → Stage 1 Ingest (dedupe on message id)
 ```
 
 Every processed email is moved out of Inbox into `Hidden` / `Routed` / `Processed` / `Errors`, so
-the Inbox only ever holds genuinely new mail and any category can be audited by folder.
+the Inbox only ever holds genuinely new mail and any category can be audited by folder — unless
+the connector is in **read-only mode** (`GraphMailbox(read_only=True)`, the default for
+`tools/ingest_mailbox.py`), which records the folder each email *would* have gone to and leaves
+Premier's mailbox untouched. That is the shadow mode Phase 7 calls for.
 
 ### 8.3 Stage 1 — Ingest & triage ✅
 
-`fetch_new_emails()` filters through `state_db.is_new_message()`, which records the Graph message
-id in `seen_message_ids`. An email already seen is never reprocessed, even if a later folder move
-fails.
+`fetch_new_emails()` filters on `state_db.has_seen()` — a pure read. The marker itself is written
+by `state_db.mark_seen()` at the end of each email, once its verdict is in `email_log`. The two
+were one call made while filtering, which marked mail processed before it had been: an interrupted
+poll left the rest of its batch permanently skipped. An email that *fails* is still marked (a
+failure is a verdict, filed to `Errors`); only an interrupted one comes back.
 
-🚩 **Known defect:** `GraphMailbox.fetch_new()` requests `$top=50` and does **not** follow
-`@odata.nextLink`. A backlog larger than 50 is silently truncated on every poll.
+The dedupe key is `internetMessageId`, not the folder-scoped Graph `id`, which changes the moment
+a message moves — and this pipeline moves every message it processes. The mutable id travels
+separately as `RawEmail.provider_message_id`, used only to address `/move`.
+
+`GraphMailbox.fetch_new()` pages through `@odata.nextLink` oldest-first, capped at
+`MAX_PAGES_PER_POLL` (20 × `$top=50` = 1000 messages). Oldest-first matters: with a page cap, a
+newest-first poll would re-read the same page forever instead of draining a backlog.
 
 **The 7 rules:**
 
@@ -500,7 +555,7 @@ Worth preserving — consistently applied, and the reason the codebase reads as 
 | # | Module | Status | Remaining | Risk |
 |---|---|---|---|---|
 | 1 | Config & models | ✅ **100%** | Real vendor/carrier domains (placeholders today) | Low |
-| 2 | Graph mailbox connector | ✅ **95%** | Mailbox address; App Access Policy; no pagination; `Mail.Send` not granted | **Med** |
+| 2 | Graph mailbox connector | ✅ **100%** | Wired and read live 2026-08-05 (read-only). `Mail.Send` still not granted — notifications only | Low |
 | 3 | Stage 1 Triage | ✅ **100%** | Tune against real Premier mail | Low |
 | 4 | Stage 2 Accumulate | ✅ **100%** | Validate 48h + 20-min poll vs real volume | Low |
 | 5 | Stage 3 Extract | ✅ **90%** | Azure DocInt + Claude fallback both `NotImplementedError` | **Med** |
@@ -511,8 +566,9 @@ Worth preserving — consistently applied, and the reason the codebase reads as 
 | 10 | Stage 7 Route | 🚧 **0%** | Routing + error log | **HIGH** |
 | 11 | Spitfire connector | 🚧 **0%** | Everything | **CRITICAL** |
 | 12 | Match Orchestrator | 🚧 **0%** | Daily SQL-agent equivalent | High |
-| 13 | Dashboard API | ✅ **100%** | No auth; demo data only | Med |
-| 14 | Dashboard UI | ✅ **~95%** | No auth; hardcoded operator | Med |
+| 13 | `/api/*` demo surface | ✅ **100%** | No auth; synthetic data only; nothing in the UI reads it | Med |
+| 14 | The UI (`api/ui/`) | ✅ **100%** | **No auth** (S2). Sidebar over 7 pages; corpus and live stores kept apart | Med |
+| 15 | Operations (`operations/`) | ✅ **100%** | Schedule + kill switch + live inbox read. Off until enabled | Low |
 
 **8 complete · 0 in progress · 6 blocked** 🚧
 
@@ -527,8 +583,8 @@ Worth preserving — consistently applied, and the reason the codebase reads as 
 > are mocks that record what *would* have happened.
 
 **Operator attribution:** `body.operator` → `X-Operator` header → `config.DEFAULT_OPERATOR`.
-Nothing in that chain is verified. The React client sends a hardcoded
-`X-Operator: ashford@consciouscreations.ai`.
+Nothing in that chain is verified. This applies to `/api/*` only — the UI does not call these
+endpoints, and no reviewer identity is collected anywhere yet.
 
 **Errors:** FastAPI shape — the human-readable reason is in `detail`, surfaced directly to the
 reviewer. `400` = decision cannot be applied · `404` = not found · `422` = validation.
@@ -620,9 +676,10 @@ own map in `config.settings`, so this screen always agrees with what the real or
 
 ### Regenerating frontend types
 
-```
-cd frontend && npm run gen:api     # requires the API to be running
-```
+No longer applicable. The React client that consumed these types was deleted on 11 Aug 2026 (§4a);
+the UI is server-rendered Python and has no generated types. `api/schemas.py` remains the single
+definition of the shapes, and its docstring's warning about drift now has one fewer place to drift
+to.
 
 ---
 
@@ -672,7 +729,7 @@ routed  — defined in the model, never written by any code path
 | `demo_emails` | 18 | Synthetic emails + the triage verdict they would have received |
 | `match_results` | 13 | Reconciliation verdict; `extracted_record_id` UNIQUE |
 | `review_decisions` | 0 | Human audit trail — **never overwritten** |
-| `staged_receipts` | 5 | Mock stage 6 output; `item_number` = the line's GUID |
+| `staged_receipts` | 5 | Mock stage 6 output; `item_number` = the line's spec code (`SourceItemNumber`) |
 | `vendor_template` | 1 | Single row, `CHECK (id = 1)` |
 | `vendor_send_log` | 0 | Simulated sends |
 
@@ -772,7 +829,7 @@ hardcode"*).
 
 ### 🔴 S2 — Zero authentication on all 20 endpoints and the UI
 Operator identity resolves `body.operator` → `X-Operator` header → default, with **nothing
-verified**. The React client sends a hardcoded constant. Any caller who can reach the port can
+verified**. Any caller who can reach the port can
 approve a receipt (staging a receipt and moving quantity onto a PO line), cancel an item, or
 **attribute either action to any identity they choose** — the `review_decisions` audit trail
 records whatever string was supplied.
@@ -786,13 +843,13 @@ for production.
 **Mitigating:** it can only reach `demo_dashboard.sqlite3`, never `pipeline_state.sqlite3`.
 **Fix:** admin role + confirmation token; disable outside demo environments.
 
-### 🟠 S4 — Graph app scope not restricted to one mailbox
-`Mail.ReadWrite` is granted tenant-wide; the **Application Access Policy** restricting the app to
-the single receiving mailbox **is not in place**. Until Joe applies it, these credentials can read
-and move mail in *every* mailbox in Premier's tenant. Flagged honestly in the connector's own
-docstring.
-**Fix:** Joe applies `New-ApplicationAccessPolicy`. **Do not point this connector at a real Premier
-mailbox until confirmed.**
+### ✅ S4 — Graph app scope restricted to one mailbox — RESOLVED
+`Mail.ReadWrite` is granted tenant-wide, so the **Application Access Policy** is what confines
+these credentials to the single receiving mailbox. Premier confirmed it is applied, which is what
+cleared the connector to read live mail (first read-only read: 2026-08-05).
+**Standing control:** `tools/ingest_mailbox.py --preflight` re-checks reachability on demand, and
+the runner defaults to `read_only=True` — moving mail requires `--move-mail` and a confirmation.
+Re-verify with `Get-ApplicationAccessPolicy` after any app-registration change.
 
 ### 🟠 S5 — Attachments deserialized and parsed with no validation
 No size cap, no MIME verification (content-type is taken from the sender's claim, never magic
@@ -809,10 +866,15 @@ Combined with S2 and S3, an unauthenticated caller can loop reset or approve wit
 `f"displayName eq '{folder_name}'"`. Values are internal constants today so **not exploitable** —
 but it is an injection-shaped construction. **Fix:** escape quotes or validate against the known set.
 
-### 🟡 S8 — Permissive CORS
-`allow_methods=["*"], allow_headers=["*"], allow_credentials=True`. Origins are restricted to
-localhost:5173 today so the risk is contained, but the wildcard + credentials combination is wrong
-to carry to production and `CORS_ORIGINS` is environment-overridable.
+### 🟢 S8 — Permissive CORS — REDUCED  *(11 Aug 2026)*
+`allow_methods=["*"], allow_headers=["*"], allow_credentials=True` is unchanged, but the origin
+list is now **empty by default**: the UI is served by this same process at `/ui`, so every browser
+request is same-origin and needs no grant. The list previously named the React dev server on
+:5173, which no longer exists.
+
+Still worth watching: `CORS_ORIGINS` is environment-overridable, and `allow_credentials=True`
+means a wildcard set there would let any site read authenticated responses the moment this app
+grows authentication (S2). The note in `api/config.py` says so at the point of change.
 
 ### 🟡 S9 — No retention or purge policy for stored email content
 `accumulation.payload_json` retains full bodies and attachment content indefinitely; nothing prunes
@@ -832,7 +894,7 @@ redaction, no rotation or shipping.
 | SQL injection resistance | Every statement parameterized; **zero** string-formatted SQL found |
 | Secrets never hardcoded | All via `os.getenv`; Azure key placeholder carries an explicit Key Vault instruction |
 | `.gitignore` hygiene | Covers `.env`, `state/*.sqlite3`, `*.log`; verified no secret ever committed |
-| XSS resistance | React auto-escapes; **no** `dangerouslySetInnerHTML` anywhere |
+| XSS resistance | `api/ui/html.py` escapes by construction — `esc()` is the only writer, `Raw` the only opt-out, and 6 tests hold it (incl. a hostile subject) |
 | Database isolation | The demo DB physically cannot reach `pipeline_state.sqlite3` |
 | Immutable audit trail | `review_decisions` append-only; `mark_failed` appends to comments |
 | Fail-safe error handling | Failed emails route to an `Errors` folder — never silently dropped |
@@ -957,7 +1019,9 @@ Quality is high — tests exercise real document bytes, not mocks of parsers. Th
 Tesseract-dependent and degrade gracefully.
 
 🚩 **No coverage measurement** — `pytest-cov` not installed; coverage is unknown.
-🚩 **Zero frontend tests** — no vitest/jest/RTL/Playwright; `package.json` has no `test` script.
+🚩 **No browser-level test** — the UI is asserted through `TestClient` (35 tests in
+`test_ui_html.py`: escaping, nav, one-script, badges). Nothing exercises a real browser, so the
+sidebar collapse and the message dialog are unverified outside a manual walk-through.
 🚩 **No end-to-end test** (stub).
 
 ### DevOps ❌ — the weakest area (12/100)
@@ -981,6 +1045,15 @@ Tesseract-dependent and degrade gracefully.
 ---
 
 ## 16. Completion analysis
+
+> ⚠️ **Phase planning has moved.** Sections 16 and 17 were written 23 July and their status
+> figures are stale — this handbook reports 90 tests where the suite now runs **253 passed /
+> 3 skipped**, and lists D2/D3/R1/R15/C18 as open when all five are closed.
+>
+> **For current status and the remaining phases, see
+> [`dev_reports/PREMIER_AUTOMATION_MASTER_PLAN.md`](../../dev_reports/PREMIER_AUTOMATION_MASTER_PLAN.md).**
+> The rest of this handbook (architecture, API reference, database, security register) remains
+> accurate and is still the reference for how the system is built.
 
 ### 📊 CALCULATED against the SoW's own effort model (160 hrs, two-person option)
 
@@ -1169,7 +1242,7 @@ correctly standardised on pdfplumber.
 | R14 | Azure DocInt volume/cost unknown | 🟠 High | High | Metered pilot |
 | R15 | README materially false; `BuildPlan/` refs dangle | 🟠 High | Certain | Fix W1 |
 | R16 | No coverage metric | 🟡 Med | Certain | pytest-cov W1 |
-| R17 | Zero frontend tests | 🟡 Med | Certain | Vitest + Playwright |
+| R17 | No browser-level test | 🟡 Med | Certain | Playwright over the 7 pages |
 | R18 | No DB indexes/FKs/migrations; base64 blobs | 🟡 Med | High | W2 + W7 |
 | R19 | Unpinned dependencies | 🟡 Med | Med | Pin W1 |
 | R20 | Model config (Sonnet 5) ≠ approved model (Haiku 4.5) | 🟡 Med | Low | Confirm + align |
@@ -1263,9 +1336,7 @@ Git. Tesseract path is set at `config/settings.py` → `TESSERACT_CMD_PATH`.
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate            # POSIX: source .venv/bin/activate
-pip install -r requirements.txt
-
-cd frontend && npm install && cd ..
+pip install -r requirements.txt -r requirements-dev.txt
 
 Copy-Item .env.example .env       # then fill in the Graph values
 ```
@@ -1277,7 +1348,7 @@ Copy-Item .env.example .env       # then fill in the Graph values
 | `GRAPH_TENANT_ID` | Joe, 2026-07-20 | ✅ |
 | `GRAPH_CLIENT_ID` | Joe, 2026-07-20 | ✅ |
 | `GRAPH_CLIENT_SECRET` | Joe, 2026-07-20 | ✅ expires 2027-07-20 |
-| `GRAPH_MAILBOX_ADDRESS` | Premier | 🚧 **Not provided — leave blank** |
+| `GRAPH_MAILBOX_ADDRESS` | Premier | ✅ `receiver@premierpm.com` |
 
 Optional: `API_HOST`, `API_PORT`, `CORS_ORIGINS`, `DEFAULT_OPERATOR`.
 
@@ -1285,8 +1356,7 @@ Optional: `API_HOST`, `API_PORT`, `CORS_ORIGINS`, `DEFAULT_OPERATOR`.
 
 ```powershell
 .venv\Scripts\python.exe -m pytest -q     # expect: 90 passed, 3 skipped (~50s)
-python run_api.py                          # API on :8000, docs at /docs
-cd frontend; npm run dev                   # SPA on :5173, proxies /api
+python run_api.py                          # the UI at /ui, API docs at /docs
 python -m api.demo.seed --reset            # deterministic reseed
 ```
 
@@ -1313,8 +1383,20 @@ print(f"staged {process_new_mail(mailbox)} records")
 `LocalFolderMailbox` reads `sample_data/emails/*.json` and simulates folder moves by moving files
 into subdirectories — the whole pipeline runs with no live mailbox access.
 
-⚠️ **Do not point `GraphMailbox` at a real Premier mailbox** until the Application Access Policy is
-confirmed (§12 S4).
+Three runners, same orchestrator, differing only in which `Mailbox` they build:
+
+```bash
+python -m tools.run_corpus                   # scores the .msg corpus, in memory, persists nothing
+python -m tools.ingest_corpus --reset        # the .msg corpus into pipeline_state.sqlite3
+python -m tools.ingest_mailbox --preflight   # live mailbox: auth + folders + count, reads no mail
+python -m tools.ingest_mailbox               # live mailbox, READ-ONLY shadow, mock OCR
+```
+
+⚠️ `tools/ingest_mailbox.py` reads Premier's production mailbox. It is read-only by default and
+**`--move-mail` is the only thing that writes to it** — that flag files mail into
+`Hidden`/`Routed`/`Processed`/`Errors` and creates those folders, and it prompts before doing so.
+Note also that OCR is not gated by triage, so `--ocr azure` bills for attachments on mail that may
+turn out to be noise; `--dry-run-ocr` prices a poll first.
 
 ### Key configuration
 
@@ -1363,7 +1445,6 @@ confirmed (§12 S4).
 | Check | Command | Healthy |
 |---|---|---|
 | Tests | `python -m pytest -q` | `90 passed, 3 skipped` |
-| Build | `cd frontend && npm run build` | exit 0 |
 | API | `GET /api/health` | `{"status":"ok","seeded":true,…}` |
 | Git clean | `git status --porcelain` | **empty** (currently is not) |
 | Remote sync | `git rev-list --left-right --count origin/main...main` | `0  0` |
