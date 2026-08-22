@@ -68,7 +68,9 @@ class HtmlAdapter(ExtractionAdapter):
             # the only thing identifying it — the enclosing email's sender is somebody else.
             subject = Path(source.filename).stem or subject
 
-        notice = authority.parse_authority_notice(sender, subject, html, body)
+        # Asked of the whole chain, not just the resolved origin: the subject a forwarder typed
+        # is not evidence about what the notice is, and triage now reads it the same way.
+        notice = authority.notice_in_thread(sender, subject, html, body, parsed)
         if notice is None:
             return []
         return authority.records_from_notice(

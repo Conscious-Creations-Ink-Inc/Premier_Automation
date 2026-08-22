@@ -20,7 +20,7 @@ Two design points carry the weight:
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from pipeline import attachment_store
 from pipeline.models import Attachment, RawEmail
@@ -267,9 +267,16 @@ def record_outcome(
     records_extracted: int = 0,
     detail: str = "",
     error_type: Optional[str] = None,
+    pod_document: Any = None,
 ) -> None:
     """Close a row with what actually happened. A no-op for `ledger_id=None` so callers that
-    don't have one (unit tests, direct adapter calls) need no special-casing."""
+    don't have one (unit tests, direct adapter calls) need no special-casing.
+
+    `pod_document` is the parsed proof of delivery when the adapter that read this attachment
+    recognised one — whatever the file type. Recorded here because this is the one write that
+    already happens for every dispatched attachment, and because deciding it once at ingest is
+    what keeps `spitfire_post` from paying for OCR again to answer "is this the proof?".
+    """
     if ledger_id is None:
         return
     if disposition not in ALL_DISPOSITIONS:
@@ -282,6 +289,16 @@ def record_outcome(
             WHERE id = ?""",
         (disposition, detail, claimed_by, records_extracted, error_type, review, now, ledger_id),
     )
+    if pod_document is not None:
+        conn.execute(
+            """UPDATE attachment_ledger
+                  SET is_pod = 1, pod_po_numbers = ?, pod_delivery_date = ?, pod_signed_by = ?
+                WHERE id = ?""",
+            (",".join(getattr(pod_document, "po_numbers", None) or []),
+             getattr(pod_document, "delivery_date", None),
+             getattr(pod_document, "signed_for_by", None),
+             ledger_id),
+        )
     conn.commit()
 
 

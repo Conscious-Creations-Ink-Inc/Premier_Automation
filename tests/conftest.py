@@ -48,3 +48,23 @@ def _the_hold_grace_period_is_the_real_one():
     settings.HOLD_GRACE_PERIOD_HOURS = 48
     yield
     settings.HOLD_GRACE_PERIOD_HOURS = previous
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _the_suite_never_replays_recorded_spitfire_responses():
+    """Pin `SPITFIRE_CASSETTE_MODE` to `off`, whatever `.env` holds.
+
+    Same reasoning as the two fixtures above, and the same failure: a developer working away from
+    Premier's office IP sets `SPITFIRE_CASSETTE_MODE=replay` in `.env` so the UI is usable, and
+    the whole suite then runs with a transport adapter mounted under both Spitfire clients. Tests
+    that mean to exercise a live-shaped path would hit `SpitfireCassetteMiss`, and
+    `test_ui_post_route` would get the Offline fragment instead of the outcome it asserts — both
+    failing for a reason that is not in the code.
+
+    Tests about the cassette set the mode themselves; nothing here stops them.
+    """
+    from config import settings
+    previous = settings.SPITFIRE_CASSETTE_MODE
+    settings.SPITFIRE_CASSETTE_MODE = "off"
+    yield
+    settings.SPITFIRE_CASSETTE_MODE = previous

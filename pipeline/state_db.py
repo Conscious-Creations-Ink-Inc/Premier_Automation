@@ -288,7 +288,50 @@ def get_connection(db_path=PIPELINE_STATE_DB_PATH) -> sqlite3.Connection:
     # The three match tiers, in order: exact line number, exact spec code, then fuzzy description
     # (which scans the PO's lines and needs only ix_po_lines_po).
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS spitfire_post (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key   TEXT NOT NULL UNIQUE,
+            record_id         INTEGER NOT NULL,
+            po_number         TEXT NOT NULL,
+            line_number       INTEGER,
+            pod_md5           TEXT NOT NULL DEFAULT '',
+            state             TEXT NOT NULL,
+            detail            TEXT NOT NULL DEFAULT '',
+            project_code      TEXT NOT NULL DEFAULT '',
+            receipt_key       TEXT NOT NULL DEFAULT '',
+            receipt_doc_no    TEXT NOT NULL DEFAULT '',
+            pod_file_key      TEXT NOT NULL DEFAULT '',
+            report_file_key   TEXT NOT NULL DEFAULT '',
+            quantity          REAL,
+            actor             TEXT NOT NULL DEFAULT '',
+            audit_json        TEXT NOT NULL DEFAULT '',
+            claimed_at        TEXT NOT NULL,
+            settled_at        TEXT,
+            attempts          INTEGER NOT NULL DEFAULT 1,
+            last_attempt_at   TEXT
+        )
+    """)
+    # The guard against posting the same delivery twice, and it has to be ours: Spitfire offers
+    # nothing to lean on. The catalog does not deduplicate — measured 2026-08-14, the same
+    # 37,352-byte PDF uploaded twice produced two fileKeys and two catalog entries — re-sending an
+    # attach creates a second row, and `ReceiptInProgressUnits` reads 0.0 on a PO that already has
+    # an unapproved receipt against it, so the one field that looks like a duplicate check is
+    # blind for the whole approval window.
+    #
+    # `idempotency_key` is UNIQUE and the row is INSERTed *before* the first call, so the claim is
+    # what reserves the work. A crash between claiming and posting leaves a row stuck at CLAIMED,
+    # which is recoverable by reading Spitfire back — whereas recording success afterwards would
+    # lose the receipt entirely and post it again on the next attempt.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_spitfire_post_record ON spitfire_post(record_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_spitfire_post_po ON spitfire_post(po_number, state)")
+
     _add_missing_columns(conn)
+    # These index columns that `_LATER_COLUMNS` adds, so they can only be created once the ALTERs
+    # above have run — a store written before those columns existed has neither.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_records_delivery_key "
+                 "ON extracted_records(delivery_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_email_log_fingerprint ON email_log(fingerprint)")
     conn.commit()
     return conn
 
@@ -391,6 +434,42 @@ _LATER_COLUMNS = {
         ("package_quantity", "REAL"),
         ("package_uom", "TEXT"),
         ("notification_number", "TEXT"),
+        # --- provenance -----------------------------------------------------------------------
+        # How this row came to exist. `auto` is every record Stage 3 staged; `manual` is one a
+        # person built from a message the pipeline could not finish. Written once at creation and
+        # never edited, so a report regenerated months later still says how the record was made.
+        #
+        # Deliberately separate from `extraction_source`, which names the *adapter* that read the
+        # bytes ("html_table", "ocr", "authority") and is free text. Overloading it would make the
+        # origin unqueryable and would break the moment an adapter is renamed.
+        ("origin", "TEXT NOT NULL DEFAULT 'auto'"),
+        ("created_by", "TEXT"),
+        ("manual_note", "TEXT"),
+        # --- which file is this record's proof of delivery -------------------------------------
+        # `attachment_ledger.id` of the attachment a reviewer chose. Null means nobody chose one
+        # and `spitfire_post._pod_for` decides by reading the files, exactly as it always has.
+        #
+        # This is the only way an image POD can be used: `_pod_for` re-reads PDFs on the request
+        # path and skips everything else, so a photographed BOL the ingest-time OCR never flagged
+        # is invisible to it until a person points at it.
+        ("pod_ledger_id", "INTEGER"),
+        # 'attachment' | 'email_body'. Recorded rather than inferred from `pod_ledger_id` being
+        # null, because "nobody has looked yet" and "a person looked and there was nothing to
+        # choose" are different states and only the second may be waived.
+        ("pod_source", "TEXT"),
+        # Who accepted that this delivery may post with no proof document attached, and when.
+        #
+        # **This is the only thing that lets a record with no POD reach Spitfire.** Automation
+        # cannot set it — `post_decision` refuses a POD-less record outright unless a named person
+        # has waived it here. Null on every row that existed before this column, so nothing already
+        # in the store is retroactively permitted.
+        ("pod_waived_by", "TEXT"),
+        ("pod_waived_at", "TEXT"),
+        # --- duplicate guard -------------------------------------------------------------------
+        # The delivery this row describes, hashed. Two rows sharing it are the same physical
+        # delivery read twice, whether from two emails or from an email and a person. See
+        # `pipeline.dedupe`.
+        ("delivery_key", "TEXT"),
     ],
     "spitfire_po_lines": [
         # Added once RelatedItemDetail was read properly: an unapproved receipt sits in
@@ -398,12 +477,33 @@ _LATER_COLUMNS = {
         # part-received line as fully outstanding.
         ("qty_in_transit", "REAL NOT NULL DEFAULT 0"),
     ],
+    "spitfire_post": [
+        # Added with the FLAGGED state. A refusal is recorded rather than returned, and pressing
+        # Post five times on an unchanged record must leave one row saying "refused, 5x" instead
+        # of five rows — so the count and the latest time live on the row itself.
+        ("attempts", "INTEGER NOT NULL DEFAULT 1"),
+        ("last_attempt_at", "TEXT"),
+    ],
     "attachment_ledger": [
         # Added when ingest started keeping the bytes rather than trusting Outlook to still have
         # them. Null means "not stored" — either a row written before the store existed, or a
         # dropped attachment whose bytes had already been released. See `pipeline.attachment_store`.
         ("blob_sha256", "TEXT"),
         ("blob_stored_at", "TEXT"),
+        # Whether this attachment *is* the proof of delivery, decided once at ingest by whichever
+        # adapter read it, and by its content rather than its file type. A POD arrives as a PDF, a
+        # phone photo, a scan inside a .docx — the type says nothing. What settles it is that the
+        # carrier-POD grammar in `parsing/pod.py` recognised the text, whether that text came from
+        # a PDF layer or from OCR.
+        #
+        # Persisted rather than recomputed because the answer for an image costs a paid OCR call:
+        # `stage3_extract` already pays it once on the way in, and `spitfire_post._pod_for` must
+        # not pay it again every time somebody opens the Records page. The parsed facts ride along
+        # so the delivery date and signature can be read back without touching the bytes at all.
+        ("is_pod", "INTEGER NOT NULL DEFAULT 0"),
+        ("pod_po_numbers", "TEXT NOT NULL DEFAULT ''"),
+        ("pod_delivery_date", "TEXT"),
+        ("pod_signed_by", "TEXT"),
     ],
     "email_log": [
         # When the payload was actually sent, recovered from the quoted `Sent:` header — as
@@ -411,6 +511,20 @@ _LATER_COLUMNS = {
         # Twelve of the fourteen corpus files are forwards Premier sent on one day, so dating a
         # delivery timeline from `email_date` put that same day on every stage of every PO.
         ("origin_sent_at", "TEXT"),
+        # --- duplicate detection ---------------------------------------------------------------
+        # A hash of what the message *says*, not of the envelope it came in. `seen_message_ids`
+        # keys on `internetMessageId`, which a vendor re-send or a second expeditor's forward does
+        # not share — so the same delivery notification ingests twice and stages two records.
+        # See `pipeline.dedupe.fingerprint`.
+        ("fingerprint", "TEXT"),
+        # The `email_id` of the message this one duplicates. Set rather than the row being dropped:
+        # a suppression nobody can inspect is a suppression nobody can trust, which is the same
+        # reason the internal-chatter rule lists what it filtered instead of hiding it.
+        ("duplicate_of", "TEXT"),
+        # A person built a record from this message, so the extraction loop must not stage more
+        # from it. Scoped to this one message — never to its thread and never to its PO, because
+        # the next mail on the same thread may be a genuinely separate delivery.
+        ("handled_manually", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "spitfire_po_index": [
         # When the purchase order was raised, from `/api/document/{id}/dates` — a *named* date

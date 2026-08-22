@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 # Premier's own file reads "Premier Design to Completion Report" in H1 — the word was missing here.
 SHEET_TITLE = "Premier Design to Completion Report"
@@ -148,22 +148,120 @@ _SELECT = """
     SELECT po_number, po_line_number, spec_code, item_description, vendor_name,
            quantity_received, unit_of_measure, package_quantity, package_uom,
            pod_stated_date, email_date, received_by, notification_number, shipment_number,
-           carrier_name, tracking_number, source_email_id, extraction_source
+           carrier_name, tracking_number, source_email_id, extraction_source,
+           COALESCE(origin, 'auto') AS origin, created_by
       FROM extracted_records
      WHERE TRIM(COALESCE(po_number,'')) <> ''
+       {record_filter}
      ORDER BY po_number, COALESCE(po_line_number, 999999), spec_code
 """
 
 
-def build(conn: sqlite3.Connection, *, generated_at: Optional[str] = None) -> Report:
-    """Group everything the emails produced into PO -> line -> receipts."""
+def _receiver(r) -> str:
+    """What goes in the Receiver column — and where a manual record is distinguishable from an
+    automated one.
+
+    Premier's own export puts phrases in these cells, not just names: `Vendor Email`,
+    `Property confirmed`, `Corina confirmed`, `WH Inventory report`. So a word here is their
+    practice rather than our invention, and it is why the origin flag needs **no new column** —
+    the report keeps its exact nine-column layout and stays conformant with their template.
+
+    Order: whoever signed for the goods, then whoever entered the record, then how it was made.
+    A named person always wins, because that is the more specific truth about who took delivery.
+    """
+    signed_for_by = (r["received_by"] or "").strip()
+    if signed_for_by:
+        return signed_for_by
+    if str(r["origin"] or "auto") == "manual":
+        return (r["created_by"] or "").strip() or "Manual entry"
+    return "Automation"
+
+
+def _fill_from_purchase_orders(conn: sqlite3.Connection, by_po) -> None:
+    """Fill Vendor, UOM and Order Qty from the mirrored purchase order — blanks only, never over.
+
+    Three of this sheet's columns describe the *order*, not the delivery, and no email carries
+    them. They were blank on every row until `spitfire_po_lines` existed to answer them, and
+    `Net` — which is `Order Qty - Received` and held for all 486 rows of Premier's own export —
+    was therefore blank too. Filling Order Qty lights Net up on its own.
+
+    **Fallback only.** A value the record already carries is what a reviewer has been looking at
+    and is left exactly as it is; this only reaches cells nothing else filled. That is also what
+    keeps the change safe: a store with no mirrored lines produces precisely the report it
+    produced before.
+
+    `Final` is deliberately not touched. It is a flag a person sets in Spitfire — 118 fully
+    received lines in the reference carry no asterisk and 5 partially received ones do, so any
+    received-versus-ordered rule would be wrong 123 times in 486.
+    """
+    if not by_po:
+        return
+    prior_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" * len(by_po))
+        lines = conn.execute(
+            f"""SELECT po_number, line_number, spec_code, vendor_name, unit_of_measure, qty_ordered
+                  FROM spitfire_po_lines WHERE po_number IN ({placeholders})""",
+            list(by_po)).fetchall()
+    except sqlite3.OperationalError:
+        # A store without the mirror table at all — the demo database, and any caller holding a
+        # connection this module did not open. The report is still correct, just less filled in.
+        return
+    finally:
+        conn.row_factory = prior_factory
+
+    by_line, by_spec = {}, {}
+    for row in lines:
+        po_number = str(row["po_number"]).strip()
+        if row["line_number"] is not None:
+            by_line[(po_number, int(row["line_number"]))] = row
+        spec = (row["spec_code"] or "").strip().upper()
+        if spec:
+            # First writer wins: two lines can share a spec (a fabric and its tariff surcharge),
+            # and picking arbitrarily between them is how a quantity gets attributed to the wrong
+            # one. A line number is exact and is tried first below.
+            by_spec.setdefault((po_number, spec), row)
+
+    for po in by_po.values():
+        for line in po.lines:
+            match = None
+            if line.line_number is not None:
+                match = by_line.get((po.po_number, int(line.line_number)))
+            if match is None and line.spec:
+                match = by_spec.get((po.po_number, line.spec.strip().upper()))
+            if match is None:
+                continue
+            if line.order_qty is None and match["qty_ordered"] is not None:
+                line.order_qty = float(match["qty_ordered"])
+            if not line.uom and match["unit_of_measure"]:
+                line.uom = str(match["unit_of_measure"]).strip()
+            if not po.vendor and match["vendor_name"]:
+                po.vendor = str(match["vendor_name"]).strip()
+
+
+def build(conn: sqlite3.Connection, *, generated_at: Optional[str] = None,
+          record_ids: Optional[Sequence[int]] = None) -> Report:
+    """Group everything the emails produced into PO -> line -> receipts.
+
+    `record_ids` narrows it to named rows, which is what the Spitfire post attaches: the report
+    that goes onto a receipt must describe *that* delivery and nothing else. Attaching the whole
+    log would put every other purchase order's quantities on a document Premier reads as evidence
+    for one — and a receipt carrying a report about someone else's PO is worse than no report.
+
+    None means the whole store, which is what the Receiver report page has always shown.
+    """
     # Rows are read by name below, so the factory is set here rather than assumed of the caller.
     # The console sets it; `api.deps.get_pipeline_conn` does not, and the failure without this is a
     # TypeError deep in the grouping loop rather than anything that names the real cause.
     prior_factory = conn.row_factory
     conn.row_factory = sqlite3.Row
+    # Placeholders are generated from the id count and the ids are bound, never interpolated —
+    # they arrive from a URL path on the post route.
+    ids = [int(i) for i in (record_ids or [])]
+    clause = f"AND id IN ({','.join('?' * len(ids))})" if ids else ""
     try:
-        rows = conn.execute(_SELECT).fetchall()
+        rows = conn.execute(_SELECT.format(record_filter=clause), ids).fetchall()
     finally:
         conn.row_factory = prior_factory
 
@@ -220,9 +318,11 @@ def build(conn: sqlite3.Connection, *, generated_at: Optional[str] = None) -> Re
             reference=reference,
             date=_date_only(r["pod_stated_date"] or r["email_date"] or ""),
             quantity=float(qty) if qty is not None else None,
-            receiver=(r["received_by"] or "").strip() or "Automation",
+            receiver=_receiver(r),
             source_email=str(r["source_email_id"] or ""),
         ))
+
+    _fill_from_purchase_orders(conn, by_po)
 
     for po in by_po.values():
         po.title = f"PO {po.po_number}" + (f" {po.vendor}" if po.vendor else "")

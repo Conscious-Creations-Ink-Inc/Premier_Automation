@@ -199,3 +199,150 @@ def test_build_does_not_require_the_caller_to_set_a_row_factory():
     extracted_records_store.write_pending(conn, record(), NOW)
     assert receipt_log.build(conn).purchase_orders[0].po_number == "208491"
     assert conn.row_factory is None, "the caller's factory is restored"
+
+
+# --- what the purchase order fills in -----------------------------------------------------------
+#
+# Three of this sheet's columns describe the order, not the delivery, and no email carries them.
+# They were blank on every row until `spitfire_po_lines` could answer them.
+
+
+def _store_with_a_record(**overrides):
+    """One record and one mirrored PO line, in a fresh in-memory store."""
+    from pipeline import state_db
+
+    conn = state_db.get_connection(":memory:")
+    fields = dict(source_email_id="mail-1", po_number="208491", spec_code="STE-402-LT-B",
+                  item_description="BASE, Floor Lamp 2", vendor_name=None,
+                  quantity_received=11.0, unit_of_measure=None, pod_stated_date="2025-10-01",
+                  received_by=None, po_line_number=300, origin="auto", created_by=None,
+                  email_date="2025-10-01", extraction_source="test", extraction_confidence=1.0)
+    fields.update(overrides)
+    columns = ", ".join(fields)
+    conn.execute(
+        f"INSERT INTO extracted_records ({columns}, created_at) "
+        f"VALUES ({', '.join('?' * len(fields))}, 'now')", tuple(fields.values()))
+    conn.execute(
+        """INSERT INTO spitfire_po_lines
+           (line_key, po_number, line_number, spec_code, description, vendor_name,
+            unit_of_measure, qty_ordered, qty_received, qty_in_transit, refreshed_at)
+           VALUES ('k1', '208491', 300, 'STE-402-LT-B', 'BASE, Floor Lamp 2', 'Light Annex',
+                   'EA', 12.0, 0.0, 0.0, 'now')""")
+    conn.commit()
+    return conn
+
+
+def test_order_qty_is_filled_from_the_mirrored_purchase_order():
+    """And Net lights up on its own, because it is `Order Qty - Received` and nothing else."""
+    report = receipt_log.build(_store_with_a_record())
+    line = report.purchase_orders[0].lines[0]
+
+    assert line.order_qty == 12.0
+    assert line.received == 11.0
+    assert line.net == 1.0
+
+
+def test_vendor_and_uom_are_filled_from_the_purchase_order_too():
+    """`completeness.DERIVED` says a person must never be asked to type these. This is where they
+    come from instead."""
+    report = receipt_log.build(_store_with_a_record())
+
+    assert report.purchase_orders[0].vendor == "Light Annex"
+    assert report.purchase_orders[0].lines[0].uom == "EA"
+
+
+def test_what_the_record_already_says_is_never_overwritten():
+    """Fallback only. A vendor or a unit the record carries is what a reviewer has been looking at,
+    and silently replacing it would change what they thought they were approving."""
+    report = receipt_log.build(
+        _store_with_a_record(vendor_name="P. Kaufmann", unit_of_measure="YD"))
+
+    assert report.purchase_orders[0].vendor == "P. Kaufmann"
+    assert report.purchase_orders[0].lines[0].uom == "YD"
+
+
+def test_a_store_with_no_mirrored_lines_builds_exactly_as_before():
+    """The safety property. Nothing about this join may change a report on a store that cannot
+    answer it — which is every store until a purchase order has been pulled."""
+    conn = _store_with_a_record()
+    conn.execute("DELETE FROM spitfire_po_lines")
+    conn.commit()
+
+    line = receipt_log.build(conn).purchase_orders[0].lines[0]
+    assert line.order_qty is None and line.net is None
+
+
+def test_a_line_matched_by_spec_when_no_line_number_was_stated():
+    """Most mail states no line number, so matching on the line alone would leave the columns blank
+    for nearly all of it."""
+    line = receipt_log.build(_store_with_a_record(po_line_number=None)).purchase_orders[0].lines[0]
+    assert line.order_qty == 12.0
+
+
+def test_final_is_never_filled_by_the_join():
+    """It is a flag a person sets in Spitfire. 118 fully received lines in Premier's own export
+    carry no asterisk and 5 partially received ones do, so no rule over quantities can produce it —
+    and this line is fully received, which is exactly where the temptation lies."""
+    report = receipt_log.build(_store_with_a_record(quantity_received=12.0))
+    assert report.purchase_orders[0].lines[0].final is False
+
+
+# --- the manual / automated flag ----------------------------------------------------------------
+#
+# It rides the Receiver column, which already held a word rather than a name. That is what keeps
+# the sheet at its exact nine columns and conformant with Premier's template.
+
+
+def test_an_automated_record_reads_as_automation():
+    report = receipt_log.build(_store_with_a_record())
+    assert report.purchase_orders[0].lines[0].receipts[0].receiver == "Automation"
+
+
+def test_a_manual_record_names_the_person_who_entered_it():
+    report = receipt_log.build(
+        _store_with_a_record(origin="manual", created_by="M Gutierrez"))
+    assert report.purchase_orders[0].lines[0].receipts[0].receiver == "M Gutierrez"
+
+
+def test_whoever_signed_for_the_goods_outranks_both():
+    """A named signature is the more specific truth about who took delivery, whichever way the
+    record was made."""
+    report = receipt_log.build(
+        _store_with_a_record(origin="manual", created_by="M Gutierrez", received_by="U ALI"))
+    assert report.purchase_orders[0].lines[0].receipts[0].receiver == "U ALI"
+
+
+def test_the_flag_adds_no_column_to_the_sheet():
+    """The whole reason it rides Receiver. A tenth column would take the workbook out of
+    conformance with Premier's own export, which `test_receipt_log_conformance` holds cell for
+    cell."""
+    assert len(receipt_log._HEADERS) == 9
+    assert [name.strip() for _, name in receipt_log._HEADERS] == [
+        "DocNo", "Vendor", "Line", "Description", "Order Qty", "Received", "Net", "Final",
+        "Receiver"]
+
+
+def test_manual_and_automated_records_produce_the_same_report_shape():
+    """Same columns, same layout, same row types — differing only in the one cell that says which.
+    A person reading the PDF can tell them apart; a machine diffing the structure cannot."""
+    from io import BytesIO
+
+    import openpyxl
+
+    def sheet(**overrides):
+        book = openpyxl.load_workbook(
+            BytesIO(receipt_log.to_xlsx(receipt_log.build(_store_with_a_record(**overrides)))))
+        return book["Receipt Log"]
+
+    automated = sheet()
+    manual = sheet(origin="manual", created_by="M Gutierrez")
+
+    assert automated.max_row == manual.max_row
+    assert automated.max_column == manual.max_column
+    differing = [(r, c) for r in range(1, automated.max_row + 1)
+                 for c in range(1, automated.max_column + 1)
+                 if automated.cell(r, c).value != manual.cell(r, c).value]
+    assert len(differing) == 1, differing
+    row, column = differing[0]
+    assert automated.cell(row, column).value == "Automation"
+    assert manual.cell(row, column).value == "M Gutierrez"

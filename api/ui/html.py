@@ -60,6 +60,97 @@ def badge(text: str, kind: str = "") -> Raw:
     return tag("span", text, class_=f"badge badge-{kind or 'plain'}")
 
 
+def field(name: str, label: str, value="", *, kind: str = "text", required: bool = False,
+          hint: str = "", placeholder: str = "", readonly: bool = False,
+          source: str = "") -> Raw:
+    """One labelled input.
+
+    Built here rather than as an f-string in `routes.py`, for the reason the module docstring gives:
+    markup is assembled in this file or not at all. The values these carry come straight off a
+    delivery email — a PO number, a description, a spec code — which is attacker-influenced text by
+    definition, and `tag()` escapes every one of them.
+
+    `source` names where a read-only value came from ("from the purchase order"). A greyed field
+    with no explanation reads as broken; one that says who supplied it reads as settled.
+    """
+    control = tag("input", type=kind, name_=name, id=f"f-{name}",
+                  value="" if value is None else str(value),
+                  placeholder=placeholder or None,
+                  required="required" if required else None,
+                  readonly="readonly" if readonly else None,
+                  class_="fld" + (" fld-ro" if readonly else ""))
+    parts = [tag("label", label, tag("span", " *", class_="req") if required else "",
+                 for_=f"f-{name}"), control]
+    if source:
+        parts.append(tag("p", source, class_="fld-src"))
+    if hint:
+        parts.append(tag("p", hint, class_="fld-hint"))
+    return tag("div", *parts, class_="field")
+
+
+def textarea(name: str, label: str, value="", *, hint: str = "", rows: int = 3) -> Raw:
+    return tag("div",
+               tag("label", label, for_=f"f-{name}"),
+               tag("textarea", "" if value is None else str(value), name_=name, id=f"f-{name}",
+                   rows=str(rows), class_="fld"),
+               tag("p", hint, class_="fld-hint") if hint else "",
+               class_="field")
+
+
+def radio(name: str, value: str, label, *, checked: bool = False, hint="") -> Raw:
+    """One option in a group. `label` may be built markup — the POD chooser puts a whole row of
+    filename, type, badges and an Open control inside its labels."""
+    return tag("label",
+               tag("input", type="radio", name_=name, value=value,
+                   checked="checked" if checked else None),
+               tag("span", label, class_="radio-label"),
+               tag("span", hint, class_="radio-hint") if hint else "",
+               class_="radio")
+
+
+def form(action: str, *children, submit: str = "Save", cancel: str = "",
+         cancel_label: str = "Cancel") -> Raw:
+    """A POST form. Everything that changes state is a POST — a link would let a prefetch press it.
+
+    Deliberately a whole-page form rather than a dialog fetch: a refused submission has to come back
+    carrying what the reviewer typed, and re-rendering the page does that with no JavaScript at all.
+    These pages spend exactly one inline script and it is not for this.
+    """
+    buttons = [tag("button", submit, type="submit", class_="btn")]
+    if cancel:
+        buttons.append(tag("a", cancel_label, href=cancel, class_="btn ghost"))
+    return tag("form", *children, tag("div", *buttons, class_="form-actions"),
+               method="post", action=action, class_="uform")
+
+
+def errors(message: str, items=()) -> Raw:
+    """Why a submission was refused, above the form that was refused.
+
+    Named fields rather than a count: "missing: spec code, POD date" tells somebody which cells to
+    fill, where "2 errors" tells them only that something is wrong — the same reason the manual
+    queue stopped printing "confidence 0.0".
+    """
+    listed = [tag("li", item) for item in items]
+    return tag("div", tag("p", message),
+               tag("ul", *listed) if listed else "", class_="errors")
+
+
+def origin_badge(origin, created_by="") -> Raw:
+    """Whether a record was extracted or entered by a person, and by whom.
+
+    Both states are labelled. Badging only the manual ones would make "no badge" mean two things —
+    automated, or a row from before this column existed — and the difference matters to anyone
+    auditing what reached Premier's ERP.
+
+    The same distinction rides the report's Receiver column, so the screen and the PDF agree
+    without the sheet needing a tenth column. See `pipeline.receipt_log._receiver`.
+    """
+    if str(origin or "auto") == "manual":
+        who = str(created_by or "").strip()
+        return badge(f"Manual · {who}" if who else "Manual", "record")
+    return badge("Automated", "plain")
+
+
 def muted(text) -> Raw:
     return tag("span", text, class_="muted")
 
@@ -606,6 +697,10 @@ _NAV = (
         # One entry. Mails and Inbox were two, and read as the same page because neither said where
         # its mail came from — the source is a column now, not a page.
         ("/ui/mails", "Mail"),
+        # Beside Mail because that is where these files came from. It is the only view of the whole
+        # ledger — the mail dialog shows one message's attachments and cannot show that the same
+        # bytes arrived twice under two names.
+        ("/ui/attachments", "Attachments"),
     )),
     ("Needs action", (
         ("/ui/manual", "Needs a human"),
@@ -637,6 +732,9 @@ _ICONS = {
     "/ui/po": _icon('<path d="M1.5 5.5 8 2l6.5 3.5v5L8 14l-6.5-3.5z"/><path d="M1.5 5.5 8 9l6.5-3.5M8 9v5"/>'),
     "/ui/records": _icon('<path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h11"/>'),
     "/ui/mails": _icon('<rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="m2 4.5 6 4 6-4"/>'),
+    # A paperclip, which is what every mail client has used for this for thirty years.
+    "/ui/attachments": _icon(
+        '<path d="M10.5 6 6 10.5a2 2 0 0 0 2.8 2.8l5-5a3.5 3.5 0 0 0-5-5l-5 5a5 5 0 0 0 7 7L14 11"/>'),
     "/ui/manual": _icon('<circle cx="8" cy="8" r="6.2"/><path d="M8 5v3.5M8 10.8v.2"/>'),
     "/ui/automation": _icon('<circle cx="8" cy="8" r="6.2"/><path d="m6.5 5.5 4 2.5-4 2.5z"/>'),
     "/ui/report": _icon('<path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3M5.5 8h5M5.5 11h3"/>'),
@@ -1058,13 +1156,54 @@ iframe.mail-body { width:100%; height:min(64vh,760px); border:1px solid var(--li
     color:var(--muted); }
 .vq tbody th { background:#fafaf8; font-weight:600; width:150px; }
 .vq .n { text-align:right; font-variant-numeric:tabular-nums; }
+/* Text cells — spec, description, vendor. Descriptions run to a thousand characters and carry
+   model numbers with no spaces in them, so they wrap on any character rather than pushing the
+   dialog sideways. Slightly smaller than the numeric rows because they are prose, not figures. */
+.vq .t { font-size:12.5px; line-height:1.45; overflow-wrap:anywhere; }
 .vq .same { background:#eef8f2; }
 .vq .diff { background:#fdf0ec; }
+/* A Records-table cell that disagrees with Spitfire. Same red as `.vq .diff` above, so the flag
+   means the same thing on the table as it does in the Verify popup. The reason is the `title`. */
+.mm { background:#fdf0ec; color:#8c1220; padding:1px 4px; border-radius:3px; font-weight:600; }
+/* The alternative-lines chooser, collapsed by default: it is there for the reader who doubts the
+   match, and open by default it would bury the comparison it exists to question. */
+.valt { margin:2px 0 10px; }
+.valt > summary { cursor:pointer; font-size:12.5px; color:var(--muted); padding:2px 0; }
+.valt > summary:hover { color:var(--fg); }
+.valt table { margin-top:8px; }
 .vfindings { margin:0 0 6px; padding-left:18px; font-size:13px; line-height:1.55; }
 .vfindings li { margin:3px 0; }
 .vrec { border-top:1px solid var(--line); padding-top:14px; margin-top:18px; }
 .vrec:first-child { border-top:none; padding-top:0; margin-top:0; }
 .vrec h3 { margin:0 0 3px; font-size:14.5px; }
+
+/* Forms. Only one page has them beyond the operations controls — creating a record by hand — and
+   it is a long form, so the fields are readable at a glance rather than dense. */
+.uform { max-width:720px; }
+.field { margin:0 0 14px; }
+.field label { display:block; font-weight:600; font-size:13px; margin:0 0 4px; }
+.field .req { color:var(--gold); }
+.fld { width:100%; box-sizing:border-box; padding:7px 9px; font:inherit; font-size:13.5px;
+    border:1px solid var(--line); border-radius:4px; background:var(--surface); color:inherit; }
+.fld:focus { outline:2px solid var(--gold); outline-offset:1px; }
+.fld-ro { background:#f4f3ef; color:var(--muted); }
+.fld-src, .fld-hint { margin:3px 0 0; font-size:12px; color:var(--muted); }
+.form-actions { display:flex; gap:10px; align-items:center; margin:18px 0 0; }
+.errors { border-left:3px solid #b3261e; background:#fdf3f2; padding:10px 14px; margin:0 0 16px;
+    border-radius:0 4px 4px 0; }
+.errors p { margin:0; font-weight:600; font-size:13.5px; }
+.errors ul { margin:6px 0 0 18px; padding:0; font-size:13px; }
+.radio { display:flex; align-items:flex-start; gap:9px; padding:9px 11px; margin:0 0 6px;
+    border:1px solid var(--line); border-radius:4px; cursor:pointer; }
+.radio:hover { background:#faf9f6; }
+.radio input { margin:2px 0 0; flex:none; }
+.radio-label { flex:1; font-size:13.5px; }
+.radio-hint { color:var(--muted); font-size:12px; }
+@media (prefers-color-scheme:dark) {
+  .fld-ro { background:#26262a; }
+  .errors { background:#2a1d1c; }
+  .radio:hover { background:#26262a; }
+}
 
 /* Run progress. All CSS: these pages spend exactly one inline script and it is not for this.
    The ring is a conic-gradient sweep over a masked disc — one element, no SVG, no canvas. */

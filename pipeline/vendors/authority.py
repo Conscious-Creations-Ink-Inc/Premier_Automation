@@ -308,6 +308,57 @@ def parse_authority_notice(
     return notice
 
 
+def notice_in_thread(
+    sender_address: str,
+    subject: str,
+    body_html: Optional[str],
+    body_text: Optional[str] = None,
+    parsed=None,
+) -> Optional[AuthorityNotice]:
+    """The notice this thread carries, wherever in the chain it was quoted.
+
+    `parse_authority_notice` is asked about one (sender, subject) pair. That pair is normally the
+    resolved origin, and normally right — so it is still tried first, and every verdict that
+    worked before resolves the same way and for the same reason. Only when it yields nothing do
+    the remaining hops get a turn.
+
+    The fallback exists because the outermost subject is the one part of a forwarded notice a
+    human retypes. Three live sends to Premier's receiving mailbox arrived as
+    `Testing Premier Automation`, then `Test 3`, each carrying a perfectly formed Inbound
+    Notification one hop down that nothing ever looked at: triage read the outer subject, got
+    `NOT_AUTHORITY`, and the receiver trigger became a property reply with no shipment number.
+    Premier's own mail has the same shape for duller reasons — always forwarded, sometimes twice,
+    and Exchange rewrites subjects on the way in.
+
+    Reading a hop's own header is sound because the subject grammar identifies the notice by
+    itself; `classify()` says so, and already depends on it for notices arriving as nested `.msg`
+    attachments, where the sender belongs to the enclosing email rather than to the notice.
+
+    **Newest-first, and only INBOUND/DELIVERED.** A stale notification quoted at the bottom of an
+    unrelated thread must not outrank a live one above it. A STATUS_REPORT is never accepted from
+    a deeper hop: it is recognised only in order to be discarded, and letting one surface from
+    anywhere in a chain would hide the real newest hop behind it.
+
+    Callers that have already split the thread pass `parsed` rather than paying for it twice.
+    """
+    notice = parse_authority_notice(sender_address, subject, body_html, body_text)
+    if notice is not None:
+        return notice
+
+    if parsed is None:
+        parsed = thr.split_thread(body_text or "", sender_address or "", subject or "")
+
+    for hop in getattr(parsed, "hops", None) or []:
+        hop_subject = (getattr(hop, "subject", "") or "").strip()
+        if not hop_subject or hop_subject == subject:
+            continue
+        candidate = parse_authority_notice(
+            getattr(hop, "sender_address", "") or "", hop_subject, body_html, body_text)
+        if candidate is not None and candidate.kind in (NoticeKind.INBOUND, NoticeKind.DELIVERED):
+            return candidate
+    return None
+
+
 def _fill_header(notice: AuthorityNotice, all_tables: List[tbl.HtmlTable], rendered: str) -> None:
     """Header fields from the key/value table if there is one, else from label/value text.
 

@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 import requests
 
 from config import settings
+from connectors import spitfire_cassette
 from pipeline.models import POLine
 
 _logger = logging.getLogger(__name__)
@@ -271,6 +272,10 @@ class SpitfireReadClient:
         self.tz_offset = settings.SPITFIRE_TZ_OFFSET if tz_offset is None else tz_offset
         self.timeout = timeout
         self._session = requests.Session()
+        # Records responses while on Premier's office IP and replays them when off it. A no-op
+        # unless SPITFIRE_CASSETTE_MODE is set, and it sits *under* this client: everything below
+        # — the allowlist, the retry rule, the audit log — runs unchanged either way.
+        spitfire_cassette.mount(self._session)
         self._authenticated = False
         self.audit_log: List[RequestRecord] = []
         if not self.base_url:

@@ -91,7 +91,10 @@ def test_a_record_with_no_proof_of_delivery_is_queued_even_though_it_is_ready():
     assert no_pod in {r["id"] for r in read_views.records_ready(c)}
     item = [i for i in read_views.manual_queue(c) if i.ref_id == no_pod][0]
     assert "POD date" in item.reason
-    assert "received-by" in item.reason
+    # `received_by` is blank here too and is deliberately *not* named: it is `DERIVED` since
+    # 2026-08-21, read from the POD's signature block or supplied by the reviewer who accepts the
+    # record. Listing it sent people looking for a cell to type into that they should not fill.
+    assert "received-by" not in item.reason
 
 
 def test_a_record_blocked_two_ways_states_both_reasons():
@@ -110,12 +113,16 @@ def test_the_queue_names_the_missing_fields_not_a_score():
     to fill."""
     c = new_conn()
     seed_email(c)
-    extracted_records_store.write_pending(c, make_record(), NOW)
+    extracted_records_store.write_pending(
+        c, make_record(spec_code=None, item_description=None, quantity_received=None), NOW)
 
     reason = [i for i in read_views.manual_queue(c) if i.kind == "record"][0].reason
     assert reason.startswith("missing: ")
-    for field_name in ("vendor", "PO line #", "POD date", "received-by"):
+    for field_name in ("spec code", "description", "quantity", "POD date"):
         assert field_name in reason
+    # And never a field somebody would be wrong to type — see `completeness.DERIVED`.
+    for derived in ("vendor", "PO line #", "received-by"):
+        assert derived not in reason
 
 
 def test_every_manual_item_states_a_reason():
@@ -746,3 +753,37 @@ def test_the_record_detail_still_says_what_was_read():
 
     detail = [i for i in read_views.manual_queue(c) if i.kind == "record"][0].detail
     assert "STE-402-LT" in detail and "Side table" in detail
+
+
+def test_records_ready_puts_the_newest_record_first():
+    """Ordering by purchase order read tidily but buried the row a person came to look at: a
+    record extracted a minute ago landed wherever its PO number happened to sort, halfway down
+    thirty-odd rows."""
+    c = new_conn()
+    seed_email(c)
+    ids = [extracted_records_store.write_pending(c, make_record(po_number=po), NOW)
+           for po in ("212614", "206481", "209395")]
+    assert [r["id"] for r in read_views.records_ready(c)] == sorted(ids, reverse=True)
+
+
+def test_attachments_put_the_newest_first_by_when_we_saw_them():
+    """Keyed on `first_seen_at`, not the email's own date. `email_date` is the envelope date, and
+    for forwarded mail that is the forwarding date — twelve of the fourteen corpus messages were
+    forwarded on one afternoon, which collapsed months of deliveries onto a single instant."""
+    c = new_conn()
+    # The older attachment deliberately carries the *later* email_date — the shape a forward
+    # produces, and the one that used to sort it above an attachment we received weeks after it.
+    for email_id, email_date, seen in (
+            ("msg-a-old-arrival", "2026-08-20T14:00:00Z", "2026-08-01T09:00:00Z"),
+            ("msg-z-new-arrival", "2026-06-06T14:00:00Z", "2026-08-17T09:00:00Z")):
+        seed_email(c, email_id=email_id)
+        c.execute("UPDATE email_log SET email_date = ? WHERE email_id = ?", (email_date, email_id))
+        c.execute("""
+            INSERT INTO attachment_ledger (email_id, parent_id, depth, ordinal, container_path,
+                filename, sniffed_kind, sha256, size_bytes, is_inline, claimed_by,
+                records_extracted, disposition, review_status, first_seen_at, last_updated_at)
+            VALUES (?, NULL, 0, 0, ?, ?, 'pdf', ?, 10, 0, 'PdfAdapter', 1, ?, 'none', ?, ?)
+        """, (email_id, f"{email_id}.pdf", f"{email_id}.pdf", email_id,
+              attachment_ledger.EXTRACTED, seen, seen))
+    c.commit()
+    assert [r["email_id"] for r in read_views.attachments(c)][0] == "msg-z-new-arrival"

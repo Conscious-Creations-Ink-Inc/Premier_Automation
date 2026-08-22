@@ -22,6 +22,8 @@ Known defects from the latest code analysis: [`docs/CODE-ANALYSIS-FINDINGS.md`](
 | Dashboard API (`api/`) | Working demo on seeded synthetic data |
 | The UI (`api/ui/`) | Seven pages behind one sidebar. **No authentication** — see the handbook's S2 |
 | Scheduler (`operations/`) | Working: interval schedule, run history, kill switch. **Off until enabled on /ui/automation** |
+| Creating a record by hand | Implemented + tested — `/ui/records/new`, opened from a message on **Needs a human** or from the message popup |
+| Duplicate handling | Implemented + tested — content fingerprint per message, delivery key per record, evidence key per post (`pipeline/dedupe.py`) |
 | Production entry point | **None yet** — `run_pipeline.py` is a stub; the pipeline is otherwise invoked from the UI or from tests |
 
 ## The interface
@@ -35,11 +37,24 @@ step, one inline script. Seven pages behind a sidebar:
 | | Records | corpus | What was extracted and is ready to go further, plus the receiver report sheet |
 | Mail | Mails | corpus | Every email through Stage 1 and what triage decided about it |
 | | Inbox | **live mailbox** | Premier's receiving inbox, read and never written |
-| Needs action | Needs a human | corpus | What the pipeline could not finish on its own |
+| Needs action | Needs a human | corpus | What the pipeline could not finish on its own — and, per row, a way to record it by hand |
 | Operations | Automation | operations DB | Run now, the schedule, run history |
 | | Receiver report | **live** | The report Premier compares against Spitfire's Receipt Log, and its Excel export |
 
 The kill switch is pinned to the bottom of the sidebar on every page.
+
+Two pages sit outside the sidebar because each is reached from a row rather than from navigation:
+`/ui/records/new` builds a record from one message, and `/ui/records/{id}/waive-pod` records that a
+delivery stated only in an email body may be posted with no proof document attached.
+
+**A record is complete when it carries the five facts only the delivery notification can supply** —
+PO number, spec code, description, quantity and delivery date (`pipeline/completeness.py`). Vendor,
+unit, PO line number and who signed for the goods are `DERIVED`: each has a source already holding
+the authoritative value, so nobody is asked to type them.
+
+**Automation never posts a receipt with no proof of delivery.** `post_decision`'s second gate
+refuses one outright; the only way past it is a named person accepting the risk on the waive page,
+which is stored on the record and carried into the ledger.
 
 There were three UIs until 11 Aug 2026 — these pages, an operations console on :8500, and a React
 dashboard on :5173. The console's four screens moved here (its logic still lives in `operations/`,
@@ -94,11 +109,17 @@ copy .env.example .env        # then fill in the GRAPH_* values
 
 ```
 pytest                          # run all tests (from repo root)
-python run_api.py               # the UI on http://127.0.0.1:8000/ui
+python run_api.py               # the UI on http://127.0.0.1:8000/ui (restarts on save)
 python -m tools.ingest_corpus --reset       # re-run the .msg corpus (the corpus pages)
 python -m tools.ingest_mailbox              # read the live mailbox (read-only)
 python -m api.demo.seed --reset             # reseed the /api/* demo database
 ```
+
+Saving a `.py` under `api/`, `pipeline/`, `config/` or `operations/`, or editing `.env`, restarts
+the server and reloads any open tab. `tools/` and `tests/` deliberately do not — nor does anything
+under `state/`, whose SQLite files are rewritten every fifteen seconds by the arrivals watch and
+would otherwise hold the server in a restart loop. Only one instance can run at a time; a second
+`python run_api.py` exits rather than binding a port beside the first.
 
 Nothing runs unattended unless someone turns it on: the schedule is off until enabled on
 `/ui/automation`, and the kill switch in the sidebar stops everything — schedule and Run now — until

@@ -49,6 +49,11 @@ def records_from_pod(document: pod_parser.PodDocument, source: ExtractionSource)
     quantity. So it emits one record per PO it references, carrying the evidence fields
     (date, carrier, tracking, signature) and leaving the line identity to Stage 4, which
     reconciles it against the notification for the same shipment."""
+    # This attachment *is* the proof, whatever its file type — the grammar recognised it, and the
+    # grammar is fed by a PDF text layer, by OCR over a photograph, and by text lifted out of a
+    # .docx alike. The dispatcher writes this onto the ledger row; see `ExtractionSource.pod_document`.
+    source.pod_document = document
+
     records = []
     tracking = document.tracking_numbers[0] if document.tracking_numbers else None
     for po_number in document.po_numbers or [""]:

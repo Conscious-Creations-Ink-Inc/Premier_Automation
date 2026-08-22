@@ -201,4 +201,5 @@ def _record(
     attachment_ledger.record_outcome(
         conn, source.ledger_id, disposition, now,
         claimed_by=claimed_by, records_extracted=records, detail=detail, error_type=error_type,
+        pod_document=source.pod_document,
     )

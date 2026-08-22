@@ -357,3 +357,48 @@ def test_internal_mail_carrying_a_readable_attachment_is_never_hidden():
     email.attachments = [Attachment(filename="tracker.pdf", content_type="application/pdf",
                                     content_bytes=b"%PDF-1.4" + b"\x00" * 500)]
     assert triage(email).matched_rule != "rule_5c_internal_noise"
+
+
+# --- The notice is found wherever the chain quoted it ------------------------
+#
+# The outermost subject is the one part of a forwarded notice a human retypes. Three live sends to
+# Premier's receiving mailbox arrived as "Testing Premier Automation", then "Test 3", each carrying
+# a perfectly formed Inbound Notification one hop down that nothing ever looked at. Premier's own
+# mail has the same shape for duller reasons: always forwarded, sometimes twice, and Exchange
+# rewrites the subject on the way in.
+
+
+def _notice_under_an_unrelated_subject(subject: str) -> RawEmail:
+    """A real Inbound Notification, forwarded by someone outside Premier who retyped the subject."""
+    email = fx.inbound_email(forwarded=True)
+    email.subject = subject
+    email.sender_address = "someone@outlook.com"
+    email.sender_domain = "outlook.com"
+    return email
+
+
+def test_a_retyped_subject_does_not_hide_the_notice_quoted_below_it():
+    result = triage(_notice_under_an_unrelated_subject("[External] Test 3"))
+    assert result.matched_rule == "rule_1a_authority_inbound"
+    assert result.category == TriageCategory.SURFACE
+    assert result.extracted_po_hints == ["208491"]
+    # The shipment number is what stops one delivery becoming two receivers, and it only exists
+    # when the notice itself was parsed — its absence is how the failure showed up in production.
+    assert result.extracted_shipment_hint == "50052"
+    assert result.notification_number == "239336"
+
+
+def test_the_outer_subject_still_wins_when_it_is_itself_a_notice():
+    """The resolved origin is tried first, so nothing that worked before resolves differently."""
+    result = triage(fx.inbound_email(forwarded=True))
+    assert result.matched_rule == "rule_1a_authority_inbound"
+    assert result.notification_number == "239336"
+
+
+def test_a_thread_with_no_authority_hop_is_unchanged():
+    """The fallback must not invent a notice. A plain vendor thread triages exactly as before."""
+    email = make_email(
+        subject="[External] Test 3",
+        sender_address="someone@outlook.com", sender_domain="outlook.com",
+        body_html="<p>Quick question about the pool pavers, no PO to hand.</p>")
+    assert triage(email).matched_rule != "rule_1a_authority_inbound"

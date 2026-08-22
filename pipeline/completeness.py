@@ -8,18 +8,23 @@ let three records through labelled *ready* while carrying **no proof of delivery
 delivery date, no carrier, no tracking, no signature, no PO line number. They cannot be compared
 against a purchase order, which is the entire point of extracting them.
 
-`REQUIRED` is not a taste call. It is `receipt_log._HEADERS` read backwards: DocNo, Vendor, Line,
-Description, Order Qty, Received, Receiver. A record is complete exactly when the Receipt Log can
-be built from it, so the two files cannot drift apart without a test noticing.
+`REQUIRED` is what only the email can tell us, and nothing else can supply. Everything a purchase
+order already knows was taken out of it on 2026-08-21 and moved to `DERIVED` — see below — because
+demanding a vendor name from a delivery notification is asking a person to retype a fact Spitfire
+is holding, and getting it wrong is then possible where before it was not.
 
 Carrier and tracking are `ADVISORY` on purpose. A warehouse Inbound notification legitimately
 carries neither — the goods moved inside the 3PL's own network — so demanding them would park
 correct records in a human queue for ever.
 
 **Nothing here blocks.** Gaps are reported, not enforced: an incomplete record still reaches the
-Records page, flagged. That is safe only while `stage4_match`-`stage7_route` remain stubs and
-nothing posts to Spitfire. Whoever builds the write path must refuse a record whose
-`is_complete` is False, or a receiver with no POD date reaches Premier's ERP.
+Records page, flagged. Whoever builds the write path must refuse a record whose `is_complete` is
+False, or **a receiver with no delivery date reaches Premier's ERP** — that is the one this list
+still exists to prevent, and `post_decision` honours it.
+
+A *missing POD file* is no longer part of that judgement. It is a separate gate, in
+`post_decision`, because it has a separate remedy: a person may waive it for a delivery stated
+entirely in the email body, and nothing else here is waivable.
 """
 
 from dataclasses import dataclass, field
@@ -27,15 +32,33 @@ from typing import Any, List, Mapping, Sequence
 
 REQUIRED: Sequence[str] = (
     "po_number",           # DocNo — nothing downstream can match without it
-    "vendor_name",         # Vendor
-    "po_line_number",      # Line
-    "item_description",    # Description
-    "quantity_received",   # Received
-    "unit_of_measure",     # the quantity is meaningless without it
     "spec_code",           # what was actually delivered, as Premier names it
-    "pod_stated_date",     # proof it arrived, and when
-    "received_by",         # proof a person took it
+    "item_description",    # Description
+    "quantity_received",   # Received — a receipt line without one cannot be created at all
+    "pod_stated_date",     # proof it arrived, and *when*. The one fact no other system holds.
 )
+"""The five facts only the delivery notification can supply. All five, or the record is incomplete."""
+
+DERIVED: Sequence[str] = (
+    "vendor_name",         # spitfire_po_lines.vendor_name, on the matched line
+    "unit_of_measure",     # spitfire_po_lines.unit_of_measure — post_decision already reads it there
+    "po_line_number",      # resolved by spec match, or chosen by a reviewer from the PO's own lines
+    "received_by",         # the POD's `Signed for by:`, else the reviewer who accepted the record
+)
+"""Fields a record needs but a person must never be asked to type.
+
+Each has a source that already holds the authoritative value, so requiring them of the *email* was
+requiring the wrong thing. Measured on the 94 live records: `received_by` alone blocked 22 of them
+and appeared in the gap set of 71.
+
+They are listed rather than deleted so the reason survives — and because `receipt_log` fills the
+first two from `spitfire_po_lines` at build time, which only makes sense if you can see here that
+their absence from the record is expected rather than a defect.
+
+`post_decision` does not read this tuple: it already derives what it needs from the matched PO line
+(`check.unit_of_measure`, `_cost_code_of`) and takes the line number from the record itself. The
+tuple is documentation and is what the UI uses to label a cell "from the purchase order".
+"""
 
 ADVISORY: Sequence[str] = (
     "carrier_name",

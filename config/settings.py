@@ -219,6 +219,24 @@ all, and its allowlist rejects any non-read request before a socket opens. Premi
 authorised a write to their ERP; when they do, that is a reviewed change to `_ALLOWED`, not a
 flag someone flips."""
 
+# --- Spitfire cassettes: developing away from the office IP --------------------
+# Spitfire only answers from Premier's office network, and SPITFIRE_SESSION_COOKIE is a
+# hand-captured browser ticket that lapses on idle — so the connected window is short even when
+# you are there. `connectors/spitfire_cassette.py` records responses while connected and replays
+# them when not, as a requests transport adapter mounted under both clients.
+#
+#   off     nothing is mounted; the code takes exactly the paths it takes today. THE DEFAULT.
+#   record  call live, save every response, return the live one.
+#   replay  never open a socket. A call nothing recorded raises, naming the call; the four
+#           mutating write operations refuse outright (a replayed create_receipt would hand back
+#           the same DocMasterKey every time and the ledger would record a key that looks real).
+#   auto    replay on a hit, otherwise live-and-record. Office mode: warms the store as you work.
+SPITFIRE_CASSETTE_MODE = os.getenv("SPITFIRE_CASSETTE_MODE", "off")
+SPITFIRE_CASSETTE_DIR = Path(
+    os.getenv("SPITFIRE_CASSETTE_DIR", "") or (STATE_DIR / "spitfire_cassettes"))
+"""Gitignored: the bodies carry real vendor names, named Premier employees on approval routes, and
+cost codes. A small scrubbed subset lives in `tests/fixtures/spitfire/` instead."""
+
 # --- Orchestrators ------------------------------------------------------------
 
 INGEST_ORCHESTRATOR_INTERVAL_MINUTES = 20   # our own default, not yet validated against real volume

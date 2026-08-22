@@ -242,11 +242,64 @@ def records_ready(conn: sqlite3.Connection) -> List[sqlite3.Row]:
                r.tracking_number, r.received_by, r.delivery_location, r.vendor_name,
                r.shipment_number, r.notification_number, r.extraction_source,
                r.extraction_confidence, r.status, r.source_email_id,
+               COALESCE(r.origin, 'auto') AS origin, r.created_by, r.manual_note,
+               r.pod_ledger_id, r.pod_source, r.pod_waived_by, r.pod_waived_at,
                COALESCE(e.subject, '') AS email_subject
           FROM extracted_records r
           LEFT JOIN email_log e ON e.email_id = r.source_email_id
          WHERE {_READY_CLAUSE}
-         ORDER BY r.po_number, r.po_line_number, r.id
+         -- Newest first. Ordering by purchase order read tidily but buried the row a person came
+         -- to look at: a record extracted a minute ago landed wherever its PO number happened to
+         -- sort, halfway down thirty-odd rows. `id` is the arrival order and cannot drift the way
+         -- a date carried in from an email can. The page's own column sort still reorders on
+         -- demand; this only decides what greets you.
+         ORDER BY r.id DESC
+    """)
+
+
+def attachments(conn: sqlite3.Connection, *, include_inline: bool = True) -> List[sqlite3.Row]:
+    """Every file the system has taken off an email, newest message first.
+
+    The whole ledger, not a subset. `/ui/manual` already shows the ones needing attention and the
+    mail dialog shows one message's worth; neither answers "what have we actually got?", which is
+    the question that surfaces the things no single-message view can — the same file arriving twice
+    under different names, or a 3 MB photograph that produced thirteen records and is still not
+    marked as a proof of delivery.
+
+    `include_inline=False` drops signature logos and letterhead. They are genuine attachments and
+    are listed by default for that reason, but they outnumber the real ones better than two to one,
+    so the page offers a way to put them aside.
+
+    `ordinal` matters as much as `id` here: `/ui/mail/attachment` is keyed by `(email_id, ordinal)`,
+    so it is the ordinal — not the ledger id — that lets a row open its own file.
+    """
+    clause = "" if include_inline else "WHERE COALESCE(a.is_inline, 0) = 0"
+    return _rows(conn, f"""
+        SELECT a.id, a.email_id, a.ordinal, a.depth, a.filename, a.sniffed_kind,
+               a.declared_content_type, a.size_bytes, a.is_inline, a.disposition,
+               a.disposition_detail, a.claimed_by, a.records_extracted, a.error_type,
+               a.first_seen_at, COALESCE(a.blob_sha256, a.sha256, '') AS stored_sha,
+               COALESCE(a.is_pod, 0) AS is_pod, COALESCE(a.pod_po_numbers, '') AS pod_po_numbers,
+               a.pod_delivery_date, a.pod_signed_by,
+               COALESCE(e.subject, '') AS email_subject, e.email_date, e.sender,
+               -- The two weaker kinds of PO evidence. `pod_po_numbers` above is the file saying
+               -- which order it is proof for; these two are the message saying it, and the records
+               -- that message produced saying it. Worth showing a reader, not worth attaching a
+               -- document to a receipt on — which is why `spitfire_post._pod_for` ignores both.
+               COALESCE(e.po_hints, '') AS email_po_hints,
+               (SELECT GROUP_CONCAT(DISTINCT r.po_number) FROM extracted_records r
+                 WHERE r.source_email_id = a.email_id) AS pos_via_records
+          FROM attachment_ledger a
+          LEFT JOIN email_log e ON e.email_id = a.email_id
+          {clause}
+         -- Newest first, keyed on when we saw the attachment rather than on the email's own date.
+         -- `email_date` is the envelope date, and for forwarded mail that is the forwarding date:
+         -- twelve of the fourteen corpus messages were forwarded on one afternoon, so ordering by
+         -- it collapsed months of deliveries onto a single instant. `first_seen_at` is stamped by
+         -- ingest, is monotonic, and cannot be rewritten by whoever forwarded the mail.
+         -- The trailing keys are unchanged: one email's attachments stay together, in their own
+         -- container order, rather than interleaving with another's.
+         ORDER BY a.first_seen_at DESC, a.id DESC, a.email_id, a.depth, a.ordinal
     """)
 
 

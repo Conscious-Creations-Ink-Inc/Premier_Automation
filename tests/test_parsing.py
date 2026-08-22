@@ -454,3 +454,24 @@ def test_a_body_quoting_a_from_line_is_not_a_message():
     """The header block ends at the first blank line; a quoted `From:` below it must not count."""
     body = b"Please see below.\r\n\r\nFrom: someone@example.com\r\nSubject: quoted\r\n"
     assert sniff.is_eml(body) is False
+
+
+def test_an_external_tagged_forward_is_still_a_forward():
+    """Exchange prepends `[External] ` to anything originating outside the tenant, so a genuine
+    forward reaches us as `[External] Fw: ...`. Testing the raw subject read that as "not a
+    forward" and took the forwarder's own annotation as the payload; three subjects in Premier's
+    live mailbox already have that shape."""
+    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com",
+                                 "[External] Fw: 239260 - Inbound Notification")
+    origin = thread.resolve_origin("mariagutierrez@premierpm.com",
+                                   "[External] Fw: 239260 - Inbound Notification", parsed)
+    assert origin.sender_address == "warehousing@authoritylogistics.com"
+
+
+def test_a_reply_is_not_treated_as_a_forward():
+    """`Re:` alone must not reach past the top hop — a genuine reply *is* the payload."""
+    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com",
+                                 "RE: 239260 - Inbound Notification")
+    origin = thread.resolve_origin("mariagutierrez@premierpm.com",
+                                   "RE: 239260 - Inbound Notification", parsed)
+    assert origin.sender_address == "mariagutierrez@premierpm.com"

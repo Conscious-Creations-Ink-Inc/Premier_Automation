@@ -18,8 +18,12 @@ nothing.
 Read-only except the four `POST /ui/automation/*` controls, all of which redirect so a refresh never
 re-submits. There are no filters, no sorting controls and no per-row actions.
 """
+import os
 import sqlite3
+from collections import OrderedDict
 from datetime import datetime
+from html import escape as _escape
+from typing import Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -28,14 +32,26 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from api import deps
 from api.ui import html
 from config import settings
+from connectors import spitfire_cassette
 from operations import inbox as inbox_reader
 from operations import killswitch, runner, scheduler
 from operations import store as ops_store
 from pipeline import (attachment_bytes, attachment_view, completeness, delivery_status,
-                      mail_arrivals, mail_cache, mail_view, po_verify, read_views, receipt_log,
+                      mail_arrivals, mail_cache, mail_view, po_verify, post_ledger, read_views,
+                      receipt_log, record_completion, record_create, spitfire_post,
                       state_db)
 
 router = APIRouter(prefix="/ui", tags=["ui"], include_in_schema=False)
+
+_BOOT = str(os.getpid())
+"""This worker's identity, mixed into the version token so a restart reloads every open tab.
+
+The rest of the token is derived from the database, which means it moves when there is new
+*data* and never when there is new *code* — so before this, a code change reached the server but
+an open tab kept rendering the old markup until someone pressed refresh, which read as "the
+change didn't work". The pid changes on every respawn, and `run_api.py` respawns the whole
+process on every edit, so one supervised restart now reloads what the browser is showing.
+"""
 
 _EMPTY_HINT = (
     "Nothing has been read from the mailbox yet. Press “Run now” on Automation, or run "
@@ -171,13 +187,35 @@ def _gap_badge(row) -> html.Raw:
 
     Deliberately not a confidence score. "0.50" says nothing a person can act on; "4 gaps" with
     `missing: vendor, PO line #, POD date, received-by` on hover names the cells to fill.
+
+    A record with gaps also gets the control that closes them, in the same cell that names them.
+    The badge alone told a reviewer what was wrong and offered nothing to do about it, and the
+    fields it names are exactly the ones the attached proof of delivery can answer.
     """
     row_gaps = completeness.gaps(row)
     if row_gaps.is_complete:
         advisory = row_gaps.describe(advisory=True)
         return html.tag("span", html.badge("Complete", "good"), title=advisory or "every field present")
-    return html.tag("span", html.badge(f"{row_gaps.count} gaps", "hold"),
-                    title=row_gaps.describe(advisory=True))
+    return html.tag(
+        "span",
+        html.badge(f"{row_gaps.count} gaps", "hold"),
+        " ",
+        html.verify_button(f"/ui/records/{row['id']}/complete", "Fill",
+                           title=f"Fill {row_gaps.describe()} from the attached proof of delivery",
+                           small=True, ghost=True),
+        title=row_gaps.describe(advisory=True))
+
+
+def _mm(value, flags, field):
+    """A cell that disagrees with Spitfire, with the reason on hover.
+
+    A span rather than a class on the `<td>`: `html.table` wraps every cell identically and has no
+    per-cell styling, and `token`/`muted`/`badge` already mark cells this way.
+    """
+    reason = (flags or {}).get(field)
+    if not reason:
+        return value
+    return html.tag("span", value, class_="mm", title=reason)
 
 
 def _clipped(value, limit: int):
@@ -312,10 +350,21 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
     # shown: every pending record reads "pending" until stages 4-7 run, so it would be 25 identical
     # cells. Where the purchase order actually stands is the question this page could not answer.
     delivery = {p.po_number: p for p in read_views.po_delivery_status(conn)}
+    # Which cells disagree with Spitfire, read from the mirror in one pass. No network: verifying
+    # every row live costs about 145 seconds, which is not a page render. An unflagged cell means
+    # nothing disagrees, not that nothing was checked — Verify is still the live answer.
+    flags = po_verify.mismatch_flags(conn, records)
+    # What has already been sent to Spitfire, in one pass. Spitfire itself cannot answer this —
+    # `ReceiptInProgressUnits` reads 0.0 against an unapproved receipt — so the ledger is the only
+    # source, and without it the page would offer Post on a row that is already a receipt.
+    posted = {a.record_id: a for a in post_ledger.latest_by_record(conn)}
+    # One query, not one per row: which emails carry something that could be a POD.
+    pod_emails = _emails_with_a_possible_pod(conn)
     rows = []
     for r in records:
         package = f"{_num(r['package_quantity'])} {r['package_uom'] or ''}".strip()
         po = delivery.get(r["po_number"])
+        mm = flags.get(r["id"])
         rows.append([
             r["id"],
             # Second column, not last. This table is eighteen columns wide and scrolls sideways, so
@@ -326,6 +375,12 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             # row, so the two do not fight.
             html.verify_button(f"/ui/records/{r['id']}/verify", "Verify",
                                title=f"Check PO {r['po_number']} against Spitfire", small=True),
+            # The write. Same control as Verify — a `data-verify` button the one inline script
+            # posts — because these pages are pinned to a single script block and a second one
+            # would fail `test_ui_html.py`. Its label carries the outcome where there is one, so a
+            # posted row reads "Posted" rather than inviting a second attempt that the ledger
+            # would only refuse.
+            _post_cell(posted.get(r["id"]), r, has_pod=r["source_email_id"] in pod_emails),
             # Two destinations, deliberately distinguishable rather than one link that does a
             # surprising thing: the number goes to the purchase order, the envelope opens the email
             # this line was read from, so the two can be compared.
@@ -335,11 +390,14 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             html.badge(po.label, po.status) if po else html.muted("—"),
             _gap_badge(r),
             r["po_line_number"] if r["po_line_number"] is not None else html.muted("—"),
-            html.token(r["spec_code"]), (r["item_description"] or "")[:70],
-            _num(r["quantity_received"]), r["unit_of_measure"] or html.muted("—"),
+            _mm(html.token(r["spec_code"]), mm, "spec"),
+            (r["item_description"] or "")[:70],
+            _mm(_num(r["quantity_received"]), mm, "qty"),
+            _mm(r["unit_of_measure"] or html.muted("—"), mm, "uom"),
             package or html.muted("—"), html.when(r["pod_stated_date"]),
             r["carrier_name"] or html.muted("—"), html.token(r["tracking_number"]),
             r["received_by"] or html.muted("—"), f"{r['extraction_confidence']:.2f}",
+            html.origin_badge(r["origin"], r["created_by"]),
             r["extraction_source"],
             # The row itself opens the delivery bar, so the message keeps its own control here
             # rather than being unreachable from this page. It was a plain `<a href>` to the
@@ -354,11 +412,11 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
                         label="Search records"),
         html.date_filter("records-table", label="POD date"),
         html.table(
-            ["#", "Verify", "PO", "Delivery", "Complete", "Line", "Spec", "Description", "Qty",
-             "UOM", "Package", "POD date", "Carrier", "Tracking", "Received by", "Conf", "Source",
-             "From email"],
+            ["#", "Verify", "Post", "PO", "Delivery", "Complete", "Line", "Spec", "Description",
+             "Qty", "UOM", "Package", "POD date", "Carrier", "Tracking", "Received by", "Conf",
+             "Origin", "Source", "From email"],
             rows, empty=_EMPTY_HINT, table_id="records-table", page_size=50,
-            date_column="POD date", no_sort=("Verify",),
+            date_column="POD date", no_sort=("Verify", "Post"),
             frag_urls=[f"/ui/po/{quote(r['po_number'])}/bar" for r in records],
             frag_title="Show this delivery's progress",
         ),
@@ -395,9 +453,12 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
                           page_size=10, unit="group", plain=True),
         note="Laid out like Spitfire's own Receipt Log and grouped by PO number, so the two can be "
              "compared line by line. Shown ten purchase orders at a time — set 'per page' to All, "
-             "or download the .xlsx, to get the whole sheet at once. Order Qty, Net and Final are "
-             "deliberately blank — they live on the purchase order inside Spitfire and no delivery "
-             "email carries them, so filling them in would mean inventing numbers.",
+             "or download the .xlsx, to get the whole sheet at once. Order Qty comes from the "
+             "purchase order and fills in once that PO has been read from Spitfire; Net is "
+             "Order Qty minus Received and follows it. Both stay blank until then rather than "
+             "showing a number nothing supports. Final is always blank — it is a flag a person "
+             "sets in Spitfire and cannot be worked out from quantities. The Receiver column says "
+             "who took delivery, or how the record was made when nobody signed.",
     )
     return html.page("Records", "/ui/records", body, sheet,
                      **_chrome(conn))
@@ -412,13 +473,483 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
 
 
 @router.post("/records/{record_id}/verify", response_class=HTMLResponse)
-def verify_record_fragment(record_id: int,
+def verify_record_fragment(record_id: int, line: Optional[int] = None,
                            conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """One record's comparison. `line` is a reviewer overriding which PO line to compare against,
+    posted by the alternatives table inside the popup — the same endpoint, so the dialog refills
+    in place rather than the reader losing the record they were reading."""
     rows = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
     if not rows:
         return str(html.tag("p", "No such record.", class_="empty"))
-    result = po_verify.verify_records(conn, rows)[0]
-    return str(_verification(result))
+    result = po_verify.verify_records(conn, rows, chosen_line=line)[0]
+
+    # Keep what it worked out. Verifying used to resolve the line, render it, and forget it, so a
+    # record could be checked against line 0001 all day and still be refused for having no line.
+    # `apply_verification` writes only an exact spec match whose quantity agrees, and only into an
+    # empty field — a reviewer's own choice, and a description-only guess, are both left alone.
+    kept = record_completion.apply_verification(conn, rows[0], result)
+    if not kept.ok:
+        return str(_verification(result))
+
+    fresh = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
+    banner = html.banner(f"{kept.applied[0]} — {kept.message}", kind="good")
+    if not fresh:
+        return str(banner) + str(_verification(result))
+    return str(banner) + str(_verification(
+        po_verify.verify_records(conn, fresh, chosen_line=line)[0]))
+
+
+@router.post("/records/{record_id}/complete", response_class=HTMLResponse)
+def complete_record_fragment(record_id: int, line: Optional[int] = None,
+                             conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Fill this record's gaps from its own proof of delivery, then show the comparison.
+
+    Writes to our SQLite and to nothing else — `pipeline/record_completion.py` reads the delivery
+    date and the signature off the attached POD rather than taking them from a form, so the record
+    and the file posted beside it cannot disagree. `line` is the reviewer's choice, the one field
+    a delivery note cannot supply.
+
+    A POST for the same reason Verify is: it changes stored data, and a GET would let a prefetch
+    do it. The reply is the verification fragment so the dialog shows the effect immediately.
+    """
+    rows = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
+    if not rows:
+        return str(html.tag("p", "No such record.", class_="empty"))
+
+    outcome = record_completion.complete(conn, rows[0], line=line)
+
+    parts = [html.tag("h3", "Completed from the POD" if outcome.ok else "Not completed"),
+             html.tag("p", outcome.message, class_="" if outcome.ok else "warn")]
+    if outcome.applied:
+        parts.append(html.tag("ul", *[html.tag("li", a) for a in outcome.applied]))
+
+    if outcome.ok:
+        # Re-read: `records_ready` filters on the very columns just written, so the row in hand is
+        # stale and the comparison below must be built from what is now stored.
+        fresh = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
+        if fresh:
+            parts.append(html.Raw(str(_verification(
+                po_verify.verify_records(conn, fresh, chosen_line=line)[0]))))
+    return "".join(str(p) for p in parts)
+
+
+# --- Post to Spitfire -------------------------------------------------------------------------
+#
+# THE ONLY ROUTE IN THIS FILE THAT WRITES TO PREMIER'S ERP. Everything else here reads.
+# `tests/test_operations_readonly.py` scans this module for write verbs and exempts this handler
+# by name; that exemption is the reviewable act, and widening it would void the guarantee for the
+# whole file. See `connectors/spitfire_write.py` for what may be issued and what is refused.
+#
+# It creates a receipt, hangs the POD and the receiver report on it, and links it to the purchase
+# order. It does **not** route: creating the receipt already stages three real Premier employees,
+# and dispatching to them is Premier's decision, not a button's.
+
+
+def _record_or_none(conn, record_id: int):
+    """A record the *write* stages may act on — one the Records page is currently offering."""
+    rows = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
+    return rows[0] if rows else None
+
+
+def _any_record_or_none(conn, record_id: int):
+    """Any record, posted or not.
+
+    `records_ready` deliberately excludes a record once it has posted — `_mark_pushed` moves it to
+    `pushed_to_spitfire` — which is right for the write stages and wrong for verification: the only
+    records worth verifying are exactly the ones that have left that view. Reading it through
+    `records_ready` made Verify POD unreachable for every record it applied to.
+    """
+    prior = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute("SELECT * FROM extracted_records WHERE id = ?", (record_id,)).fetchone()
+    finally:
+        conn.row_factory = prior
+
+
+def _write_guarded(conn, record_id: int, action, headings):
+    """Run one Spitfire write for one record, behind the two guards every write here keeps.
+
+    The kill switch and `runner._LOCK` are not per-route policy — they are the reason a stop is a
+    stop and a double-submit is a no-op rather than two receipts — so both stages and nothing else
+    go through here.
+    """
+    if killswitch.is_stopped():
+        return str(_post_outcome_fragment(
+            ok=False, heading="Stopped",
+            message="the kill switch is engaged — release it before posting to Spitfire."))
+
+    # Refused here rather than deeper down, and deliberately before `post_ledger.claim` ever runs.
+    # `connectors/spitfire_cassette` raises on the write itself as a backstop, but that raise would
+    # land inside `post_pod`'s try block — after the claim — leaving a `CLAIMED` row, which the
+    # ledger reads as "a receipt may exist on training somewhere". Nothing was sent and nothing
+    # should be recorded as if it might have been.
+    if spitfire_cassette.writes_refused():
+        return str(_post_outcome_fragment(
+            ok=False, heading="Offline",
+            message=("Spitfire can only be written to from Premier's office network, and this "
+                     "session is replaying recorded responses. Verifying and reading still work; "
+                     "posting does not.")))
+
+    row = _record_or_none(conn, record_id)
+    if row is None:
+        return str(html.tag("p", "No such record.", class_="empty"))
+
+    # A second caller is turned away rather than queued, so a double-submit is a no-op rather than
+    # two receipts. The ledger is the durable half of the same guard, for a restart between clicks.
+    if not runner._LOCK.acquire(blocking=False):
+        return str(_post_outcome_fragment(
+            ok=False, heading="Busy",
+            message="the automation is mid-run — wait for it to finish and try again."))
+    try:
+        result = action(conn, row)
+    finally:
+        runner._LOCK.release()
+
+    heading = headings.get(result.state, "Posted" if result.ok else "Failed")
+    return str(_post_outcome_fragment(ok=result.ok, heading=heading, message=result.message,
+                                      result=result))
+
+
+_POST_HEADINGS = {"flagged": "Not posted", "session_expired": "Session expired",
+                  "partial": "Partly posted — needs a person",
+                  post_ledger.POD_POSTED: "Proof of delivery posted"}
+
+
+@router.post("/records/{record_id}/post-pod/confirm", response_class=HTMLResponse)
+def post_pod_confirm_fragment(record_id: int,
+                              conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Say what is about to be created, then offer the button that creates it.
+
+    A POST that only reads. The dialog script always POSTs (see `html.verify_button`), and this
+    codebase already has the shape — `spitfire_write.find_documents` is documented as "a read,
+    despite being a POST".
+
+    The confirmation exists because this is the one control in the application that writes to
+    Premier's ERP, and it used to fire on the first click with nothing said first.
+    """
+    row = _record_or_none(conn, record_id)
+    if row is None:
+        return str(html.tag("p", "No such record.", class_="empty"))
+    quantity = f"{row['quantity_received']} {row['unit_of_measure'] or ''}".strip()
+    return str(html.Raw("".join(str(p) for p in [
+        html.tag("h3", f"Post the proof of delivery for PO {row['po_number']}?"),
+        html.tag("p", html.Raw(
+            f"This creates a receipt on purchase order <strong>{_escape(row['po_number'])}</strong> "
+            f"for <strong>{_escape(quantity)}</strong> of "
+            f"<strong>{_escape(row['spec_code'] or '—')}</strong>, uploads the proof of delivery, "
+            f"checks the catalog's hash against ours, and attaches it.")),
+        html.tag("p", html.Raw(
+            "The receiver report is <strong>not</strong> posted by this step — it becomes a "
+            "separate button once the proof of delivery is on the receipt.")),
+        html.tag("p", "Nothing is routed. The receipt is left In Process for a person to approve.",
+                 class_="sub"),
+        html.verify_button(f"/ui/records/{record_id}/post-pod", "Post POD to Spitfire",
+                           title="Create the receipt and attach the proof of delivery"),
+    ])))
+
+
+@router.post("/records/{record_id}/post-pod", response_class=HTMLResponse)
+def post_pod_fragment(record_id: int,
+                      conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Create the receipt and put the POD on it.
+
+    Synchronous, and for several seconds — five calls and an upload. A background job would need
+    polling, polling needs script, and `tests/test_ui_html.py` pins these pages to exactly one
+    inline block. One person posting one record at a time can wait.
+    """
+    return _write_guarded(conn, record_id, spitfire_post.post_pod, _POST_HEADINGS)
+
+
+@router.post("/records/{record_id}/post-report/confirm", response_class=HTMLResponse)
+def post_report_confirm_fragment(record_id: int,
+                                 conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    row = _record_or_none(conn, record_id)
+    if row is None:
+        return str(html.tag("p", "No such record.", class_="empty"))
+    attempt = spitfire_post._awaiting_report_attempt(conn, record_id)
+    if attempt is None:
+        return str(_post_outcome_fragment(
+            ok=False, heading="Nothing to add a report to",
+            message=("the proof of delivery has not been posted for this record — post it first, "
+                     "and the report becomes available on the receipt it creates.")))
+    where = attempt.receipt_doc_no or attempt.receipt_key[:8]
+    return str(html.Raw("".join(str(p) for p in [
+        html.tag("h3", f"Post the receiver report onto receipt {where}?"),
+        html.tag("p", html.Raw(
+            f"The proof of delivery is already on this receipt. This builds the receiver report "
+            f"for PO <strong>{_escape(row['po_number'])}</strong>, uploads it, attaches it beside "
+            f"the POD, links the purchase order and any pay requests, and reads the receipt back "
+            f"to confirm both files are on it.")),
+        html.tag("p", "Nothing is routed. The receipt stays In Process.", class_="sub"),
+        html.verify_button(f"/ui/records/{record_id}/post-report", "Post report to Spitfire",
+                           title="Build and attach the receiver report"),
+    ])))
+
+
+@router.post("/records/{record_id}/post-report", response_class=HTMLResponse)
+def post_report_fragment(record_id: int,
+                         conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    return _write_guarded(conn, record_id, spitfire_post.post_report, _POST_HEADINGS)
+
+
+@router.post("/records/{record_id}/verify-pod", response_class=HTMLResponse)
+def verify_pod_fragment(record_id: int,
+                        conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Re-read the POD from Spitfire and re-compare its hash. Reads only, so no kill switch and no
+    lock: refusing to *check* what was written while a run is in progress would be perverse."""
+    row = _any_record_or_none(conn, record_id)
+    if row is None:
+        # The ledger row outlives its record: `tools/reprocess_mail` erases extracted records so
+        # mail can be read again, and deliberately leaves the posting history alone. So a receipt
+        # can be listed here with nothing left locally to compare against — which is a different
+        # thing from a bad link, and saying "no such record" alone sent people looking for one.
+        return str(_post_outcome_fragment(
+            ok=False, heading="Cannot verify",
+            message=("this receipt's record is no longer in our store — it was erased when the "
+                     "mail was reprocessed. The receipt still exists in Spitfire; there is simply "
+                     "no local copy of the POD left to compare its hash against.")))
+    result = spitfire_post.verify_pod(conn, row)
+    heading = {"verified": "Proof of delivery verified",
+               "flagged": "Not verified"}.get(result.state, "Could not verify")
+    return str(_post_outcome_fragment(ok=result.ok, heading=heading, message=result.message,
+                                      result=result))
+
+
+def _posted_receipts(conn: sqlite3.Connection) -> list:
+    """Everything that reached Spitfire, each with the control that proves it is still there.
+
+    It has to live here rather than on the Records page, and that is not a layout preference: a
+    posted record leaves `records_ready` the moment `_mark_pushed` runs, so the Records page cannot
+    show it at all. Without this section the verification had nowhere to be clicked from — which is
+    the state the feature was in until a live check caught it.
+    """
+    done = [a for a in post_ledger.latest_by_record(conn) if a.state == post_ledger.POSTED]
+    if not done:
+        return []
+    rows = [[html.badge(a.receipt_doc_no or a.receipt_key[:8], "good"),
+             a.po_number,
+             html.when((a.settled_at or a.claimed_at or "")[:16]),
+             html.verify_button(f"/ui/records/{a.record_id}/verify-pod", "Verify POD",
+                                title="Re-read the POD from Spitfire and re-check its hash",
+                                small=True, ghost=True)] for a in done]
+    return [html.section(
+        f"Posted to Spitfire ({len(done)})",
+        html.table(["Receipt", "Purchase order", "Posted", "Proof"], rows,
+                   empty="Nothing has been posted.", table_id="posted-receipts",
+                   page_size=25, date_column="Posted"),
+        note=("Verify POD re-reads the receipt from Spitfire and re-compares the catalog's hash "
+              "against the file we sent — it answers both 'is it still attached' and 'are the "
+              "bytes still ours', which a successful upload never proved on its own. "
+              "Each receipt is left In Process until a person approves it."),
+    )]
+
+
+def _awaiting_report(conn: sqlite3.Connection) -> list:
+    """Receipts that carry a proof of delivery and no receiver report.
+
+    A state the atomic post could not produce and the split can: somebody posted the POD and has
+    not posted the report. Not a fault — but a real document sitting in Premier's ERP, half built,
+    and the difference between "normal resting state" and "forgotten" is only whether anyone is
+    told. So it is listed, for the same reason refusals are.
+    """
+    waiting = post_ledger.awaiting_report(conn)
+    if not waiting:
+        return []
+    rows = [[html.badge(a.receipt_doc_no or a.receipt_key[:8], "warn"),
+             a.po_number,
+             f"record {a.record_id}",
+             html.when((a.settled_at or a.claimed_at or "")[:16])] for a in waiting]
+    return [html.section(
+        f"Proof of delivery posted, report outstanding ({len(waiting)})",
+        html.table(["Receipt", "Purchase order", "Record", "POD posted"], rows,
+                   empty="Nothing is waiting.", table_id="awaiting-report",
+                   page_size=25, date_column="POD posted"),
+        note=("The receipt exists in Spitfire with the proof of delivery attached. Press "
+              "Post report on the record to finish it — the receipt stays In Process either way, "
+              "so nothing is routed and no one is emailed."),
+    )]
+
+
+def _blocked_from_posting(conn: sqlite3.Connection) -> list:
+    """Records the gate refused, grouped by the reason it gave.
+
+    Grouped rather than listed because the shape of the answer is lopsided and a flat list hides
+    it: `received_by` is missing on 27 of 29 live records, and twenty-seven identical sentences
+    read as twenty-seven separate problems when they are one data question for Premier. A count
+    against a reason says which single thing to fix first.
+
+    Reasons that carry figures — "the email says 18 EA and the purchase order says 19 EA" — are
+    each their own group, correctly: those are genuinely separate problems and each needs its own
+    look.
+    """
+    blocked = post_ledger.blocked(conn)
+    if not blocked:
+        return []
+
+    by_reason: "OrderedDict[str, list]" = OrderedDict()
+    for attempt in sorted(blocked, key=lambda a: a.detail):
+        by_reason.setdefault(attempt.detail or "no reason recorded", []).append(attempt)
+
+    rows = []
+    for reason, attempts in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+        pos = sorted({a.po_number for a in attempts if a.po_number})
+        rows.append([
+            html.badge(str(len(attempts)), "hold"),
+            reason,
+            ", ".join(pos[:6]) + ("…" if len(pos) > 6 else "") or html.muted("—"),
+            html.when((attempts[0].last_attempt_at or attempts[0].claimed_at or "")[:16]),
+        ])
+    return [html.section(
+        f"Blocked from posting ({len(blocked)})",
+        html.table(["Records", "Why the post was refused", "Purchase orders", "Last tried"],
+                   rows, empty="Nothing is blocked.", table_id="blocked-posting",
+                   page_size=25, date_column="Last tried"),
+        note=("Nothing was sent to Spitfire for these. The Post button stays live on the Records "
+              "page — fix what the reason names and press it again; there is nothing to clear "
+              "here. A record that has since posted drops off this list on its own."),
+    )]
+
+
+def _emails_with_a_possible_pod(conn: sqlite3.Connection) -> set:
+    """Emails that could yield a proof of delivery, in one query.
+
+    Deliberately a *superset* of what `spitfire_post._pod_for` will accept: any non-inline
+    attachment already flagged `is_pod`, plus any PDF, because `_pod_for` re-reads a PDF that
+    carries no stored verdict. Erring wide is the safe direction — this decides whether the Post
+    button is drawn at all, and hiding a button on a record that would actually post is a worse
+    failure than showing one that then refuses.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT email_id FROM attachment_ledger "
+        "WHERE COALESCE(is_inline, 0) = 0 "
+        "  AND (COALESCE(is_pod, 0) = 1 OR sniffed_kind = 'pdf')").fetchall()
+    return {r[0] for r in rows}
+
+
+def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
+    """The Post control for one row, at whichever of the two stages it has reached.
+
+    Posting is two steps a person takes separately — the proof of delivery, then the receiver
+    report — so this renders one button at a time and nothing once both are done. A control whose
+    only possible outcome is a refusal is not offered at all: it teaches people to ignore
+    refusals, and the two cases where that is knowable without calling Spitfire (no POD to upload,
+    required fields still missing) are cheap to check here.
+
+    What is *not* pre-judged is anything needing a live purchase-order read — an over-receive, a
+    quantity that moved. Those still refuse on click, and the reason lands on the cell afterwards.
+    """
+    verify = html.verify_button(
+        f"/ui/records/{record['id']}/verify-pod", "Verify POD",
+        title="Re-read the POD from Spitfire and re-check its hash", small=True, ghost=True)
+
+    # Offline is a third certain-and-cheap refusal, alongside "no POD" and "N gaps" below: no write
+    # can reach Spitfire from off Premier's network, so no Post button is drawn. What already
+    # happened still shows — a receipt posted last week is a fact, not a control — and Verify POD
+    # survives because re-checking a stored file's hash reads from the catalog, which replays.
+    offline = spitfire_cassette.writes_refused()
+
+    if attempt is not None and attempt.state == post_ledger.POSTED:
+        return html.Raw(str(html.muted(f"Posted {attempt.receipt_doc_no}".rstrip()))
+                        + " " + str(verify))
+
+    if attempt is not None and attempt.state == post_ledger.POD_POSTED:
+        # The state the split introduced: a real receipt in Premier's ERP carrying proof of
+        # delivery and no report. Named on the row rather than left to be inferred from a missing
+        # button, because a half-finished write to an ERP is not something to discover later.
+        # Offline, the "report pending" badge is the half that still matters — it says a real
+        # receipt is unfinished — so it stays and only the button it belongs to goes.
+        report = html.muted("offline") if offline else html.verify_button(
+            f"/ui/records/{record['id']}/post-report/confirm", "Post report",
+            title=f"Add the receiver report to receipt {attempt.receipt_doc_no}".rstrip(),
+            small=True, ghost=True)
+        return html.Raw(
+            str(report) + " " + str(verify) + " " + str(html.badge("report pending", "warn")))
+
+    if attempt is not None and attempt.state == post_ledger.PARTIAL:
+        # Deliberately not a button. Retrying would create a second receipt beside the half-built
+        # one, which is the failure the ledger exists to prevent.
+        return html.badge("Partial", "warn")
+    if attempt is not None and attempt.state == post_ledger.CLAIMED:
+        return html.muted("Posting…")
+
+    # Nothing posted yet. Three refusals are certain and cheap to know, so no button is drawn for
+    # them — the cell says which one instead, so the diagnosis stays where the reviewer is looking.
+    if offline:
+        return html.muted("offline")
+
+    waived_by = str(_maybe(record, "pod_waived_by") or "").strip()
+    if not has_pod and not waived_by:
+        # Was a dead end: the cell said "no POD" and nothing on the page could act on it, so every
+        # delivery stated in an email body — most Authority Inbound notifications — was permanently
+        # stuck. It is still not a Post button. Automation may not decide that a receipt can go to
+        # Premier's ERP with no proof behind it; a named person may, on a page that says so.
+        return html.Raw(
+            str(html.muted("no POD")) + " "
+            + str(html.tag("a", "Accept anyway", class_="btn ghost small",
+                           href=f"/ui/records/{record['id']}/waive-pod",
+                           title="Record that this delivery has no proof document and may be "
+                                 "posted without one")))
+
+    gaps = completeness.gaps(record)
+    if gaps.missing_required:
+        return html.muted(f"{len(gaps.missing_required)} gaps")
+
+    if attempt is not None and attempt.state == post_ledger.FLAGGED:
+        # The button stays: whatever blocked it may since have been fixed, and the ledger will let
+        # the post through the moment it is. What changes is that the reason is on the cell, so a
+        # reviewer reads it without a click — and without the live purchase-order read a click
+        # costs. The attempt count is there because "refused 6x" is the signal that somebody keeps
+        # trying something that needs a different fix.
+        again = f" · tried {attempt.attempts}×" if attempt.attempts > 1 else ""
+        return html.Raw(
+            str(html.verify_button(
+                f"/ui/records/{record['id']}/post-pod/confirm", "Post POD",
+                title=f"Last refused: {attempt.detail}{again}", small=True, ghost=True))
+            + " " + str(html.badge("blocked", "hold")))
+
+    if not has_pod:
+        return html.Raw(
+            str(html.verify_button(
+                f"/ui/records/{record['id']}/post-pod/confirm", "Post receipt",
+                title=(f"Create a receipt on PO {record['po_number']}. It will carry no proof of "
+                       f"delivery — accepted by {waived_by}."),
+                small=True, ghost=True))
+            + " " + str(html.badge("no proof", "warn")))
+
+    return html.verify_button(
+        f"/ui/records/{record['id']}/post-pod/confirm", "Post POD",
+        title=f"Create a receipt on PO {record['po_number']} and attach the proof of delivery",
+        small=True, ghost=True)
+
+
+def _maybe(row, name):
+    """One column that may be absent — a row built by a test, or read before the column existed."""
+    try:
+        return row[name]
+    except (IndexError, KeyError, TypeError):
+        return getattr(row, name, None)
+
+
+def _post_outcome_fragment(*, ok: bool, heading: str, message: str,
+                           result=None) -> html.Raw:
+    """What the dialog shows afterwards.
+
+    The steps are listed even on success, because "posted" alone does not tell a reviewer that the
+    pay requests were linked or that one of them was not — and on a partial post the list is the
+    only record of how far it got that a person will actually read.
+    """
+    parts = [html.tag("h3", heading),
+             html.tag("p", message, class_="" if ok else "warn")]
+    if result is not None and result.receipt_doc_no:
+        parts.append(html.tag("p", html.Raw(
+            f"Receipt {_escape(result.receipt_doc_no)} on purchase order "
+            f"{_escape(result.po_number)}. It is left <strong>In Process</strong> and has not "
+            f"been routed, so the purchase order will show nothing received until it is approved.")
+        ))
+    if result is not None and result.steps:
+        parts.append(html.tag("ul", *[html.tag("li", s) for s in result.steps]))
+    return html.Raw("".join(str(p) for p in parts))
 
 
 @router.post("/records/verify", response_class=HTMLResponse)
@@ -427,7 +958,25 @@ def verify_all_fragment(conn: sqlite3.Connection = Depends(deps.get_pipeline_con
     if not rows:
         return str(html.tag("p", "There are no records to verify.", class_="empty"))
     results = po_verify.verify_records(conn, rows)
-    return str(_verification_summary(results))
+
+    # Same rule as the single-record route, applied across the page: an exact spec match whose
+    # quantity agrees is written onto the record, anything weaker is left for a person. Doing this
+    # here as well as there is the difference between "Verify all" being a report and being the
+    # step that actually makes records postable.
+    by_id = {r["id"]: r for r in rows}
+    kept = [outcome for outcome in
+            (record_completion.apply_verification(conn, by_id[v.record_id], v)
+             for v in results if v.record_id in by_id)
+            if outcome.ok]
+
+    banner = ""
+    if kept:
+        complete_now = sum(1 for outcome in kept if outcome.is_complete)
+        banner = str(html.banner(
+            f"{len(kept)} purchase-order line(s) recorded from an exact spec match — "
+            f"{complete_now} record(s) are now complete. Lines matched on description alone were "
+            f"left for a person.", kind="good"))
+    return banner + str(_verification_summary(results))
 
 
 def _verification_summary(results) -> html.Raw:
@@ -494,33 +1043,118 @@ def _verification(result) -> html.Raw:
                           class_="note"))
 
     if result.matched:
-        parts.append(_matched_line(result.matched))
+        parts.append(_matched_line(result.matched, result.vendor_name,
+                                   result.record_vendor_name))
     parts.append(html.tag("ul", *[html.tag("li", note) for note in result.notes],
                           class_="vfindings"))
+    if result.matched and not result.matched.spec_resolved:
+        parts.append(_line_alternatives(result))
     return html.tag("div", *parts, class_="vrec")
 
 
-def _matched_line(check) -> html.Raw:
+def _line_alternatives(result) -> html.Raw:
+    """The other receivable lines on this purchase order, offered only when the spec did not
+    resolve the match.
+
+    A description match is a weaker claim than a spec match — the popup already says so — but
+    saying it without offering anything to check leaves a reader with a warning and no way to act
+    on it. These buttons re-run the same comparison against a line the reader picks.
+
+    Deliberately not shown when the spec resolved the line. A chooser on a confident match invites
+    second-guessing the one signal that is actually reliable, and every extra line offered is a
+    chance to pick the wrong one.
+    """
+    lines = getattr(result, "line_options", None) or []
+    others = [l for l in lines
+              if result.matched is None or l.line_number != result.matched.line_number]
+    if not others:
+        return html.Raw("")
+
+    rows = []
+    for opt in others:
+        rows.append(html.tag(
+            "tr",
+            html.tag("td", f"{opt.line_number:04d}" if opt.line_number is not None else "—"),
+            html.tag("td", opt.spec_code or html.muted("—")),
+            html.tag("td", opt.description or html.muted("—"), class_="t"),
+            html.tag("td", f"{po_verify.fmt_qty(opt.qty_ordered)} {opt.unit_of_measure}",
+                     class_="n"),
+            html.tag("td", f"{po_verify.fmt_qty(opt.qty_outstanding)} {opt.unit_of_measure}",
+                     class_="n"),
+            html.tag("td", html.verify_button(
+                f"/ui/records/{result.record_id}/verify?line={opt.line_number}",
+                "Compare",
+                title=f"Compare this record against line {opt.line_number:04d} instead",
+                small=True, ghost=True)),
+        ))
+    return html.tag(
+        "details",
+        html.tag("summary", f"Compare against a different line ({len(others)} other"
+                            f"{'s' if len(others) != 1 else ''} on this PO)"),
+        html.tag("table",
+                 html.tag("thead", html.tag("tr", *[html.tag("th", h) for h in
+                          ("Line", "Spec", "Description", "Ordered", "Outstanding", "")])),
+                 html.tag("tbody", *rows), class_="vq"),
+        class_="valt")
+
+
+def _matched_line(check, vendor_name: str = "", record_vendor: str = "") -> html.Raw:
     """The comparison table. Two columns because they are two different claims.
 
-    The quantity row is tinted only where the two sides can actually be compared — a row with no
-    email quantity is neither agreement nor disagreement, and colouring it either way would assert
-    something the data does not say.
+    Spec, description and vendor come first because they are what a reader is checking — whether
+    this is the same *item* — and the quantities only mean anything once that is settled. The
+    earlier version of this table opened on Quantity and showed the description once, truncated to
+    90 characters in the heading, which put the numbers first and hid the thing they depend on.
+
+    Descriptions are not truncated here. Spitfire's run to a thousand characters and carry the
+    model numbers and finishes that distinguish two otherwise identical lines — cutting them is
+    what would make two different items look like one.
+
+    Rows are tinted only where the two sides can actually be compared. A row with nothing on one
+    side is neither agreement nor disagreement, and colouring it either way would assert something
+    the data does not say.
     """
     line_label = f"line {check.line_number:04d}" if check.line_number is not None else "a line"
-    heading = html.tag(
-        "p",
-        f"Spec {check.spec_code or '—'} resolved {line_label}" if check.spec_resolved
-        else f"Description resolved {line_label}",
-        html.tag("span", f" — {check.description[:90]}", class_="muted"),
-        class_="note",
-    )
+    if getattr(check, "reviewer_chose", False):
+        how = f"A reviewer chose {line_label}"
+    elif check.spec_resolved:
+        how = f"Spec {check.spec_code or '—'} resolved {line_label}"
+    else:
+        how = f"Description resolved {line_label}"
+    heading = html.tag("p", how, class_="note")
 
-    def row(label, email_cell, po_cell, state=""):
+    def row(label, email_cell, po_cell, state="", numeric=True):
+        kind = "n" if numeric else "t"
         return html.tag("tr",
                         html.tag("th", label),
-                        html.tag("td", email_cell, class_=f"n {state}".strip() or None),
-                        html.tag("td", po_cell, class_="n"))
+                        html.tag("td", email_cell, class_=f"{kind} {state}".strip()),
+                        html.tag("td", po_cell, class_=kind))
+
+    def agreement(ours, theirs):
+        """Tint only when both sides said something. Compared case- and space-insensitively:
+        `STE-402-LT-B` and `ste-402-lt-b ` are the same claim, and flagging them as a difference
+        would train a reader to ignore the colour."""
+        a, b = (ours or "").strip().casefold(), (theirs or "").strip().casefold()
+        if not a or not b:
+            return ""
+        return "same" if a == b else "diff"
+
+    def name_agreement(ours, theirs):
+        """Vendor names, where a legal suffix is not a disagreement.
+
+        Live example, PO 208491: the mail says `Light Annex`, the purchase order says
+        `Light Annex, LLC`. Marking that red is the same mistake `UOM_ALIASES` exists to prevent —
+        a warning that fires on a difference that is not one teaches a reader to ignore the colour,
+        and then the real mismatch goes past unnoticed.
+
+        One side being a prefix of the other is treated as agreement. Anything else is left
+        untinted rather than called a difference: two vendor names that merely look unalike may
+        still be the same company trading under another name, and this screen does not know.
+        """
+        a, b = (ours or "").strip().casefold().rstrip(".,"), (theirs or "").strip().casefold().rstrip(".,")
+        if not a or not b:
+            return ""
+        return "same" if a == b or a.startswith(b) or b.startswith(a) else ""
 
     qty_state = ""
     if check.qty_agrees is True:
@@ -533,7 +1167,26 @@ def _matched_line(check) -> html.Raw:
     elif check.uom_agrees is False:
         uom_state = "diff"
 
+    record_spec = getattr(check, "record_spec", None)
+    record_desc = getattr(check, "record_description", None)
+
+    # When the parent spec resolved the line, the two codes genuinely differ but the match is still
+    # exact — on the parent. Showing the bare sub-spec against the line's code would tint the row
+    # red and contradict the note beside it, which says the line is right.
+    if getattr(check, "matched_on_parent", False):
+        spec_cell = html.Raw(f"{html.esc(record_spec or '')} "
+                             f"{html.tag('span', f'(parent {check.spec_code})', class_='muted')}")
+        spec_state = "same"
+    else:
+        spec_cell = record_spec or html.muted("—")
+        spec_state = agreement(record_spec, check.spec_code)
+
     body = [
+        row("Spec", spec_cell, check.spec_code or html.muted("—"), spec_state, numeric=False),
+        row("Description", record_desc or html.muted("—"), check.description or html.muted("—"),
+            "", numeric=False),
+        row("Vendor", record_vendor or html.muted("—"), vendor_name or html.muted("—"),
+            name_agreement(record_vendor, vendor_name), numeric=False),
         row("Quantity",
             f"{po_verify.fmt_qty(check.record_quantity)} {check.record_uom or ''}".strip(),
             f"{po_verify.fmt_qty(check.qty_ordered)} ordered", qty_state),
@@ -548,7 +1201,7 @@ def _matched_line(check) -> html.Raw:
     table = html.tag(
         "table",
         html.tag("thead", html.tag("tr", html.tag("th", ""), html.tag("th", "From the email"),
-                                   html.tag("th", "On the purchase order"))),
+                                   html.tag("th", "On the purchase order (in Spitfire)"))),
         html.tag("tbody", *body),
         class_="vq",
     )
@@ -565,6 +1218,316 @@ def receiver_download(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="Receiver_Report_{stamp}.xlsx"'},
     )
+
+
+# --- Creating a record by hand ------------------------------------------------------------------
+#
+# The path for mail the pipeline could not finish: an image-only body, a portal link instead of an
+# attachment, a property reply saying "Yes ma'am, this was received!" and naming no purchase order.
+# Premier's own staff complete those here rather than the work being dropped.
+#
+# A whole page rather than a dialog fragment, deliberately. A refused submission has to come back
+# carrying what the reviewer typed, and re-rendering a page does that with no JavaScript at all —
+# these pages spend exactly one inline script and it is not for this. It is also a long form with
+# an attachment chooser in it, which a modal would crush.
+#
+# Nothing here writes to Spitfire. It writes one row to our own store, and that row then goes
+# through exactly the same eight gates as every extracted record.
+
+_UNIT_HINT = ("Optional — taken from the purchase order line when it is left blank. "
+              "Fill it only if the email states a unit the order does not.")
+
+
+
+def _mandatory_fields(values, missing=()) -> list:
+    """The five facts only the delivery notification can supply. Everything else is derived.
+
+    Rendered from `completeness.REQUIRED` rather than from a list written out here, so shrinking or
+    widening that tuple changes the form with it. The two lists silently disagreeing is how a form
+    starts collecting a field nothing needs, or stops collecting one that blocks every post.
+    """
+    labels = {
+        "po_number": ("PO number", "The purchase order in Spitfire these goods were ordered on."),
+        "spec_code": ("Spec code", "As Premier names the item — STE-402-LT-B, GR-350a-WTF."),
+        "item_description": ("Description", "What arrived, in the words the paperwork uses."),
+        "quantity_received": ("Quantity received",
+                              "Items, not packages. A header saying 41 CTN against a line saying "
+                              "11 EA means eleven items in forty-one cartons — record the eleven."),
+        "pod_stated_date": ("Delivery date",
+                            "The day the goods actually arrived, as the proof or the message "
+                            "states it. Not the day the email was sent."),
+    }
+    out = []
+    for name in completeness.REQUIRED:
+        label, hint = labels.get(name, (completeness.LABELS.get(name, name), ""))
+        out.append(html.field(name, label, values.get(name, ""), required=True, hint=hint))
+    return out
+
+
+def _pod_chooser(conn, email_id: str, chosen) -> html.Raw:
+    """Which file on this message is the proof of delivery — or an explicit statement that none is.
+
+    Every non-inline attachment is offered whatever its type or disposition. The three cases this
+    exists for are all files the automatic rules skip: a photographed delivery note (they re-read
+    PDFs only, because OCR is a paid call), a POD naming another purchase order (rejected outright),
+    and a proof that is not a carrier POD at all.
+
+    A file whose bytes were never kept is shown disabled rather than hidden. "The POD is that one
+    and we no longer have it" is a different problem from "there was no POD", and only the first is
+    ours.
+    """
+    options = []
+    for row in record_create.choosable_attachments(conn, email_id):
+        usable = record_create.has_bytes(conn, dict(row, email_id=email_id))
+        marks = []
+        if row["is_pod"]:
+            marks.append(html.badge("reads as a POD", "pod"))
+        if row["pod_po_numbers"]:
+            marks.append(html.muted(f" names PO {row['pod_po_numbers']}"))
+        if not usable:
+            marks.append(html.badge("bytes not stored", "error"))
+        label = html.Raw(
+            str(html.tag("b", row["filename"] or "(unnamed)")) + " "
+            + str(html.muted(f"· {row['sniffed_kind'] or 'unknown'} · {_num(row['size_bytes'])} B"))
+            + " " + " ".join(str(m) for m in marks))
+        options.append(html.tag(
+            "div",
+            html.radio("pod_ledger_id", str(row["id"]), label,
+                       checked=(str(chosen or "") == str(row["id"]))),
+            # The viewer, not the raw route: it renders markup we built, or a sandboxed iframe with
+            # no `allow-scripts`. Choosing a proof means looking at it first.
+            html.tag("button", "Open", type="button", class_="btn ghost small",
+                     data_frag=(f"/ui/mail/attachment/view?id={quote(email_id)}"
+                                f"&n={row['ordinal']}&src={html.DEFAULT_MAIL_SOURCE}"),
+                     data_frag_title=f"Attachment — {row['filename'] or 'file'}"),
+            class_="pod-option"))
+
+    none_note = ("Most Authority Inbound notifications state the whole delivery in a table in the "
+                 "body and attach nothing. Choosing this means the receipt in Spitfire will carry "
+                 "no proof document — only the receiver report — and your name is recorded against "
+                 "that decision.")
+    options.append(html.radio(
+        "pod_ledger_id", "none",
+        html.Raw(str(html.tag("b", "No attachment — the message body is the proof"))),
+        checked=(str(chosen or "") == "none"), hint=none_note))
+
+    return html.section(
+        "Proof of delivery",
+        *options,
+        note=("Pick the file that proves this delivery, or say there is none. Nothing is assumed: "
+              "a record cannot be created until one of these is chosen."),
+    )
+
+
+def _create_form(conn, email_id: str, *, values=None, chosen=None, created_by="",
+                 note_text="", problem=None) -> str:
+    """The form itself, rendered fresh or re-rendered after a refusal carrying what was typed."""
+    values = values if values is not None else record_create.prefill(conn, email_id)
+    subject = conn.execute("SELECT subject FROM email_log WHERE email_id = ?",
+                           (email_id,)).fetchone()
+    subject = (subject[0] if subject else "") or "(no subject)"
+
+    parts = []
+    if problem is not None:
+        parts.append(html.errors(problem.message, problem.missing))
+
+    parts.append(html.section(
+        "The message",
+        html.tag("p", subject, class_="lede"),
+        html.tag("p", html.mail_link(email_id, "Open the message and its attachments",
+                                     title="Read what this record is being built from")),
+        note="Everything below describes this one message. Read it before recording anything.",
+    ))
+
+    parts.append(html.section(
+        "What arrived",
+        *_mandatory_fields(values),
+        html.field("unit_of_measure", "Unit", values.get("unit_of_measure", ""),
+                   hint=_UNIT_HINT),
+        note=("These five are the facts only the delivery notification can carry. Vendor, PO line "
+              "number and who signed for the goods are deliberately not asked for — they come from "
+              "the purchase order and from the proof of delivery, which already hold them."),
+    ))
+
+    parts.append(_pod_chooser(conn, email_id, chosen))
+
+    parts.append(html.section(
+        "You",
+        html.field("created_by", "Your name", created_by, required=True,
+                   hint="Recorded against this record for good, and printed in the Receiver "
+                        "column of the report."),
+        html.textarea("note", "Note (optional)", note_text,
+                      hint="Anything the next person needs to know about why this was entered by "
+                           "hand."),
+    ))
+
+    body = html.form("/ui/records/new", html.tag("input", type="hidden", name_="email_id",
+                                                 value=email_id),
+                     *parts, submit="Create the record", cancel="/ui/manual",
+                     cancel_label="Back to Needs a human")
+    return html.page("Create a record", "/ui/manual", body, **_chrome(conn))
+
+
+@router.get("/records/new", response_class=HTMLResponse)
+def new_record_form(email_id: str = "",
+                    conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Open the form on one message, pre-filled with whatever was already worked out about it."""
+    if not email_id:
+        return html.page("Create a record", "/ui/manual",
+                         html.section("Create a record",
+                                      html.tag("p", "Open this from a message on the Needs a "
+                                                    "human page — a record is always built from "
+                                                    "one.", class_="empty")),
+                         **_chrome(conn))
+    if conn.execute("SELECT 1 FROM email_log WHERE email_id = ?", (email_id,)).fetchone() is None:
+        raise HTTPException(status_code=404, detail="no such message")
+    return _create_form(conn, email_id)
+
+
+@router.post("/records/new", response_class=HTMLResponse)
+async def create_record(request: Request):
+    """Create it, or come back saying exactly what was wrong.
+
+    The kill switch is honoured even though nothing here reaches Spitfire: a stop means the system
+    is not to act, and staging a record that the next press of Post would send is acting.
+
+    The connection is opened here rather than through `Depends(deps.get_pipeline_conn)`, matching
+    the other POST handlers in this file. A sync dependency is resolved in a worker thread while an
+    async handler runs on the event loop, and a sqlite connection is bound to the thread that
+    created it — so the pair raises "SQLite objects created in a thread can only be used in that
+    same thread" the moment the handler touches it.
+    """
+    posted = await _form_values(request)
+    email_id = posted.get("email_id", "")
+    created_by = posted.get("created_by", "")
+    pod_ledger_id = posted.get("pod_ledger_id", "")
+    note = posted.get("note", "")
+    values = {name: posted.get(name, "") for name in
+              ("po_number", "spec_code", "item_description", "quantity_received",
+               "unit_of_measure", "pod_stated_date")}
+    conn = deps.pipeline_connection()
+    try:
+        if killswitch.is_stopped():
+            stopped = record_create.Created(
+                ok=False,
+                message="the kill switch is engaged — release it before recording anything.")
+            return HTMLResponse(_create_form(conn, email_id, values=values, chosen=pod_ledger_id,
+                                             created_by=created_by, note_text=note,
+                                             problem=stopped))
+
+        chosen = None if pod_ledger_id in ("", "none") else _int_or_none(pod_ledger_id)
+        result = record_create.create(
+            conn, email_id=email_id, created_by=created_by, values=values,
+            pod_ledger_id=chosen, waive_pod=(pod_ledger_id == "none"), note=note)
+
+        if not result.ok:
+            return HTMLResponse(_create_form(conn, email_id, values=values, chosen=pod_ledger_id,
+                                             created_by=created_by, note_text=note,
+                                             problem=result))
+    finally:
+        conn.close()
+    # 303: the browser must follow with a GET, or a refresh on the Records page re-submits the form
+    # and stages the delivery twice.
+    return RedirectResponse(f"/ui/records?created={result.record_id}", status_code=303)
+
+
+def _int_or_none(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# --- Accepting a delivery that has no proof ------------------------------------------------------
+#
+# A page rather than a dialog, for the same reason the create form is one: this is a decision with
+# a consequence in Premier's ERP, it has to be explained before it is taken, and it has to be
+# signed. A modal with one button invites the reflex press this must not have.
+
+
+def _waive_page(conn, record_id: int, *, by: str = "", problem: str = "") -> str:
+    row = _any_record_or_none(conn, record_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such record")
+
+    already = str(_maybe(row, "pod_waived_by") or "").strip()
+    if already:
+        body = html.section(
+            "Already accepted",
+            html.tag("p", f"Record #{record_id} was accepted without a proof of delivery by "
+                          f"{already}. That decision stands — the first name is the one that took "
+                          f"the risk."),
+            html.tag("p", html.tag("a", "Back to Records", href="/ui/records", class_="btn")),
+        )
+        return html.page("Accept without a proof", "/ui/records", body, **_chrome(conn))
+
+    parts = []
+    if problem:
+        parts.append(html.errors(problem))
+    parts.append(html.section(
+        f"Record #{record_id} — {row['po_number']}",
+        html.tag("p", f"{_num(row['quantity_received'])} {row['unit_of_measure'] or ''} of "
+                      f"{row['spec_code'] or 'this item'}, delivered "
+                      f"{row['pod_stated_date'] or 'on an unstated date'}.", class_="lede"),
+        html.tag("p", html.mail_link(row["source_email_id"], "Read the message first",
+                                     title="What this record was built from")),
+        note=("No file on this message could be read as a proof of delivery. Most Authority "
+              "Inbound notifications are like this: the whole delivery is stated in a table in "
+              "the body and nothing is attached."),
+    ))
+    parts.append(html.section(
+        "What accepting means",
+        html.tag("ul",
+                 html.tag("li", "A receipt is created in Spitfire against this purchase order, "
+                                "with no proof document attached to it."),
+                 html.tag("li", "The receiver report is still built and attached, so the receipt "
+                                "is not empty — but Premier's ERP will hold nothing showing the "
+                                "goods arrived."),
+                 html.tag("li", "The email stays here as the audit trail, and your name is "
+                                "recorded against this decision for good.")),
+        html.form(f"/ui/records/{record_id}/waive-pod",
+                  html.field("by", "Your name", by, required=True,
+                             hint="Recorded on the record and carried into the ledger entry for "
+                                  "the post."),
+                  submit="Accept without a proof of delivery",
+                  cancel="/ui/records", cancel_label="Back to Records"),
+        note="Nothing is sent to Spitfire by this page. It unblocks the Post button, which is "
+             "still a separate press.",
+    ))
+    return html.page("Accept without a proof", "/ui/records", *parts, **_chrome(conn))
+
+
+@router.get("/records/{record_id}/waive-pod", response_class=HTMLResponse)
+def waive_pod_form(record_id: int,
+                   conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Explain what accepting a POD-less delivery means, and ask who is accepting it."""
+    return _waive_page(conn, record_id)
+
+
+@router.post("/records/{record_id}/waive-pod", response_class=HTMLResponse)
+async def waive_pod(record_id: int, request: Request):
+    """Accept that a record has no proof of delivery and may post anyway.
+
+    The other half of the body-only path. Extraction stages these from Inbound notifications that
+    attach nothing, `post_decision` refuses every one, and without this nothing could ever unblock
+    them — while automation still must never make that call for itself.
+
+    Writes nothing outbound. It is the control that lets a write happen later, so it is guarded
+    like one, and the name it records is what the ledger will carry.
+    """
+    by = (await _form_values(request)).get("by", "").strip()
+    conn = deps.pipeline_connection()
+    try:
+        if killswitch.is_stopped():
+            return HTMLResponse(_waive_page(
+                conn, record_id, by=by,
+                problem="the kill switch is engaged — release it before accepting anything."))
+        result = record_create.waive_pod(conn, record_id, by=by)
+        if not result.ok:
+            return HTMLResponse(_waive_page(conn, record_id, by=by, problem=result.message))
+    finally:
+        conn.close()
+    return RedirectResponse(f"/ui/records?waived={record_id}", status_code=303)
 
 
 @router.get("/manual", response_class=HTMLResponse)
@@ -603,6 +1566,15 @@ def manual_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> s
             else html.muted("—"),
             i.subject[:45] or html.muted("—"), html.when(i.when[:16]),
             i.reason, i.detail or html.muted("—"),
+            # The way out of this queue. Every row here is work the pipeline could not finish, and
+            # until this existed the page could only say so — a person could read the message and
+            # had nowhere to put what they learned from it.
+            #
+            # A link, not a `button_form`: the target is a page to land on and filling it in has no
+            # effect until it is submitted, so a prefetch can do no harm. Record rows are excluded
+            # — those already have a record, and the fix for them is the Complete control on the
+            # Records page rather than a second row for the same delivery.
+            _create_link(i.email_id) if kind != "record" else html.muted("—"),
         ] for i in group]
         sections.append(html.section(
             f"{title} ({len(group)})",
@@ -610,13 +1582,17 @@ def manual_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> s
             # it `_store_for` resolves to the retired `.msg` corpus — so every row on this page
             # reported its message missing, having searched a folder of test files for Premier's
             # live mail.
-            html.table(["What", "PO", "Email", "When", "Why it needs a person", "Detail"],
-                       rows, empty="Nothing in this group.",
+            html.table(["What", "PO", "Email", "When", "Why it needs a person", "Detail", ""],
+                       rows, empty="Nothing in this group.", no_sort=("",),
                        table_id=f"manual-{kind}", page_size=25, date_column="When",
                        frag_urls=[html.mail_url(i.email_id, i.reason) for i in group],
                        frag_title="Open this message"),
             note=note,
         ))
+    sections.extend(_awaiting_report(conn))
+    sections.extend(_posted_receipts(conn))
+    sections.extend(_blocked_from_posting(conn))
+
     if not items:
         # One "nothing here" panel in place of three empty groups — but *keeping* whatever came
         # before it. This used to rebuild the list from scratch, which also threw away the search
@@ -628,6 +1604,15 @@ def manual_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> s
     sections.append(_filtered_section(conn))
     return html.page("Needs a human", "/ui/manual", *sections,
                      **_chrome(conn))
+
+
+def _create_link(email_id) -> html.Raw:
+    """"Create a record" for one message, or nothing if there is no message to build it from."""
+    if not email_id:
+        return html.muted("—")
+    return html.tag("a", "Create a record", class_="btn ghost small",
+                    href=f"/ui/records/new?email_id={quote(str(email_id))}",
+                    title="Record this delivery by hand, from what this message says")
 
 
 def _filtered_section(conn: sqlite3.Connection) -> html.Raw:
@@ -718,6 +1703,162 @@ def po_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
     )
     return html.page("Delivery status", "/ui/po", body, caveat,
                      **_chrome(conn))
+
+
+def _size(value) -> str:
+    """Bytes a person can read at a glance. The corpus runs from a 1 KB logo to a 3 MB photograph,
+    and `3236138` in a column does not communicate the difference."""
+    size = int(value or 0)
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size} B"
+
+
+def _po_evidence(row) -> html.Raw:
+    """Which purchase order(s) this attachment belongs to, and on whose word.
+
+    Three sources, and the difference between them is the point rather than a detail:
+
+      * **the file itself** names the PO — `parse_pod` read it out of the document. This is the
+        only one strong enough to hang the file on a receipt in Premier's ERP, and the only one
+        `spitfire_post._pod_for` will act on.
+      * **the email** names it (`email_log.po_hints`). The message is about that order; the
+        attachment merely arrived with it.
+      * **the records** extracted from that message name it. Weakest of the three — one tracker
+        spreadsheet reaches five purchase orders this way, on nothing but the envelope.
+
+    Only the strongest tier present is shown in full. The rest collapse to a count with the detail
+    on hover, because at fifty-five rows a column that lists everything is a column nobody reads.
+    """
+    def split(value):
+        return [p.strip() for p in str(value or "").replace(";", ",").split(",") if p.strip()]
+
+    in_file = split(row["pod_po_numbers"])
+    on_email = [p for p in split(row["email_po_hints"]) if p not in in_file]
+    via_records = [p for p in split(row["pos_via_records"])
+                   if p not in in_file and p not in on_email]
+
+    if in_file:
+        weaker = len(on_email) + len(via_records)
+        parts = [html.token(", ".join(in_file))]
+        if weaker:
+            parts.append(html.muted(f" +{weaker} more on the email"))
+        return html.Raw("".join(str(p) for p in parts))
+    if on_email:
+        shown = ", ".join(on_email[:2]) + (f" +{len(on_email) - 2}" if len(on_email) > 2 else "")
+        return html.tag("span", html.muted(f"email: {shown}"),
+                        title=f"the email names {', '.join(on_email)}; the file itself names none")
+    if via_records:
+        shown = ", ".join(via_records[:2]) + (f" +{len(via_records) - 2}"
+                                              if len(via_records) > 2 else "")
+        return html.tag("span", html.muted(f"records: {shown}"),
+                        title=(f"records from this email name {', '.join(via_records)}; neither "
+                               f"the file nor the email names a purchase order"))
+    return html.muted("—")
+
+
+_ATTACHMENT_DISPOSITIONS = {
+    "extracted": "good",
+    "dropped_decorative": "hide",
+    "dropped_duplicate": "hold",
+    "corrupt": "error",
+    "empty": "hold",
+    "not_dispatched": "plain",
+}
+
+
+@router.get("/attachments", response_class=HTMLResponse)
+def attachments_page(inline: str = "",
+                     conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Every file taken off every email, with what we know about each one.
+
+    The only page that answers "what have we actually got?". `/ui/manual` lists the attachments
+    needing attention and the mail dialog lists one message's worth; neither can show that the same
+    bytes arrived twice under different filenames, which is exactly what the two FedEx PDFs on the
+    210634 thread do.
+
+    Inline attachments are listed by default because they were downloaded too and the count on
+    screen should match the count in the database. `?inline=hide` puts them aside — they are
+    signature logos and letterhead, and they outnumber the real files better than two to one.
+    """
+    hide_inline = inline == "hide"
+    rows_in = read_views.attachments(conn, include_inline=not hide_inline)
+    total = len(read_views.attachments(conn))
+
+    rows = []
+    for a in rows_in:
+        pod = (html.Raw(str(html.badge("POD", "pod")) + " "
+                        + str(html.token(a["pod_po_numbers"] or "unnamed")))
+               if a["is_pod"] else html.muted("—"))
+        asserts = " · ".join(x for x in (a["pod_delivery_date"], a["pod_signed_by"]) if x)
+        stored = (html.token(a["stored_sha"][:10]) if a["stored_sha"]
+                  else html.badge("not stored", "error"))
+        view = f"/ui/mail/attachment/view?id={quote(a['email_id'])}&n={a['ordinal']}&src=inbox"
+        download = (f"/ui/mail/attachment?id={quote(a['email_id'])}&n={a['ordinal']}"
+                    f"&src=inbox&download=1")
+        rows.append([
+            a["id"],
+            html.when((a["email_date"] or a["first_seen_at"] or "")[:16]),
+            html.mail_link(a["email_id"], (a["email_subject"] or "(no subject)")[:38],
+                           title="Open the email this arrived on"),
+            # The filename opens the file itself. The row does too, but a filename that is not
+            # clickable reads as inert, and this is the cell a person aims at.
+            html.tag("button", (a["filename"] or "(unnamed)")[:44], type="button",
+                     class_="link-btn", data_frag=view, title="Open this attachment"),
+            html.badge(a["sniffed_kind"] or "unknown", "attachment"),
+            _size(a["size_bytes"]),
+            html.badge("inline", "hide") if a["is_inline"] else html.muted("—"),
+            _po_evidence(a),
+            pod,
+            asserts or html.muted("—"),
+            html.badge((a["disposition"] or "").replace("_", " "),
+                       _ATTACHMENT_DISPOSITIONS.get(a["disposition"], "plain")),
+            a["claimed_by"] or html.muted("—"),
+            a["records_extracted"] or html.muted("0"),
+            stored,
+            # View before Download, and both visible. The filename opens the file too, but a
+            # filename rendered as text carries no affordance — the page read as download-only
+            # even though the in-page viewer was there all along.
+            html.Raw(
+                str(html.tag("button", "View", type="button", class_="btn ghost small",
+                             data_frag=view, title="Open this file in the page"))
+                + " "
+                + str(html.tag("a", "Download", href=download, class_="btn ghost small"))),
+        ])
+
+    inline_count = sum(1 for a in read_views.attachments(conn) if a["is_inline"])
+    toggle = (html.tag("a", f"Show all {total}, including inline", href="/ui/attachments")
+              if hide_inline else
+              html.tag("a", f"Hide the {inline_count} inline images", href="/ui/attachments?inline=hide"))
+
+    body = html.section(
+        "Everything downloaded from every email",
+        html.search_box("attachments-table",
+                        placeholder="Search filename, kind, email, disposition…",
+                        label="Search attachments"),
+        html.date_filter("attachments-table", label="received"),
+        html.table(
+            ["#", "Received", "From email", "File", "Kind", "Size", "Inline", "PO", "POD",
+             "POD says", "Disposition", "Read by", "Records", "Stored", ""],
+            rows, empty="No attachments have been downloaded yet.",
+            table_id="attachments-table", page_size=50, date_column="Received",
+            no_sort=("", "File"),
+            frag_urls=[f"/ui/mail/attachment/view?id={quote(a['email_id'])}"
+                       f"&n={a['ordinal']}&src=inbox" for a in rows_in],
+            frag_title="Open this attachment",
+        ),
+        action=toggle,
+        note=(f"{len(rows_in)} of {total} attachment(s). "
+              f"Kind is what the bytes are, not what the sender called them. POD is decided once "
+              f"when the file is read — from a PDF's text, or from OCR on a photograph — so a "
+              f"blank there on a file that plainly is one means nothing has read it yet. "
+              f"A purchase order in black was named by the file itself; one in grey came from the "
+              f"email or from the records it produced, which ties the file to the order far more "
+              f"loosely and is not enough to attach it to a receipt."),
+    )
+    return html.page("Attachments", "/ui/attachments", body, **_chrome(conn))
 
 
 @router.get("/po/{po_number}", response_class=HTMLResponse)
@@ -885,7 +2026,11 @@ def mail_fragment(id: str = "", reason: str = "", images: int = 0, src: str = ""
         return '<p class="empty">No message was requested.</p>'
     db_path = _store_for(src)
     mail = mail_view.resolve(id, db_path=db_path)
-    return mail_view.render(
+    # Offered from the message itself, because that is where somebody works out that the pipeline
+    # missed something — reading the mail, not scanning the queue that listed it. Says what has
+    # already been made from this message rather than inviting a second record for one delivery.
+    header = _create_from_mail(id)
+    return header + mail_view.render(
         mail, reason=reason, remote_images=bool(images),
         # `src` is carried through so an attachment link inside the popup looks in the same store
         # the message itself came from.
@@ -896,6 +2041,35 @@ def mail_fragment(id: str = "", reason: str = "", images: int = 0, src: str = ""
         view_url=f"/ui/mail/attachment/view?id={quote(id)}&src={quote(src)}",
         db_path=db_path,
     )
+
+
+def _create_from_mail(email_id: str) -> str:
+    """The Create control, and what has already been built from this message.
+
+    Only offered for live mail: a record has to carry a `source_email_id` the rest of the system
+    can resolve, and the retired corpus store is not that. `_store_for` resolves an unknown `src`
+    to the corpus on purpose, so this asks the live store directly rather than trusting the caller.
+    """
+    conn = deps.pipeline_connection()
+    try:
+        known = conn.execute("SELECT 1 FROM email_log WHERE email_id = ?", (email_id,)).fetchone()
+        if known is None:
+            return ""
+        made = record_create.records_from(conn, email_id)
+    finally:
+        conn.close()
+
+    if made:
+        who = ", ".join(sorted({str(r["created_by"] or "somebody") for r in made}))
+        numbers = ", ".join(f"#{r['id']}" for r in made)
+        return str(html.tag(
+            "p",
+            html.muted(f"{len(made)} record(s) created from this message by hand ({numbers}, "
+                       f"by {who})."),
+            " ",
+            html.tag("a", "Records", href="/ui/records", class_="btn ghost small"),
+            class_="mail-created"))
+    return str(html.tag("p", _create_link(email_id), class_="mail-created"))
 
 
 @router.get("/mail/attachment/view", response_class=HTMLResponse)
@@ -1099,6 +2273,9 @@ def live_version_token() -> str:
     seconds about a number that could not move any faster than the thing it was waiting for. The
     arrivals signature moves within seconds of mail landing, and again when the pipeline reads it.
 
+    Prefixed with `_BOOT`, so a restarted server also counts as "something new to look at" — that
+    is what makes a code change visible in an already-open tab.
+
     Never raises. A version endpoint that 500s would make every page think it had new mail for ever.
     """
     try:
@@ -1123,7 +2300,7 @@ def live_version_token() -> str:
         run_id = last.id if last else 0
     except Exception:                                              # noqa: BLE001
         run_id = 0
-    return f"{newest}:{count}:{run_id}:{arrivals}"
+    return f"{_BOOT}:{newest}:{count}:{run_id}:{arrivals}"
 
 
 @router.get("/version")

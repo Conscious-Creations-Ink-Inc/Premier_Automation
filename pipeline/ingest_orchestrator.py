@@ -6,9 +6,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from config import settings
 from connectors.mailbox import Mailbox
 from pipeline import (
-    attachment_ledger, email_log, evidence, extracted_records_store, mail_arrivals,
-    stage2_accumulate, state_db,
-)
+    attachment_ledger, dedupe, email_log, evidence, extracted_records_store, mail_arrivals,
+    stage2_accumulate, state_db)
 from pipeline.models import DeliveryEvent, ExtractedRecord, TriageCategory
 from pipeline.stage1_ingest import fetch_new_emails
 from pipeline.parsing import text
@@ -122,15 +121,46 @@ def _log_email(conn, email, triaged, folder: str, now: str, *, evidence=None, er
         _log(f"email_log write failed for {email.email_id}: {e}")
 
 
-def _settle(mailbox, conn, email, triaged, folder: str, now: str, **log_kwargs) -> None:
+def _identify(conn, email, triaged):
+    """This message's content fingerprint, and the earlier message it duplicates if any.
+
+    Reads only. The stamp is written by `_settle`, *after* the `email_log` row exists —
+    `email_log.record` writes or overwrites the whole row, so anything stamped ahead of it is
+    erased, which left every message carrying `fingerprint = NULL` and made the lookup match
+    nothing.
+
+    Never raises. A fingerprint is bookkeeping about an email; failing to take one must not cost us
+    the email, and treating an error as "this is a duplicate" would silently drop a real delivery —
+    so the failure direction is deliberately towards processing it again rather than not at all.
+    """
+    try:
+        value = dedupe.fingerprint(
+            subject=email.subject,
+            origin_sender=triaged.origin_sender_address if triaged else None,
+            origin_sent_at=triaged.origin_sent_at if triaged else None,
+            attachment_hashes=dedupe.hashes_for_email(conn, email.email_id))
+        earlier = dedupe.find_by_fingerprint(conn, value, exclude_email_id=email.email_id)
+        return value, (str(earlier["email_id"]) if earlier is not None else None)
+    except Exception as e:                                     # noqa: BLE001
+        _log(f"fingerprint failed for {email.email_id}: {e}")
+        return "", None
+
+
+def _settle(mailbox, conn, email, triaged, folder: str, now: str,
+            fingerprint: str = "", duplicate_of=None, **log_kwargs) -> None:
     """The one exit path every email takes: record the verdict, mark it processed, move the mail.
 
     All three in one helper so no branch can do two of the three. In particular the seen-marker
     is written *here* rather than while fetching, so an email is only ever marked processed after
     it has been — see `state_db.mark_seen`. Order matters: the audit row first, because a folder
     move can fail and an unrecorded email cannot.
+
+    The fingerprint is stamped here for the same reason, and *after* the audit row: `email_log`
+    writes the whole row, so a stamp applied earlier is overwritten. Doing it on this one path is
+    what gives every message a fingerprint rather than only the ones that reached accumulation.
     """
     _log_email(conn, email, triaged, folder, now, **log_kwargs)
+    dedupe.stamp(conn, email.email_id, fingerprint, duplicate_of)
     state_db.mark_seen(conn, email.email_id, now)
     # The arrival watch may have shown this message on screen seconds after it landed, badged as
     # not yet read. This is the moment that stops being true, and stamping it here — on the one
@@ -429,29 +459,52 @@ def process_new_mail(
             triaged = triage(email, evidence=email_evidence)
             _stamp_triage_category(conn, email, triaged.category.value)
 
+            # Computed once for every message, whatever triage decided, so the fingerprint column
+            # is answerable across the whole mailbox rather than only for delivery mail. It is only
+            # *acted on* in the accumulate branch below — chatter and routed mail never reach the
+            # step that would double-count a delivery, so suppressing them would buy nothing and
+            # would hide a second copy of something a person still needs to read.
+            fingerprint, duplicate_of = _identify(conn, email, triaged)
+            settle = dict(fingerprint=fingerprint, duplicate_of=duplicate_of)
+
             # Every branch below logs *before* moving the mail: a folder-move hiccup is
             # survivable, an email that leaves no record is not.
             if oversize:
                 _log(f"quarantined {email.email_id}: {oversize}")
                 attachment_ledger.close_undispatched(conn, email, _now_iso())
                 _settle(mailbox, conn, email, triaged, settings.MAILBOX_FOLDER_QUARANTINE,
-                        _now_iso(), evidence=email_evidence, note=f"quarantined: {oversize}")
+                        _now_iso(), evidence=email_evidence, note=f"quarantined: {oversize}",
+                        **settle)
                 continue
             if triaged.category == TriageCategory.ROUTE:
                 _log(f"routed, no accumulation: {email.email_id} — {triaged.reason}")
                 attachment_ledger.close_undispatched(conn, email, _now_iso())
                 _settle(mailbox, conn, email, triaged, settings.MAILBOX_FOLDER_ROUTED,
-                        _now_iso(), evidence=email_evidence)
+                        _now_iso(), evidence=email_evidence, **settle)
                 continue
             if triaged.category == TriageCategory.HIDE:
                 # discarded — Stage 1's job is done, nothing more happens with it
                 attachment_ledger.close_undispatched(conn, email, _now_iso())
                 _settle(mailbox, conn, email, triaged, settings.MAILBOX_FOLDER_HIDDEN,
-                        _now_iso(), evidence=email_evidence)
+                        _now_iso(), evidence=email_evidence, **settle)
                 continue
+            # Has this exact notification already been through, under a different message id?
+            # `seen_message_ids` cannot answer that — a vendor re-send and a second expeditor's
+            # forward each get their own `internetMessageId` — so the same delivery accumulates
+            # twice and stages two records. Asked here, after triage (which is what recovers the
+            # originating sender and send time from the quoted headers) and before accumulation,
+            # which is the step that would double-count it.
+            if duplicate_of is not None:
+                _log(f"duplicate of {duplicate_of}: {email.email_id} — not accumulated")
+                attachment_ledger.close_undispatched(conn, email, _now_iso())
+                _settle(mailbox, conn, email, triaged, settings.MAILBOX_FOLDER_PROCESSED,
+                        _now_iso(), evidence=email_evidence,
+                        note="already received as another message; not counted twice", **settle)
+                continue
+
             released_events.extend(stage2_accumulate.process_triaged_email(conn, triaged, _now_iso()))
             _settle(mailbox, conn, email, triaged, settings.MAILBOX_FOLDER_PROCESSED,
-                    _now_iso(), evidence=email_evidence)
+                    _now_iso(), evidence=email_evidence, **settle)
         except Exception as e:
             _log(f"failed to triage/accumulate {email.email_id}: {e}")
             _settle(mailbox, conn, email, triaged, settings.MAILBOX_FOLDER_ERRORS,
@@ -496,7 +549,27 @@ def process_new_mail(
                     raw_records.append(record)
 
             for record in reconcile_cross_source_duplicates(raw_records):
-                extracted_records_store.write_pending(conn, record, _now_iso())
+                # A person already built a record from this message, so staging more from it would
+                # put two rows on the page for one delivery. Scoped to the one message — never to
+                # its thread or its purchase order, because the next mail on the same thread may be
+                # a genuinely separate delivery and suppressing that would hide a real receipt.
+                if dedupe.is_handled_manually(conn, record.source_email_id):
+                    _log(f"skipped {record.po_number}: a person already recorded "
+                         f"{record.source_email_id} by hand")
+                    continue
+
+                # And the same delivery read twice from two different messages. Deliberately after
+                # `reconcile_cross_source_duplicates`, which dedupes *within* one email; this asks
+                # the store, so it also catches a re-extraction after a reprocess.
+                key = dedupe.key_for_row(record)
+                existing = dedupe.find_by_delivery_key(conn, key)
+                if existing:
+                    _log(f"skipped {record.po_number}: already staged as record "
+                         f"#{existing[0]['id']}")
+                    continue
+
+                extracted_records_store.write_pending(conn, record, _now_iso(),
+                                                      extra={"delivery_key": key})
                 staged_count += 1
         except Exception as e:
             _log(f"failed to extract for delivery {event.key}: {e}")

@@ -35,14 +35,28 @@ def get_pipeline_conn() -> Iterator[sqlite3.Connection]:
     page now reads the same database the automation writes when it reads the real inbox. There is
     no second store on screen any more — see `read_views.MAIL_SOURCES`.
     """
-    from config import settings
-    from pipeline import state_db
-
-    conn = state_db.get_connection(settings.PIPELINE_STATE_DB_PATH)
+    conn = pipeline_connection()
     try:
         yield conn
     finally:
         conn.close()
+
+
+def pipeline_connection() -> sqlite3.Connection:
+    """The same store as `get_pipeline_conn`, opened directly rather than as a dependency.
+
+    For the `async def` POST handlers. FastAPI resolves a sync generator dependency in a worker
+    thread while an async handler runs on the event loop, and a sqlite connection is bound to the
+    thread that created it — so the pair raises "SQLite objects created in a thread can only be
+    used in that same thread" the moment the handler touches it.
+
+    One definition of *which* file, so an async route can never end up reading a different store
+    from the page that submitted to it. The caller closes it.
+    """
+    from config import settings
+    from pipeline import state_db
+
+    return state_db.get_connection(settings.PIPELINE_STATE_DB_PATH)
 
 
 def get_operator(x_operator: Optional[str] = Header(default=None)) -> str:

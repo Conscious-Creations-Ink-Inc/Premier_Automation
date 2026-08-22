@@ -42,6 +42,12 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 # somewhere else and the quoted chain must be consulted.
 INTERNAL_DOMAINS = {"premierpm.com"}
 
+# "Is this a forward?" asked of a subject that may carry any run of prefixes before the one that
+# answers it: `Fw:`, `[External] Fw:`, `Re: Fw:`, `[External] FW:` are all forwards. Only `fw`/`fwd`
+# decides; `[External]`, `Re:`, `Aw:` and `Tr:` are noise that may precede it in any order.
+_FORWARD_PREFIX_RE = re.compile(
+    r"^\s*(?:\[external\]\s*|(?:re|aw|tr)\s*:\s*)*(?:fw|fwd)\s*:", re.IGNORECASE)
+
 
 # Every `Sent:` shape in the corpus, measured across its 111 quoted headers rather than guessed.
 # Three of the four were obvious; the fourth was not — six headers use 24-hour time with no AM/PM
@@ -178,7 +184,13 @@ def resolve_origin(
     top.sender_domain = top.sender_domain or _domain_of(address)
     top.subject = top.subject or subject
 
-    is_forward = subject.strip().lower().startswith(("fw:", "fwd:"))
+    # Tested against the *stripped* subject, not the raw one. Exchange prepends `[External] ` to
+    # anything originating outside the tenant, so a genuine forward reaches us as
+    # `[External] Fw: ...` — and a raw `startswith` reads that as "not a forward" and takes the
+    # forwarding hop's own annotation as the payload. Three subjects in Premier's live mailbox
+    # already have that shape. `strip_forward_prefixes` removes `[External]` and the accumulated
+    # Re:/Fw: run in either order, which is exactly the question being asked here.
+    is_forward = bool(_FORWARD_PREFIX_RE.match(subject or ""))
     if not is_forward or _domain_of(address) not in INTERNAL_DOMAINS:
         return top
 

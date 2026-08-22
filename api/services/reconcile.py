@@ -63,8 +63,23 @@ def score_candidate(record: ExtractedRecord, po_line: POLineRow) -> Candidate:
     line = po_line.line
     po_signal = bool(record.po_number) and _normalize(record.po_number) == _normalize(line.po_number)
 
-    record_spec = _normalize(record.spec_code) or _normalize(record.parent_spec_code)
-    spec_signal = bool(record_spec) and record_spec == _normalize(line.spec_code)
+    # The sub-spec first, then the parent. Both exact — widening *which* codes are compared, not
+    # how, so the rule above still holds.
+    #
+    # Vendors ship a lamp as parts: Authority Inbound splits `STE-402-LT` into `STE-402-LT-B`
+    # (base) and `STE-402-LT-SH` (shade), and the purchase order carries only the assembled
+    # `STE-402-LT`. The sub-spec therefore never matches a line, and `or` short-circuits — the
+    # parent the parser went to the trouble of extracting was never tried. Record 208 landed on
+    # the right line only because its description happened to score 94%.
+    record_spec = _normalize(record.spec_code)
+    parent_spec = _normalize(record.parent_spec_code)
+    line_spec = _normalize(line.spec_code)
+    # `bool(line_spec)` so a line with no spec cannot match a record with no spec: two blanks are
+    # not an identification.
+    spec_signal = bool(line_spec) and (
+        (bool(record_spec) and record_spec == line_spec)
+        or (bool(parent_spec) and parent_spec == line_spec)
+    )
 
     desc_score = 0.0
     if record.item_description and line.description:

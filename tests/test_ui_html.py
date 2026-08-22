@@ -680,10 +680,22 @@ def test_the_records_page_carries_the_receipt_log_and_its_caveat():
     assert "Premier Design to Completion Report" in body
     assert "Receipt Log" in body
     assert "receiver.xlsx" in body
-    assert "inventing numbers" in body
+    # The caveat moved on 2026-08-21: Order Qty and Net now fill from the mirrored purchase order,
+    # so the sheet no longer claims they never can. Final still cannot be worked out at all.
+    assert "Final is always blank" in body
+    assert "cannot be worked out from quantities" in body
 
 
-UI_PAGES = ("/ui/mails", "/ui/records", "/ui/manual", "/ui/po", "/ui/po/208491")
+def test_the_records_page_says_how_each_record_was_made():
+    """Both states are labelled. Badging only the manual ones would make an unbadged row mean two
+    things — automated, or a row from before the column existed."""
+    body = TestClient(app).get("/ui/records").text
+    assert ">Origin<" in body
+    assert "Automated" in body
+
+
+UI_PAGES = ("/ui/mails", "/ui/records", "/ui/manual", "/ui/po", "/ui/po/208491",
+            "/ui/attachments")
 
 
 def test_pages_carry_exactly_one_first_party_script_and_nothing_else():
@@ -724,7 +736,8 @@ def test_a_hostile_subject_cannot_reach_the_script_or_a_row_attribute():
 # in the page, so a `?q=` round trip would be slower than typing and could disagree with what is
 # on screen. These tests pin the contract the script depends on.
 
-SEARCHABLE_PAGES = {"/ui/mails": "mail-table", "/ui/records": "records-table"}
+SEARCHABLE_PAGES = {"/ui/mails": "mail-table", "/ui/records": "records-table",
+                    "/ui/attachments": "attachments-table"}
 
 
 @pytest.mark.parametrize("path,table_id", sorted(SEARCHABLE_PAGES.items()))
@@ -823,6 +836,7 @@ PAGED_TABLES = {
     "/ui/mails": "mail-table",
     "/ui/records": "records-table",
     "/ui/po": "po-table",
+    "/ui/attachments": "attachments-table",
 }
 
 
@@ -1050,6 +1064,7 @@ DATE_COLUMNS = {
     "/ui/records": "POD date",
     "/ui/po": "Last heard",
     "/ui/manual": "When",
+    "/ui/attachments": "Received",
     "/ui/automation": "Started",
     "/ui/report": "When",
 }
@@ -1250,7 +1265,7 @@ def test_the_page_will_not_reload_over_an_open_dialog_or_a_scrolled_reader():
 # the page asked a folder of test files for Premier's live mail and, correctly, found nothing.
 # The failure was silent: a dialog reading "could not be found in any source we can still read".
 
-MAIL_OPENING_PAGES = ("/ui/manual", "/ui/records", "/ui/mails")
+MAIL_OPENING_PAGES = ("/ui/manual", "/ui/records", "/ui/mails", "/ui/attachments")
 
 
 def test_every_control_that_opens_a_message_names_its_store():

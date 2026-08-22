@@ -211,7 +211,8 @@ def triage(email: RawEmail, evidence=None) -> TriagedEmail:
                       "lost / damaged / claim / replacement-PO thread — out of Phase 1 scope, needs a person")
 
     # Rule 1 — Authority Logistics, by (local part, subject grammar).
-    notice = authority.parse_authority_notice(origin.sender_address, origin_subject, email.body_html, body)
+    notice = authority.notice_in_thread(
+        origin.sender_address, origin_subject, email.body_html, body, parsed)
     if notice is not None:
         notification_type, category, matched_rule, reason = _decide_authority(email, notice)
         notice_pos = notice.po_numbers
