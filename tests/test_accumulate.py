@@ -5,6 +5,7 @@ import pytest
 from pipeline import state_db, stage2_accumulate
 from pipeline.models import RawEmail, TriageCategory
 from pipeline.stage1_triage import triage
+from tests import corpus_fixtures as fx
 
 
 def make_email(**overrides):
@@ -45,12 +46,8 @@ def test_hidden_emails_never_reach_stage2_by_construction():
 
 
 def test_inbound_notification_alone_releases_immediately(conn):
-    email = make_email(
-        email_id="msg-inbound-1",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound 239336 - shipment 50052 / PO 208491",
-        body_text="Inbound 239336 received for PO 208491, all items accounted for.",
-    )
+    email = fx.inbound_email(email_id="msg-inbound-1", notice="239336",
+                             po_numbers=("208491",), shipment="50052 : 1")
     triaged = triage(email)
     assert triaged.category == TriageCategory.SURFACE
 
@@ -62,22 +59,17 @@ def test_inbound_notification_alone_releases_immediately(conn):
 
 
 def test_duplicate_after_release_is_discarded_not_rereleased(conn):
-    email = make_email(
-        email_id="msg-inbound-2",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="Inbound - shipment 60001 / PO 208491",
-        body_text="Inbound received for PO 208491.",
-    )
-    first = stage2_accumulate.process_triaged_email(conn, triage(email), now_iso())
+    """The corpus holds notice 239336 twice — once direct from Authority, once forwarded by an
+    expeditor, under two different Message-IDs. Only the shipment key stops the second copy
+    creating a second receiver."""
+    direct = fx.inbound_email(email_id="msg-inbound-2", notice="239336", shipment="60001 : 1",
+                              forwarded=False)
+    first = stage2_accumulate.process_triaged_email(conn, triage(direct), now_iso())
     assert len(first) == 1
 
-    resent = make_email(
-        email_id="msg-inbound-2-resent",
-        sender_address="notify@authoritylogistics.com", sender_domain="authoritylogistics.com",
-        subject="FWD: Inbound - shipment 60001 / PO 208491",
-        body_text="Inbound received for PO 208491.",
-    )
-    second = stage2_accumulate.process_triaged_email(conn, triage(resent), now_iso())
+    forwarded = fx.inbound_email(email_id="msg-inbound-2-resent", notice="239336",
+                                 shipment="60001 : 1", forwarded=True)
+    second = stage2_accumulate.process_triaged_email(conn, triage(forwarded), now_iso())
     assert second == []
 
 
@@ -104,15 +96,15 @@ def test_property_confirmation_only_releases_after_grace_period(conn):
 
 
 def test_two_po_email_releases_two_independent_delivery_events(conn):
-    email = make_email(
-        email_id="msg-two-po",
-        sender_address="notify@atlaslogistics.com", sender_domain="atlaslogistics.com",
-        subject="Inbound for PO 206725 and PO 207665 - shipment 70009",
-        body_html=(
-            "<table><tr><th>PO</th><th>Spec</th><th>Qty</th></tr>"
-            "<tr><td>206725</td><td>EXT-901-AC</td><td>4</td></tr>"
-            "<tr><td>207665</td><td>EXT-902-AC</td><td>2</td></tr></table>"
-        ),
+    email = fx.inbound_email(
+        email_id="msg-two-po", notice="239260", po_numbers=("206725", "207665"),
+        shipment="70009 : 1",
+        lines=[
+            {"po": "206725", "line": "1", "part": "EXT-925-AC",
+             "item": '2 EACH - EXT-925-AC-Linear Planter w/Pocket(s) 96"Lx30"Wx24"'},
+            {"po": "207665", "line": "1", "part": "POOL-925-AC",
+             "item": "3 EA - POOL-925-AC Linear Planter w/Pocket(s) for CFCI Lighting"},
+        ],
     )
     events = stage2_accumulate.process_triaged_email(conn, triage(email), now_iso())
     assert len(events) == 2
@@ -129,12 +121,10 @@ def test_property_confirmation_then_true_inbound_releases_on_inbound_with_both_b
     )
     assert stage2_accumulate.process_triaged_email(conn, triage(property_email), now_iso()) == []
 
-    inbound_email = make_email(
-        email_id="msg-inbound-3",
-        sender_address="notify@hospitalitylogistics.com", sender_domain="hospitalitylogistics.com",
-        subject="Inbound for PO 213500",
-        body_text="Inbound received for PO 213500.",
-    )
-    events = stage2_accumulate.process_triaged_email(conn, triage(inbound_email), now_iso())
+    inbound = fx.inbound_email(email_id="msg-inbound-3", notice="239500",
+                               po_numbers=("213500",), shipment="",
+                               lines=[{"po": "213500", "line": "100", "part": "LOB-203-PI",
+                                       "item": '12 EA - LOB-203-PI 18"x18" Throw Pillow'}])
+    events = stage2_accumulate.process_triaged_email(conn, triage(inbound), now_iso())
     assert len(events) == 1
     assert len(events[0].emails) == 2

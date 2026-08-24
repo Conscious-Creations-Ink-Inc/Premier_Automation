@@ -404,5 +404,9 @@ def test_excel_tracker_with_confirmed_column():
     r = records[0]
     assert r.po_number == "212448"
     assert r.quantity_received == 5.0
-    assert r.comments == "Confirmed: Y"
-    assert r.extraction_source == "excel"
+    # A confirmation column routes the sheet through the confirmation-grid path, which records
+    # the answer in words rather than echoing the raw cell — "Y", "yes" and "Confirmed" all
+    # normalise to the same statement, and a "no" is recorded just as explicitly.
+    assert r.comments == "property/vendor confirmed receipt"
+    assert r.extraction_confidence == 0.85
+    assert r.extraction_source.startswith("excel:")   # suffixed with the sheet name

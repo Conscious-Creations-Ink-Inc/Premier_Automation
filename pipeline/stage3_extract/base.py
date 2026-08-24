@@ -1,7 +1,7 @@
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from rapidfuzz import fuzz
 
@@ -61,6 +61,35 @@ class ExtractionSource:
     filename: Optional[str] = None
     content_type: Optional[str] = None
     content_bytes: Optional[bytes] = None
+
+    sender_address: Optional[str] = None
+    subject: Optional[str] = None
+    """Envelope sender and subject of the email this source came from. A vendor parser cannot
+    identify a format without them — the Authority grammars key on (sender local part, subject),
+    and an attachment carries neither on its own."""
+
+    only_po: Optional[str] = None
+    """Restrict extraction to one PO. The orchestrator runs one `DeliveryEvent` per PO, so a
+    multi-PO source read without this filter stages every line once per PO on the document:
+    one email covering two POs produced four records where two were correct (finding C1)."""
+
+    ledger_id: Optional[int] = None
+    container_path: str = ""
+    """Which `attachment_ledger` row this source is, and where it sits inside any containers.
+    The dispatcher writes the outcome back against `ledger_id`, which is what guarantees every
+    attachment ends with a recorded verdict."""
+
+    pod_document: Any = None
+    """The parsed proof of delivery, when whichever adapter read this attachment recognised one.
+
+    Set by `records_from_pod`, which every POD path funnels through — a PDF's text layer, an
+    OCR'd photograph, a scan lifted out of a .docx. Read by the dispatcher, which is the one
+    place holding both a database connection and this source's `ledger_id`, and written onto the
+    ledger row so that "is this file the proof?" is answered once, at ingest, for any file type.
+
+    Carried on the source rather than returned because the adapter contract is
+    `extract() -> List[ExtractedRecord]`, and widening that for one verdict would touch every
+    adapter to serve none of them."""
 
 
 class ExtractionAdapter(ABC):

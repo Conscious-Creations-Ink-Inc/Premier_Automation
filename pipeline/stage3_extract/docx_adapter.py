@@ -5,6 +5,7 @@ from typing import List, Optional
 import docx
 
 from pipeline.models import ExtractedRecord
+from pipeline.parsing import sniff
 from pipeline.stage3_extract.base import (
     ExtractionAdapter,
     ExtractionSource,
@@ -42,11 +43,16 @@ class DocxAdapter(ExtractionAdapter):
         self.ocr_client = ocr_client or MockDocumentIntelligenceClient()
 
     def can_handle(self, source: ExtractionSource) -> bool:
-        return (
-            source.source_type == "attachment"
-            and source.content_type == DOCX_CONTENT_TYPE
-            and source.content_bytes is not None
-        )
+        """Claim by byte sniff, not by declared content type.
+
+        This was the one adapter still comparing `content_type` as a string, so a .docx arriving
+        as `application/octet-stream` — or with no type at all, which is how the corpus's real
+        attachments arrive — reached no adapter. Same rationale as ExcelAdapter's.
+        """
+        if source.source_type != "attachment" or source.content_bytes is None:
+            return False
+        return sniff.sniff(source.content_bytes, source.filename or "",
+                           source.content_type or "").kind == sniff.KIND_DOCX
 
     def extract(self, source: ExtractionSource) -> List[ExtractedRecord]:
         document = docx.Document(io.BytesIO(source.content_bytes))

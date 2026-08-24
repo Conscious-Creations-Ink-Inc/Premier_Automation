@@ -1,0 +1,6 @@
+# Test / development-only dependencies.
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
+pytest
+pytesseract  # local, dev-time OCR for generating realistic test fixtures — NOT the production OCR path (that's Azure AI Document Intelligence, per Premier's confirmation)
+reportlab  # test-only: generates real in-memory PDF fixtures for test_extract.py, not a runtime dependency
+httpx  # required by fastapi's TestClient, used in tests/api/

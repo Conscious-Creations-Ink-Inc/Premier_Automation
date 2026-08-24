@@ -106,3 +106,45 @@ def test_match_result_and_route_target_shapes():
     )
     assert verify.passed
     assert routing.route_to == RouteTarget.AUTO_APPROVED
+
+
+def test_extracted_record_fields_all_persist_through_the_staging_store():
+    """A field on the model with no column in the store is silently dropped between Stage 3 and
+    Stage 4. That happened to `po_line_number` — the Spitfire line number, the most valuable
+    field the Authority format supplies — so the two are pinned together here."""
+    import dataclasses
+
+    from pipeline import extracted_records_store
+    from pipeline.models import ExtractedRecord
+
+    model_fields = {f.name for f in dataclasses.fields(ExtractedRecord)}
+    stored_fields = set(extracted_records_store._COLUMNS)
+    assert model_fields == stored_fields, (
+        f"only on the model: {sorted(model_fields - stored_fields)}; "
+        f"only in the store: {sorted(stored_fields - model_fields)}"
+    )
+
+
+def test_staging_store_round_trips_every_field():
+    from pipeline import extracted_records_store, state_db
+    from pipeline.models import ExtractedRecord
+
+    conn = state_db.get_connection(":memory:")
+    try:
+        record = ExtractedRecord(
+            source_email_id="msg-1", po_number="208491", shipment_number="50052",
+            spec_code="STE-402-LT-B", parent_spec_code="STE-402-LT", sub_spec_suffix="B",
+            item_description="BASE, Floor Lamp 2", vendor_name="Light Annex",
+            carrier_name="Nolan Transportation", tracking_number="8840455",
+            quantity_received=11.0, unit_of_measure="EA", pod_stated_date="2025-10-01",
+            email_date="2025-10-01T18:00:00Z", delivery_location="Crown Worldwide - Mira Loma",
+            comments="STE-402-LT", extraction_source="authority_inbound",
+            extraction_confidence=1.0, raw_snippet="208491 : 300",
+            po_line_number=300, received_by="Miguel C.",
+            package_quantity=11.0, package_uom="CTN", notification_number="239336",
+        )
+        extracted_records_store.write_pending(conn, record, "2026-08-03T00:00:00Z")
+        restored = extracted_records_store.get_pending(conn)[0].record
+        assert restored == record
+    finally:
+        conn.close()

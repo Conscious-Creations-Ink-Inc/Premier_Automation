@@ -2,7 +2,29 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-state/*.sqlite3
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.bak-*
 .env
+.env.*.local
 *.log
 .pytest_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# Frontend — kept after the React app was deleted (11 Aug 2026) only so a stray `npm install`
+# in this tree cannot commit 1,700 packages. There is no build step and nothing to ignore.
+node_modules/
+
+# Recorded Spitfire responses. Spitfire only answers from Premier's office IP, so
+# connectors/spitfire_cassette.py replays these when off it — see docs/ACCESS.md. Local only: the
+# bodies carry real vendor names, named Premier employees staged on approval routes, and cost
+# codes. A small scrubbed subset is committed to tests/fixtures/spitfire/ instead.
+state/spitfire_cassettes/
+
+# The real values behind docs/ACCESS.md. .env stays the only file the code reads; this one exists
+# so a person has somewhere to look them all up at once.
+ACCESS.local.md

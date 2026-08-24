@@ -36,7 +36,17 @@ def _serialize_triaged_email(te: TriagedEmail) -> str:
                 {
                     "filename": a.filename,
                     "content_type": a.content_type,
-                    "content_b64": base64.b64encode(a.content_bytes).decode("ascii"),
+                    # An attachment the connector dropped carries no bytes — only its metadata
+                    # is worth persisting, and base64-ing a 3 MB photo into a TEXT column twice
+                    # over is what the size limits exist to avoid.
+                    "content_b64": base64.b64encode(a.content_bytes).decode("ascii") if a.content_bytes else "",
+                    "content_id": a.content_id,
+                    "is_inline": a.is_inline,
+                    "sha256": a.sha256,
+                    "size_bytes": a.size_bytes,
+                    "drop_hint": a.drop_hint,
+                    "ledger_id": a.ledger_id,
+                    "container_path": a.container_path,
                 }
                 for a in te.email.attachments
             ],
@@ -47,6 +57,9 @@ def _serialize_triaged_email(te: TriagedEmail) -> str:
         "extracted_po_hints": te.extracted_po_hints,
         "extracted_shipment_hint": te.extracted_shipment_hint,
         "reason": te.reason,
+        "origin_sender_address": te.origin_sender_address,
+        "origin_sent_at": te.origin_sent_at,
+        "notification_number": te.notification_number,
     })
 
 
@@ -57,7 +70,14 @@ def _deserialize_triaged_email(payload: str) -> TriagedEmail:
         Attachment(
             filename=a["filename"],
             content_type=a["content_type"],
-            content_bytes=base64.b64decode(a["content_b64"]),
+            content_bytes=base64.b64decode(a["content_b64"]) if a.get("content_b64") else b"",
+            content_id=a.get("content_id"),
+            is_inline=a.get("is_inline", False),
+            sha256=a.get("sha256", ""),
+            size_bytes=a.get("size_bytes", 0),
+            drop_hint=a.get("drop_hint"),
+            ledger_id=a.get("ledger_id"),
+            container_path=a.get("container_path", ""),
         )
         for a in ed["attachments"]
     ]
@@ -75,6 +95,11 @@ def _deserialize_triaged_email(payload: str) -> TriagedEmail:
         extracted_po_hints=data["extracted_po_hints"],
         extracted_shipment_hint=data["extracted_shipment_hint"],
         reason=data["reason"],
+        origin_sender_address=data.get("origin_sender_address"),
+        # `.get`, like its neighbours: a payload written before this field existed must still
+        # deserialize rather than KeyError a stored accumulation into an unreadable state.
+        origin_sent_at=data.get("origin_sent_at"),
+        notification_number=data.get("notification_number"),
     )
 
 

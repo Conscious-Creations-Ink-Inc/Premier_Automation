@@ -12,6 +12,12 @@ class NotificationType(str, Enum):
     PROPERTY_CONFIRMATION = "property_confirmation"
     VENDOR_CONFIRMATION = "vendor_confirmation"
     ORDER_CANCELLATION = "order_cancellation"
+    WAREHOUSE_STATUS_REPORT = "warehouse_status_report"
+    """The periodic Purchase Order Status Report — same sender as the receiver trigger, told
+    apart only by its subject. Recognised so it can be discarded rather than scraped."""
+    LOSS_OR_CLAIM = "loss_or_claim"
+    """Lost/damaged goods, claims, credit memos, replacement POs. Reads like delivery mail and
+    is out of Phase 1 scope, so it must be recognised and handed to a person, never processed."""
     UNKNOWN = "unknown"
 
 
@@ -28,6 +34,32 @@ class Attachment:
     content_type: str
     content_bytes: bytes
 
+    # --- Provenance. All defaulted, so every existing positional constructor still works.
+
+    content_id: Optional[str] = None
+    is_inline: bool = False
+    """From the mail source. Together with the body's `cid:` references these are what tell a
+    signature logo apart from a photograph someone attached — see parsing/sniff.classify_image."""
+
+    sha256: str = ""
+    size_bytes: int = 0
+    sniffed_kind: str = ""
+    """Recorded at ingest, while the bytes are still in hand. A dropped attachment has its
+    `content_bytes` cleared to avoid carrying a logo or a duplicate around, so re-sniffing it
+    later yields `unknown` — which would make the ledger useless for exactly the rows a person
+    most needs to understand."""
+
+    drop_hint: Optional[str] = None
+    """Set when the connector decided not to hand this on: `"decorative:tiny"`,
+    `"duplicate:<sha>"`, `"oversize"`, `"empty"`. The attachment is still carried, so the
+    orchestrator can record *why* it was dropped. Silently discarding one at ingest is how a
+    photographed POD used to disappear without trace."""
+
+    ledger_id: Optional[int] = None
+    container_path: str = ""
+    """Position inside nested containers, e.g. `"outer.msg!/inner.zip!/pod.pdf"`, so a record
+    extracted four levels down can still be traced back to the file it came from."""
+
 
 @dataclass
 class RawEmail:
@@ -40,6 +72,13 @@ class RawEmail:
     body_text: Optional[str]
     attachments: List[Attachment] = field(default_factory=list)
 
+    provider_message_id: Optional[str] = None
+    """The mail provider's own handle for this message, when it differs from `email_id`.
+
+    Graph's folder-scoped `id` changes the moment a message is moved — and this pipeline moves
+    every message it processes — so it cannot be the dedupe key; `internetMessageId` is. But
+    Graph's /move endpoint only accepts its own id, so both have to be carried (finding C5)."""
+
 
 @dataclass
 class TriagedEmail:
@@ -50,6 +89,25 @@ class TriagedEmail:
     extracted_po_hints: List[str]
     extracted_shipment_hint: Optional[str] = None   # None for property/vendor confirmations — no shipment number
     reason: str = ""
+
+    origin_sender_address: Optional[str] = None
+    """Who actually sent the payload, recovered from the quoted chain. Every message Premier
+    handed over is a `Fw:` from an internal expeditor, so `email.sender_address` is
+    `premierpm.com` on all of them and useless for routing (see parsing/thread.py)."""
+
+    origin_sent_at: Optional[str] = None
+    """When that payload was actually sent, `YYYY-MM-DD`, from the same quoted header block.
+
+    The counterpart to `origin_sender_address` and for the same reason: the envelope date of a
+    forward is the day it was forwarded. On the corpus that is 2026-06-06 for twelve of fourteen
+    messages, which is why every stage of every delivery timeline once showed one date. None when
+    the mail arrived direct, or when the header is in a shape `parsing.thread.parse_sent` cannot
+    read — in both cases the envelope date is the better answer."""
+
+    notification_number: Optional[str] = None
+    """The originator's own reference (Authority inbound # / Authority #). Two files in the
+    corpus are the same notice 239336 — one direct, one forwarded — arriving under different
+    Message-IDs; this is what lets Stage 2 see them as one event."""
 
 
 # --- Stage 2: Accumulate -------------------------------------------------
@@ -93,6 +151,28 @@ class ExtractedRecord:
     extraction_confidence: float
     raw_snippet: str
 
+    # --- Fields below carry defaults so the positional constructors already in the adapters
+    # keep working. They were added once the real June corpus showed the Authority Logistics
+    # format hands over more than the design assumed.
+
+    po_line_number: Optional[int] = None
+    """The Spitfire line number, when the source states it outright — the Authority Inbound
+    `PO # / Line #` cell reads `208491 : 300`. This turns Stage 4 from a fuzzy description
+    search into an exact lookup, so it is the single most valuable field on the record."""
+
+    received_by: Optional[str] = None
+    """Warehouse staffer who signed the goods in ("Miguel C.") or the POD's `Signed for by`."""
+
+    package_quantity: Optional[float] = None
+    package_uom: Optional[str] = None
+    """Cartons/pallets/skids — deliberately kept apart from `quantity_received`. An Inbound
+    header reads `Quantity: 41 CTN` while the line row reads `11 EA`; receiving the carton
+    count against the PO line is the failure mode this split exists to prevent."""
+
+    notification_number: Optional[str] = None
+    """Authority's own reference — the inbound # for a Class A notice, the Authority # for a
+    Class B one. Retained for audit and for tying a record back to the notice that produced it."""
+
 
 @dataclass
 class ExtractedRecordRow:
@@ -125,6 +205,20 @@ class POLine:
     ship_to: Optional[str]
     assigned_agent: Optional[str]
     pay_terms: Optional[str] = None   # "Net 30" | "CBD" | "ADR" — needed by Stage 5; checklist #14
+
+    qty_in_transit: float = 0.0
+    """`RelatedItemDetail.ReceiptInProgressUnits` — *"units tentatively received not yet
+    approved"*: a receipt document that exists but has not been approved through its route.
+
+    Outstanding quantity has to subtract this as well as `qty_received`, or a delivery whose
+    receipt is still awaiting approval reads as entirely un-received and gets a second receipt
+    raised against it. One physical delivery becoming two receivers is the failure that ended
+    Premier's previous attempt, and this field is the only thing in the API that reveals the
+    in-flight case. It is also column 53 ("Qty In Transit") of the receiver file spec."""
+
+    @property
+    def qty_outstanding(self) -> float:
+        return self.qty_ordered - self.qty_received - self.qty_in_transit
 
 
 @dataclass

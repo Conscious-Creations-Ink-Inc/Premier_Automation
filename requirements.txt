@@ -1,12 +1,41 @@
-beautifulsoup4
-lxml
-pdfplumber
+# Runtime dependencies (pipeline + dashboard API).
+# Test/dev-only tools live in requirements-dev.txt.
+
+# --- Email intake -------------------------------------------------------------
+extract-msg  # Outlook .msg parsing — connectors/msg_file.py, a production intake path.
+             # It was imported but undeclared, so a clean install failed at import.
+
+# --- Document parsing, one library per attachment family ----------------------
+beautifulsoup4  # HTML bodies and quoted threads
+lxml            # BeautifulSoup's parser
+pdfplumber      # native PDFs: carrier PODs, warehouse receipts
+openpyxl        # .xlsx trackers
+xlrd            # legacy .xls trackers — xlrd 2.x reads BIFF only, which is exactly what we want
+python-docx     # .docx attachments
+
+# Read by the attachment viewer rather than by the extraction cascade. Neither format is mined for
+# delivery records — a deck is not a POD — but "open any attachment in the UI" means a person has
+# to be able to *look* at one without leaving the browser, and a panel that says "not previewable"
+# is the thing that promise exists to remove.
+python-pptx     # .pptx decks — slide text and tables, for reading only
+striprtf        # .rtf to plain text; RTFDE above handles the encapsulated-HTML case
+
+# Pinned explicitly rather than relied on transitively (they arrive via extract-msg and
+# pdfplumber today, but the code below now depends on them directly).
+olefile            # tells .xls from .doc inside an OLE2 container
+msoffcrypto-tool   # tells a password-protected Office file from a corrupt one
+RTFDE              # .rtf bodies and attachments
+charset-normalizer # encoding detection for text attachments
+
+# --- Matching and services ----------------------------------------------------
 rapidfuzz
-openpyxl
-pytest
 python-dotenv
 msal
 requests
-python-docx
-pytesseract  # local, dev-time OCR for generating realistic test fixtures — NOT the production OCR path (that's Azure AI Document Intelligence, per Premier's confirmation)
-reportlab  # test-only: generates real in-memory PDF fixtures for test_extract.py, not a runtime dependency
+fastapi  # dashboard API layer (api/) — pydantic v2 comes with it; pipeline/ never imports api/
+uvicorn[standard]  # ASGI server for the dashboard API in dev
+
+# --- OCR ----------------------------------------------------------------------
+# Production OCR is Azure AI Vision, called over REST with `requests` — no SDK needed, and no
+# extra dependency. It stays inert until AZURE_VISION_ENDPOINT/KEY are configured.
+# pytesseract (requirements-dev.txt) remains the local, offline alternative for development.

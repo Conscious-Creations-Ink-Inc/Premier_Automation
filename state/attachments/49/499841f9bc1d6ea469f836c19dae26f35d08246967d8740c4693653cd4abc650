@@ -1,0 +1,87 @@
+<!DOCTYPE html><html><head>
+<meta http-equiv="Content-Type" content="text/html; charset=us-ascii"><title></title>
+    
+
+    <style>
+        table {
+            font-family: arial, sans-serif;
+            border-collapse: collapse;
+            width: 100%;
+        }
+
+        td, th {
+            border: 1px solid #dddddd;
+            text-align: left;
+            padding: 8px;
+        }
+
+        tr:nth-child(even) {
+            background-color: #dddddd;
+        }
+
+        .logo, .logo img {
+            width: 15%;
+            height: 15%;
+        }
+
+        p.logoAddress {
+            text-align: justify;
+            text-justify: inter-word;
+        }
+    </style>
+</head>
+<body>
+   
+    <div>
+        <h3><u>Authority #:</u> 49985</h3>
+    </div>
+    <div>
+        <h3><u>Carrier:</u> GlobalTranz Enterprises, LLC</h3>
+    </div>
+    <div>
+        <h3><u>Tracking:</u> </h3>
+        31457971<br>7497809572 FEDEX
+    </div>
+    <br>
+    <br>
+    <div>
+        <h3><u>From:</u> Hampton Textile Printing Inc. : 2230 Eddie Williams Drive, Johnson City, TN</h3>
+    </div>
+<br>
+<br>
+    <div><h3><u>Delivered:</u> 09/10/2025 <u> Signed by:</u>  U ALI </h3></div>
+<h3><u>To:</u> 5-Star Interior Services, Inc. : 6840 Walthall Way, Paramount, CA
+</h3>
+    <table>
+        <tr>
+            <th>Package</th>
+            <th>PO #</th>
+            <th>Item</th>
+            <th>Supplier</th>
+        </tr>
+        <tr><td>1 SKID - 392.00 lb</td><td>210634</td><td>202 YD - GR-350a-WTF - Main Drapery Fabric Description: In-line Base Cloth, Heavy Two-Way Slub, BLACKOUT Pattern Name: CHILLAX BASE CLOTH Width: 56&quot; Repeat: N/A Content: 100% Polyester - All Filament Fire Rating: NFPA 701 Pattern Name: CHILLAX BASE CLOTH
+Finish: 4 Pass Fr Black Out Coating by Manufacturer  Notes: Same as PO 207273 for attic stock</td><td>P. Kaufmann</td></tr>
+    </table>
+    <br>
+    <br>
+    <br>
+    <div>
+        <h3>Thank You</h3>
+    </div>
+    <br>
+    <p class="logoAddress">
+        <img src="https://admin.authoritylogistics.com/Content/Images/General/Logo.png" class="logo" width="150">
+        <div>
+            <p>400 Chesterfield Center, Suite 400</p>
+            <p>Chesterfield, MO. 63017</p>
+            <p>Toll Free: 844.502.9998</p>
+            <p>
+                <a href="www.authoritylogistics.com">www.authoritylogistics.com</a>
+            </p>
+        </div>
+    </p>
+
+
+    
+<img src="https://u3681777.ct.sendgrid.net/wf/open?upn=u001.2tCWJV4hc2Abg87HCbutNMf2yfG0EN-2F2zlOQT-2B-2FUnsHh0Yr-2FOFKjhqfUEBiQ5yDjkBy-2FdybTQs0IV-2FGLVlWnJKtQ9RFEdcjLre6noCsWsd5it8ASl5y-2F2CeT4Vwj0s3hWzHjXvkHHYCTnRplzf7n6htH7ay4P5GFI5AppSJLxNouBEYwJT92WicOIKIWX94KHoJt4ulM4vaG0doV-2BQgQm93Y5JYUkQCkqznpt9PqjP8-3D" alt="" width="1" height="1" border="0" style="height:1px !important;width:1px !important;border-width:0 !important;margin-top:0 !important;margin-bottom:0 !important;margin-right:0 !important;margin-left:0 !important;padding-top:0 !important;padding-bottom:0 !important;padding-right:0 !important;padding-left:0 !important;"></body>
+</html>
