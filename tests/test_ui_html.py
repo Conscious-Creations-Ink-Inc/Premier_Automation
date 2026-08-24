@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
-from api.ui import html
+from api.ui import html, routes
 from pipeline import delivery_status, read_views
 
 HOSTILE = 'OS&E <script>alert("x")</script> "quoted" \'single\''
@@ -215,15 +215,65 @@ def test_the_active_nav_entry_is_marked_on_every_page():
 
 
 def test_the_delivery_page_declares_what_it_cannot_show():
-    """Two claims a reader would otherwise get wrong: the statuses are inferred rather than
-    recorded, and the empty money columns are missing data, not zero."""
+    """The claim a reader would otherwise get wrong: nothing on this page *recorded* a status. Each
+    one is derived from whichever notifications happened to arrive, so it is a reading of the mail
+    rather than a fact out of Spitfire. It is in the subtitle, where it is on screen whatever the
+    table is showing.
+
+    Two further caveats used to sit in a note above the table — that `Receipt staged` and `In
+    Spitfire` cannot be reached at all yet, and that Ordered and Outstanding are empty because they
+    live on the purchase order inside Spitfire rather than in any delivery email. Both were dropped
+    on 2026-08-22, by decision, when the page was rebuilt to the design. They are still true; this
+    page no longer says them.
+    """
     body = TestClient(app).get("/ui/po").text
     assert "inferred" in body
-    assert "inventing numbers" in body
-    # Named as unreachable, not silently absent. Asserted through the constant so renaming a label
-    # is a vocabulary change, not a broken test.
-    for status in read_views.UNREACHABLE_STATUSES:
-        assert delivery_status.STATUS_LABELS[status] in body, status
+    assert "not recorded" in body
+
+
+def test_quantities_line_up_on_their_last_digit():
+    """`175.04` above `6`, both left-aligned, cannot be compared by eye — and a right-aligned column
+    under a left-aligned heading reads as two columns that happen to overlap, so the heading turns
+    with it."""
+    out = str(html.table(["PO", "Received"], [["208491", "175.04"]], table_id="t",
+                         num_columns=("Received",)))
+    assert '<td class="num">175.04</td>' in out
+    assert 'class="num"' in out.split("<tbody>")[0], "the heading did not turn with its column"
+    assert '<td>208491</td>' in out, "a column nobody named is left alone"
+    assert ".scroll th.num, th.num { text-align:right; }" in html._CSS
+
+
+def test_a_numeric_column_must_name_a_real_heading():
+    """Named rather than indexed, for the same reason as the date and choice columns: an index
+    silently points at the wrong column the day someone inserts one."""
+    with pytest.raises(ValueError):
+        html.table(["A", "B"], [["1", "2"]], table_id="t", num_columns=("Nope",))
+
+
+def test_the_delivery_page_can_be_narrowed_to_what_has_not_arrived():
+    """"What is still coming" is one question. Answering it by picking Ordered, then In transit,
+    then At partnered warehouse in turn and adding up is not answering it."""
+    body = markup_of("/ui/po")
+    assert 'data-choice-for="po-table"' in body
+    marked = re.findall(r'<th[^>]*data-choice="1"[^>]*>(.*?)</th>', body)
+    assert marked and "Status" in re.sub(r"<[^>]+>", "", marked[0])
+    assert ">My triage queue<" in body
+    # The entry stands for several statuses at once, and never for one that has already arrived.
+    value = re.search(r'<option value="([^"]*)">My triage queue</option>', body).group(1)
+    assert value, "the triage entry must name the statuses it stands for"
+    assert delivery_status.STATUS_LABELS[delivery_status.DELIVERED] not in value.split("|")
+
+
+def test_the_delivery_export_carries_every_purchase_order():
+    """Same rule as Mail's: the file is the whole table, not the page someone happens to be on."""
+    client = TestClient(app)
+    response = client.get("/ui/po.csv")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["content-disposition"]
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    assert len(lines) - 1 == client.get("/ui/po").text.count('<td><a href="/ui/po/')
+    # The page shows the release *reason* and hides the moment on hover; a file has no hover.
+    assert "Released at" in lines[0]
 
 
 def test_the_stepper_escapes_its_labels():
@@ -313,6 +363,46 @@ def test_the_mail_page_shows_both_stores_and_marks_each_row():
     assert rows, "no mail rows at all"
     for row in rows:
         assert "badge-sample" in row or "badge-inbox" in row, "a row rendered with no source"
+
+
+def test_the_subject_and_its_sender_are_one_cell():
+    """They were two columns, and one long address set the width of the sender column — which left
+    the subject, the thing anyone actually scans this table for, squeezed beside it. The full
+    address stays in `title`, which is also where the search box looks, so nothing is lost by
+    shortening what is drawn."""
+    body = TestClient(app).get("/ui/mails").text
+    headers = re.findall(r"<th[^>]*>(?:<button[^>]*>)?([A-Za-z #][^<]*)", body)
+    assert "Subject" in headers
+    assert "From" not in headers, "the sender moved into the subject cell"
+    assert 'class="cell-subject"' in body
+    assert 'class="from nw"' in body
+
+
+def test_a_shortened_address_keeps_the_domain_and_the_whole_one_on_hover():
+    """Which mailbox this came from is what identifies a sender at a glance. A truncation that cut
+    the domain off would make every address on the page end in the same meaningless prefix."""
+    short = routes._short_address("Rahulconsciouscreations@outlook.com")
+    assert short.endswith("@outlook.com")
+    assert short.startswith("Rahul")
+    assert len(short) < len("Rahulconsciouscreations@outlook.com")
+    assert routes._short_address("ap@premierpm.com") == "ap@premierpm.com", "short ones are left"
+    cell = str(routes._subject_cell("Delivered", "Rahulconsciouscreations@outlook.com"))
+    assert 'title="Rahulconsciouscreations@outlook.com"' in cell
+
+
+def test_the_mail_export_carries_every_row_and_no_formulas():
+    """An export that silently stopped at the page on screen would be worse than none, because
+    nothing about the file would say it was partial. And every cell in it is a string a mail server
+    chose — a spreadsheet runs one that opens with `=`."""
+    client = TestClient(app)
+    response = client.get("/ui/mails.csv")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["content-disposition"]
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    page_rows = client.get("/ui/mails").text.count('<tr class="clickable"')
+    assert len(lines) - 1 == page_rows, "the file and the page disagree about how much mail there is"
+    assert routes._csv_safe(["=cmd|' /c calc'!A0"])[0].startswith("'=")
+    assert routes._csv_safe(["plain"])[0] == "plain"
 
 
 def test_a_row_opens_the_message_from_its_own_store():
@@ -429,10 +519,22 @@ def test_the_delivery_bar_fragment_carries_the_stages_and_the_receipt_address():
     assert "/ui/po/208491" in fragment, "a way through to the full purchase order"
 
 
-def test_the_download_is_a_button():
-    body = TestClient(app).get("/ui/records").text
-    assert '<button class="btn" type="submit">Download .xlsx</button>' in body
-    assert 'action="/ui/records/receiver.xlsx"' in body
+def test_the_receiver_sheet_lives_on_one_page_now():
+    """It was the same report over the same data as `/ui/report` — one sheet on two pages — and
+    that route's own docstring said one of the two should go and that the choice was Premier's.
+    Dropped from Records on 2026-08-22 by that decision.
+
+    What must not go with it: the sheet's search, its group pager and a way to the workbook. The
+    duplicate was the thing to remove, not the controls that made the sheet readable.
+    """
+    records = TestClient(app).get("/ui/records").text
+    assert 'id="receipt-sheet"' not in records, "the duplicate sheet is back on Records"
+    assert "receiver.xlsx" not in records
+
+    report = TestClient(app).get("/ui/report").text
+    assert 'id="receipt-sheet"' in report
+    assert 'data-filter="receipt-sheet"' in report, "the sheet lost its search on the way over"
+    assert 'href="/ui/report.xlsx"' in report
 
 
 def test_the_receiver_report_offers_its_download_even_when_it_is_empty():
@@ -482,16 +584,83 @@ def test_the_verify_controls_are_where_someone_can_actually_find_them():
     """
     body = TestClient(app).get("/ui/records").text
 
-    # The section's own control sits on the heading row, before the note it is explained by.
-    heading = body.index("Ready to process further")
-    assert body.index('data-verify="/ui/records/verify"') < body.index('<p class="note">', heading), \
-        "the page-level button is below its own explanation again"
+    # The page-level button sits beside the title, above everything it acts on.
+    assert body.index('data-verify="/ui/records/verify"') < body.index('id="records-table"'), \
+        "the page-level button is below the table it acts on again"
+    assert 'class="bar-actions"' in body
 
-    # Second column, immediately after "#". Read through the wrapper: a sortable heading is a
+    # Straight after the selection box and "#". Read through the wrapper: a sortable heading is a
     # `<button>` inside its `<th>`, while Verify is in `no_sort` and stays a bare cell — so
-    # matching `<th>…</th>` literally sees only half the columns.
-    assert column_labels(body[heading:])[:2] == ["#", "Verify"], \
-        f"Verify is not the second column: {column_labels(body[heading:])[:4]}"
+    # matching a `<th>` literally sees only half the columns.
+    table = body[body.index('id="records-table"'):]
+    assert column_labels(table)[:4] == ["", "#", "Verify", "Post"], \
+        f"the controls are not where they were pinned: {column_labels(table)[:5]}"
+
+
+def test_verify_all_narrows_to_the_ticked_rows():
+    """One control, two meanings, and the button says which it is about to do: with nothing ticked
+    it verifies everything and reads "Verify all against Spitfire"; with rows ticked it verifies
+    those and says how many. A control that is disabled until someone guesses a checkbox turns it
+    on would be the alternative, and it teaches nobody anything.
+    """
+    body = TestClient(app).get("/ui/records").text
+    assert 'data-verify-selection="records-table"' in body
+    assert 'data-verify-all="Verify all against Spitfire"' in body
+    assert 'class="pick-all"' in body and 'data-pick-all="records-table"' in body
+    picks = re.findall(r'<input type="checkbox" class="pick" data-pick-for="records-table" '
+                       r'value="(\d+)"', body)
+    assert picks, "no per-row selection boxes"
+    # The script is what turns ticks into a narrower request; both halves are pinned, because
+    # either alone is a control that quietly acts on everything.
+    assert "pickedIn(scope)" in html._JS
+    assert "'ids=' + encodeURIComponent" in html._JS
+
+
+def test_a_selection_can_only_narrow_what_verify_touches():
+    """`?ids=` is a filter over what the page was already offering, never a way to name something
+    else: an id that is not in `records_ready` is dropped rather than looked up."""
+    client = TestClient(app)
+    everything = client.post("/ui/records/verify")
+    assert everything.status_code == 200
+    stranger = client.post("/ui/records/verify?ids=999999")
+    assert stranger.status_code == 200
+    assert "None of the selected records are still listed here." in stranger.text
+
+
+def test_the_records_export_carries_every_row():
+    """Same rule as Mail's and Delivery status': the file is the whole table."""
+    client = TestClient(app)
+    response = client.get("/ui/records.csv")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["content-disposition"]
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    assert len(lines) - 1 == client.get("/ui/records").text.count('class="pick" data-pick-for=')
+    # Two columns the page carries as controls rather than as text.
+    assert "Complete" in lines[0] and "Posted" in lines[0]
+
+
+def test_a_row_can_be_in_two_states_at_once():
+    """An attachment can be a signature logo *and* a file nothing could read. Comparing the whole
+    attribute made such a row match neither view: on the live store three of sixty fell through
+    both "Real files only" and "Inline images only" and were reachable from neither."""
+    marker = html._JS.split("var own = row.getAttribute('data-choice-value')")[1][:420]
+    assert "split(" in marker and "choices.some" in marker,         "the match must be an intersection of words, not an equality"
+    body = markup_of("/ui/attachments")
+    assert '<option value="inline">Inline images only</option>' in body
+    # Every listed row falls under one of the two file/inline views, so neither hides a row from
+    # both. That is the arithmetic the bug broke.
+    states = re.findall(r'data-choice-value="([^"]*)"', body)
+    assert states, "no row carries its state"
+    assert all("inline" in w.split() or "file" in w.split() for w in states)
+
+
+def test_the_records_page_can_be_narrowed_to_what_needs_a_person():
+    """The Complete cell holds a badge, a Fill button and a tooltip, so its rendered text is
+    "3 gaps Fill" — nothing a dropdown could name. The row carries the state instead."""
+    body = markup_of("/ui/records")
+    assert 'data-choice-value="gaps"' in body or 'data-choice-value="complete"' in body
+    assert '<option value="gaps">My triage queue</option>' in body
+    assert "row.getAttribute('data-choice-value')" in html._JS
 
 
 def test_something_listens_for_data_verify_and_posts_it():
@@ -508,7 +677,9 @@ def test_a_verify_button_inside_a_row_does_not_also_open_the_row_dialog():
     script = html._JS
     assert script.index("data-verify") < script.index("tr[data-frag]"), \
         "the verify branch must be checked before the row branch, or it is unreachable"
-    assert "closest('a,button')" in script
+    # `input` and `label` joined the list on 2026-08-22 with the selection checkbox: ticking a row
+    # also opened the popup over the table you were ticking in.
+    assert "closest('a,button,input,label')" in script
 
 
 def test_every_dialog_opener_has_a_dialog_and_a_handler_to_open_it():
@@ -536,6 +707,112 @@ def test_the_receiver_report_preview_carries_the_sheet_itself():
     body = TestClient(app).get("/ui/report").text
     assert '<dialog id="preview"' in body
     assert "Premier Design to Completion Report" in body, "the sheet is not in the dialog"
+
+
+# --- the message popup's layers, its one scrollbar, and the page behind it ---------------------
+# Three defects reported together, all in the same dialog: opening an attachment and closing it
+# threw the message away with it; the popup, the frame inside it and the page behind it each had
+# their own scrollbar; and the page behind scrolled under the backdrop.
+
+
+def test_the_message_dialog_does_not_close_itself_natively():
+    """`<form method="dialog">` closes unconditionally, with no JS involved and nothing it can be
+    told. That is why closing an attachment closed the message underneath it — the dialog has
+    layers and a native submit cannot know that. The ✕ must route through `_JS` instead.
+
+    `modal()`'s dialog keeps its native close and is deliberately not covered here: it holds one
+    server-rendered sheet and has no layers to step back through."""
+    assert 'method="dialog"' not in html._MAIL_DIALOG, \
+        "the ✕ closes natively again — layers cannot survive it"
+    assert "data-dialog-back" in html._MAIL_DIALOG, "the ✕ carries no attribute for _JS to act on"
+    assert "data-dialog-back" in html._JS, "nothing listens for data-dialog-back"
+
+
+def test_escape_steps_back_through_the_layers_before_closing():
+    """Escape on a `<dialog>` is the browser's, not ours. The only place to intervene is `cancel`,
+    which fires first and can be prevented — without that, one keystroke from an open attachment
+    discards the message and the reader has to find the row again."""
+    assert "'cancel'" in html._JS, "nothing handles the dialog's cancel event"
+    handler = html._JS.split("'cancel'")[1][:700]
+    assert "preventDefault" in handler, \
+        "cancel is observed but not prevented, so Escape still closes through the layers"
+    # Chrome fires this uncancelable when there is no fresh user activation, and Escape grants
+    # none — so a second Escape with no click in between lands there. Stepping back anyway would
+    # pop the layer AND let the dialog close, losing the message: the worst of both.
+    assert "e.cancelable" in handler, \
+        "the handler pops even when it cannot stop the close, which loses the layer it popped"
+    assert "onDialogClosed" in html._JS, "nothing recovers the layer an uncancelable Escape took"
+
+
+def test_back_to_message_pops_a_layer_rather_than_stacking_another():
+    """It carries a `data-frag` like every other control, so without a marker the loader would
+    treat a return as a new destination and ten open-and-backs would leave ten layers to press
+    Escape through. The `data-frag` stays: opened cold from /ui/attachments there is no message
+    underneath, and the button must still fetch one."""
+    for markup in (
+        html.attachment_viewer(filename="pod.pdf", size=10, label="PDF", verdict="",
+                               body=html.Raw(""), download_url="/d", mail_url="/ui/mail?id=x"),
+        html.attachment_viewer_missing(mail_url="/ui/mail?id=x"),
+    ):
+        back = re.search(r"<button[^>]*>\u2039 Back to message</button>", markup)
+        assert back, "the viewer has no way back at all"
+        assert 'data-back="1"' in back.group(0)
+        assert 'data-frag="/ui/mail?id=x"' in back.group(0), "the cold-open fallback is gone"
+
+    assert "data-back" in html._JS, "nothing treats data-back as a return"
+
+
+def test_opening_a_dialog_locks_the_page_behind_it():
+    """`showModal()` does not scroll-lock the document. Without this a wheel gesture over the
+    dimmed backdrop scrolls the table underneath, which reads as the popup itself moving."""
+    assert "modal-open" in html._JS, "openDialog never marks the document"
+    assert "html.modal-open { overflow:hidden; }" in html._CSS
+    assert "scrollbar-gutter: stable" in html._CSS, \
+        "hiding the page scrollbar will shift the layout sideways as the popup opens"
+
+
+def test_the_popup_has_exactly_one_scroll_container():
+    """The dialog clips and the body scrolls. It used to be `max-height:calc(94vh - 42px)` on the
+    body — arithmetic hard-coding the head's height — so a head that wrapped turned the dialog
+    itself into a second scroller and pushed the sticky head out of view."""
+    dialog = re.search(r"dialog\.modal \{[^}]*\}", html._CSS).group(0)
+    body = re.search(r"\.modal-body \{[^}]*\}", html._CSS).group(0)
+
+    assert "overflow:hidden" in dialog, "the dialog itself is a scroll container again"
+    assert "flex-direction:column" in html._CSS, "nothing lays the head and body out as a column"
+    assert "overflow:auto" in body and "min-height:0" in body, \
+        "min-height:0 is load-bearing — a flex item will not shrink below its content without it"
+    assert "calc(" not in body, "the body is sized by layout now, not by guessing the head's height"
+
+
+def test_a_closed_dialog_is_never_given_a_display():
+    """The trap this test exists to stop anyone falling into twice.
+
+    The UA sheet hides a closed dialog with `dialog:not([open]) { display:none }`. An author rule
+    setting `display` on a bare `dialog.modal` outranks that, so the CLOSED dialog stays laid out
+    across the page and silently swallows every click underneath it — the popup opens once and the
+    page behind is dead from then on. Nothing in the markup or the open popup looks wrong; it took
+    a browser and a hit test to find. Every `display` on this dialog must be scoped to `[open]`.
+    """
+    for match in re.finditer(r"(dialog\.modal[^{,]*)\{([^}]*)\}", html._CSS):
+        selector, block = match.group(1).strip(), match.group(2)
+        if "display:" in block.replace(" ", ""):
+            assert "[open]" in selector, \
+                f"`{selector}` sets display on a dialog that may be closed — it will eat clicks"
+
+
+def test_the_message_frame_is_measured_even_when_it_has_already_parsed():
+    """The frames arrive by innerHTML with their document in `srcdoc`, so the load event has
+    usually fired before anything can listen for it. Attaching a listener and nothing else meant
+    the frame kept its fallback height and scrolled internally — the second scrollbar people
+    actually hit."""
+    fit = html._JS[html._JS.index("function fitFrames"):]
+    fit = fit[:fit.index("\n}\n")]
+
+    assert "readyState" in fit, "fitFrames still waits for a load event that has already fired"
+    assert "ResizeObserver" in fit, "nothing re-measures once inline images land"
+    assert "view-frame" in fit, "the attachment's HTML preview is left scrolling internally"
+    assert "view-pdf" not in fit, "the PDF plugin owns its own scroller and must keep its height"
 
 
 def test_an_empty_receiver_report_says_where_the_populated_one_is():
@@ -668,18 +945,20 @@ def test_a_container_child_is_not_offered_a_download_that_would_404():
 
 def test_the_records_page_shows_delivery_status_per_row():
     body = TestClient(app).get("/ui/records").text
-    assert ">Delivery<" in body
+    # Named "Status" since 2026-08-22 — the same word the Delivery status page uses for the same
+    # badge, rather than two names for one fact.
+    assert ">Status<" in body
     assert 'href="/ui/po/208491"' in body
     # Delivered, not "At partnered warehouse": the Authority notice states the goods were received
     # and signed for, and that is the event that creates a receiver.
     assert delivery_status.STATUS_LABELS[delivery_status.DELIVERED] in body
 
 
-def test_the_records_page_carries_the_receipt_log_and_its_caveat():
-    body = TestClient(app).get("/ui/records").text
+def test_the_receiver_report_carries_the_receipt_log_and_its_caveat():
+    body = TestClient(app).get("/ui/report").text
     assert "Premier Design to Completion Report" in body
     assert "Receipt Log" in body
-    assert "receiver.xlsx" in body
+    assert "report.xlsx" in body
     # The caveat moved on 2026-08-21: Order Qty and Net now fill from the mirrored purchase order,
     # so the sheet no longer claims they never can. Final still cannot be worked out at all.
     assert "Final is always blank" in body
@@ -877,6 +1156,37 @@ def test_the_page_size_offered_includes_the_default_and_all():
     assert 'value="0"' in out and ">All<" in out
 
 
+def test_the_pager_says_which_rows_are_on_screen_and_offers_them_by_number():
+    """"Page 2 of 5" does not say whether the thing you are looking for is in this table at all.
+    The numbers themselves are written by the script, because how many pages there are depends on
+    what the filter left — a server-rendered "1 2 3" would be wrong the moment anyone typed."""
+    out = str(html.pager("t", 25))
+    assert 'class="pager-showing"' in out
+    assert 'class="pager-nums"' in out
+    assert "Showing " in html._JS and "paintPages" in html._JS
+    assert "'page-btn on'" in html._JS, "the page you are on has to be marked"
+    # Prev and Next step; a numbered button goes straight to that page.
+    assert "parseInt(want, 10)" in html._JS
+
+
+def test_a_long_run_of_pages_is_windowed_rather_than_listed():
+    """Two thousand rows at 25 a page is eighty buttons, which is not a control any more."""
+    numbers = re.search(r"function pageNumbers\(page, pages\) \{(.*?)\n\}", html._JS, re.S)
+    assert numbers, "pageNumbers() is what decides, and it has to exist to be pinned"
+    assert "pages <= 7" in numbers.group(1)
+    assert "out.push(0)" in numbers.group(1), "0 is the gap between the ends and the window"
+
+
+def test_a_view_may_name_several_verdicts_at_once():
+    """"What is waiting on me" is one question, and answering it by picking each verdict in turn
+    and adding up is not answering it."""
+    out = str(html.choice_filter("t", [("hold|not read yet", "My triage queue")],
+                                 label="View", all_label="All mail", boxed=True))
+    assert 'value="hold|not read yet"' in out
+    assert "choice.split('|')" in html._JS
+    assert "choices.indexOf(" in html._JS, "the match is against the list, not the whole string"
+
+
 def test_paging_and_filtering_are_separate_row_states():
     """A row can be off-screen because it did not match the search or because it is on another
     page. One class for both would make each pass clobber the other's decision."""
@@ -893,7 +1203,7 @@ def test_filtering_resets_to_the_first_page():
 def test_the_receiver_report_pages_by_purchase_order_not_by_row():
     """A page boundary inside a purchase order would split the block someone is holding beside
     Spitfire's own Receipt Log, which is the only thing that sheet is for."""
-    body = TestClient(app).get("/ui/records").text
+    body = TestClient(app).get("/ui/report").text
     assert 'data-pager-for="receipt-sheet"' in body
     assert 'data-unit="group"' in body
     assert 'data-group="' in body, "the sheet's rows must be grouped for group paging to work"
@@ -902,7 +1212,7 @@ def test_the_receiver_report_pages_by_purchase_order_not_by_row():
 def test_the_receiver_report_keeps_its_own_row_styling():
     """`.scroll` brings a zebra and a header rule the sheet must not pick up — it has `r-po`,
     `r-line` and `r-rcpt` of its own."""
-    body = TestClient(app).get("/ui/records").text
+    body = TestClient(app).get("/ui/report").text
     assert 'class="scroll plain" id="receipt-sheet"' in body
     assert ".scroll.plain tbody tr:nth-child(even)" in html._CSS
 
@@ -1000,7 +1310,8 @@ def test_the_attachment_pager_matches_the_shared_one():
     source = (Path(attachment_view.__file__)).read_text(encoding="utf-8")
     shared = str(html.pager("X", 25))
     for marker in ('class="pager"', 'data-page="prev"', 'data-page="next"',
-                   'class="pager-label"', 'data-unit=', 'data-page-size='):
+                   'class="pager-showing"', 'class="pager-nums"', 'data-unit=',
+                   'data-page-size='):
         assert marker in shared, f"html.pager() no longer emits {marker}"
         assert marker in source, (
             f"mail_view's hand-written pager is missing {marker} — it has drifted from html.pager()"
@@ -1031,9 +1342,9 @@ def test_every_column_sorts_except_the_ones_holding_a_control():
     """A heading is a real `<button>`: a `<th>` with a click handler is not focusable, so a column
     nobody can sort without a mouse. Verify is excluded because "sort by button" means nothing."""
     body = markup_of("/ui/records")
-    heading = body.index("Ready to process further")
-    section = body[heading:]
-    assert '<th data-sort="0" aria-sort="none"><button' in section
+    section = body[body.index('id="records-table"'):]
+    # 1, not 0: the selection checkbox is the first cell and sorts by nothing.
+    assert '<th data-sort="1" aria-sort="none"><button' in section
     assert "<th>Verify</th>" in section, "the control column must not become a sort button"
     for handler in ("onclick=", "onkeydown="):
         assert handler not in section
@@ -1054,7 +1365,7 @@ def test_the_sorted_column_says_so_to_a_screen_reader():
 def test_the_grouped_report_sheet_has_no_sortable_headings():
     """It is laid out to be read line by line beside Spitfire's own Receipt Log. Reordering its
     rows would take away the only thing it is for."""
-    body = markup_of("/ui/records")
+    body = markup_of("/ui/report")
     sheet = body[body.index('id="receipt-sheet"'):]
     assert "sort-btn" not in sheet[:sheet.index("</table>")]
 
@@ -1229,6 +1540,46 @@ def _live_store():
     return state_db.get_connection(settings.PIPELINE_STATE_DB_PATH)
 
 
+def test_a_table_pane_sizes_itself_by_flex_not_by_arithmetic():
+    """`height: calc(100vh - 400px)` was measured against a 908px-tall window. On a 642px laptop it
+    fell through to its minimum and the page showed three and a half rows of twenty-seven — the
+    failure that a number tuned to one screen will always eventually produce.
+
+    The pane takes what the bands above and below it did not want instead, so no screen height is
+    the right one and none is wrong.
+    """
+    pane = html._CSS.split(".scroll.pane {")[1].split("}")[0]
+    assert "100vh" not in pane, "the pane is counting pixels against the viewport again"
+    # Basis 0, not auto: from `auto` the pane starts at the height of every row it holds and has to
+    # be shrunk back down, which lets one long table decide the layout for the whole column.
+    assert "flex:1 1 0" in pane
+    # And a definite height to grow inside — `min-height:100vh` let the column grow past the
+    # window instead, which is the bug this pair was written after.
+    assert ".shell:has(.scroll.pane) { height:100vh; }" in html._CSS
+    for rule in (".content:has(.scroll.pane)", "main:has(.scroll.pane)",
+                 "main:has(.scroll.pane) > section"):
+        assert rule in html._CSS, f"{rule} is missing — the pane has no flex parent to grow into"
+    # Both floors, or the table pushes the column past the viewport instead of scrolling inside it.
+    assert html._CSS.count("min-height:0") >= 2
+
+
+def test_the_last_run_line_is_in_the_rail_not_under_the_table():
+    """It was a `<footer>` with 40px of padding under every table, spending a whole row of every
+    grid on a line that changes a few times a day. The rail had the space and was not using it."""
+    body = TestClient(app).get("/ui/mails").text
+    assert "<footer" not in body, "the footer is back under the table"
+    assert 'class="last-run"' in body
+    assert body.index('class="last-run"') < body.index('class="content"'), \
+        "the line must be inside the sidebar, which is rendered before the content column"
+    # Clipped to the minute: the raw value carries microseconds and a UTC offset, and the rail is
+    # 232px wide.
+    shown = re.search(r'class="last-run">([^<]*)<', body).group(1)
+    assert shown.startswith("Last run ") or shown == "Never run."
+    assert "." not in shown and "+" not in shown, f"still the raw timestamp: {shown!r}"
+    # Collapsed to 58px, the rail drops it like every other label.
+    assert ".rail .side-foot .last-run" in html._CSS
+
+
 def test_every_page_stamps_a_version_for_the_poller_to_compare():
     client = TestClient(app)
     for path in UI_PAGES:
@@ -1329,3 +1680,156 @@ def test_the_po_control_is_a_button_not_a_link():
     # `href="/ui/mail?` specifically — the sidebar's own link to `/ui/mails` is not this.
     assert 'href="/ui/mail?' not in body
     assert "data-mail=" in body
+
+
+# --- the page header, the rail's alert card, and the two new table filters -------------------
+#
+# All four are presentation, and presentation is exactly what nothing else in this file would
+# notice breaking. The rules they have to keep are not cosmetic though: one `class="on"` per page,
+# the date boxes surviving on every list page, and every filter that can hide a row being counted
+# by the readout beside the search box.
+
+
+def test_the_queue_alert_is_on_every_page_and_never_lights_the_nav():
+    """The rail must look the same everywhere.
+
+    Automation and Report built their own header and so passed no `counts` at all — they were the
+    two pages with no badge and no card, and a sidebar that changes shape depending on where you
+    are reads as a bug in the sidebar.
+
+    The card links to `/ui/manual` and must not carry `class="on"` even on that page; the nav entry
+    below it is the single active marker, which `test_the_active_nav_entry_is_marked_on_every_page`
+    counts across the whole document.
+    """
+    client = TestClient(app)
+    for path in ALL_UI_PAGES + ("/ui/automation", "/ui/report"):
+        body = client.get(path).text
+        assert body.count('class="side-alert"') == 1, f"{path}: no queue card in the rail"
+        assert 'href="/ui/manual" class="side-alert"' in body, path
+        assert body.count('class="on"') == 1, f"{path}: the card lit a second nav entry"
+
+
+def test_the_collapsed_rail_hides_the_alert_card_text():
+    """At 58px the card keeps its glyph and nothing else, or a 232px panel sits in a 58px rail."""
+    assert ".rail .side-alert .lbl, .rail .side-alert .count { display:none; }" in html._CSS
+    assert ".rail .side-alert {" in html._CSS
+
+
+def test_page_actions_render_beside_the_title():
+    """A control that acts on the whole page belongs next to its name, not part-way down the body.
+    `bar-text` wraps the title and subtitle so they stack and the actions can be pushed right."""
+    body = TestClient(app).get("/ui/mails").text
+    assert '<div class="bar-text">' in body
+    assert '<div class="bar-actions">' in body
+    assert 'class="btn primary small"' in body, "Check now is no longer the page action"
+    assert ".bar-actions { margin-left:auto;" in html._CSS
+
+
+def test_check_now_left_the_note_but_the_watch_state_did_not():
+    """Moving the button up must not take the sentence with it. Whether the arrival watch is on is
+    real state, and a page that only says "Check now" cannot explain why it looks stale."""
+    body = TestClient(app).get("/ui/mails").text
+    assert 'href="/ui/mails?refresh=1"' in body
+    assert "the new-mail watch is off" in body.lower() or "last checked" in body.lower()
+
+
+def test_date_presets_fill_the_range_rather_than_replacing_it():
+    """The chips are not a second filter. They write into the same two boxes the range already
+    uses, so there is one definition of "the last 7 days" and the two controls cannot disagree.
+
+    The pressed chip is `.sel`. It must never be `class="on"` — that string is counted per page.
+    """
+    body = TestClient(app).get("/ui/mails").text
+    assert 'class="chips"' in body
+    for days in ("0", "7", "30"):
+        assert f'data-range="{days}"' in body, days
+    assert 'class="chip sel" aria-pressed="true" data-range=""' in body, "All starts pressed"
+    # The boxes the chips write into are still there — several sweeps require them.
+    assert 'class="date-from"' in body and 'class="date-to"' in body
+    assert "markChips" in html._JS and "isoDay" in html._JS
+
+
+def test_an_exact_range_is_the_fifth_segment_of_the_same_control():
+    """It shipped as an unlabelled 33px square standing beside the chips, and the first thing the
+    reader asked was how you pick a custom range at all. "Today", "7d", "30d", "All" and "Custom"
+    are five answers to one question, so they are one control.
+
+    The panel is absolutely positioned inside the group, so the group must not clip it — that is
+    what the hand-rounded ends are for.
+    """
+    body = TestClient(app).get("/ui/mails").text
+    chips = body[body.index('class="chips"'):]
+    chips = chips[:chips.index("</div>", chips.index("date-custom"))]
+    assert "chip chip-cal" in chips, "the exact-range trigger is outside the group again"
+    assert ">Custom<" in chips, "the trigger has no visible label"
+    group = html._CSS.split(".chips {")[1].split("}")[0]
+    assert "overflow:hidden" not in group, "the group would clip its own panel"
+    assert ".chips > :first-child" in html._CSS and ".chips > :last-child" in html._CSS
+
+
+def test_the_custom_segment_lights_when_the_range_came_from_the_boxes():
+    """Otherwise the group shows nothing selected while a range is actively hiding two thirds of
+    the table — the same silent-hiding problem the count beside the search box exists to prevent.
+
+    It carries `data-range-for` with no `data-range`: it is the segment that means "not one of the
+    presets", which is exactly the case `markChips` is handed a null for.
+    """
+    body = TestClient(app).get("/ui/mails").text
+    assert re.search(r'<summary class="chip chip-cal" data-range-for="[^"]+" title=', body), \
+        "the segment must be findable by markChips and carry no preset of its own"
+    marker = html._JS.split("function markChips")[1].split("\nfunction ")[0]
+    assert "own === null ? days === null" in marker
+    # `aria-pressed` is a button state; a <summary> must not claim it.
+    assert "chip.tagName === 'BUTTON'" in marker
+
+
+def test_isoday_is_local_not_utc():
+    """`toISOString()` is UTC, so east of Greenwich "Today" would hide everything that arrived this
+    morning. The helper must build the day from local getters."""
+    start = html._JS.index("function isoDay(")
+    body = html._JS[start:start + 320]
+    assert "getFullYear()" in body and "getMonth()" in body and "getDate()" in body
+    assert "toISOString" not in body
+
+
+def test_the_verdict_dropdown_filters_one_named_column():
+    """By heading, never by position — an index quietly points at the wrong column the day someone
+    inserts one, and this table has twelve."""
+    body = TestClient(app).get("/ui/mails").text
+    assert 'class="choice-filter"' in body
+    assert 'data-choice-for="mail-table"' in body
+    marked = re.findall(r'<th[^>]*data-choice="1"[^>]*>(.*?)</th>', body, re.S)
+    assert marked, "no column is marked as the dropdown's column"
+    assert "Verdict" in marked[0], marked[0]
+    assert "choiceColumnOf" in html._JS
+
+
+def test_choice_column_must_name_a_real_heading():
+    """Same guard `date_column` has. A typo should fail loudly here, not filter nothing at runtime."""
+    with pytest.raises(ValueError):
+        html.table(["A", "B"], [["1", "2"]], table_id="t", choice_column="Nope")
+
+
+def test_every_filter_that_hides_rows_is_counted_by_the_readout():
+    """A filter that hides rows silently is indistinguishable from an empty table, which is how
+    someone concludes their mail was lost. `narrowed()` is the list of things that can hide a row,
+    and the dropdown had to join the search box and the date range in it."""
+    start = html._JS.index("function narrowed(")
+    body = html._JS[start:start + 500]
+    assert "date-from" in body and "date-to" in body
+    assert "choice-filter" in body, "the dropdown can hide rows without the count admitting it"
+
+
+def test_narrowing_by_date_or_verdict_also_fixes_the_zebra():
+    """`nth-child(even)` counts hidden rows. This watched only the search box, so a table narrowed
+    by date alone striped at random — and the dropdown would have been a second way in."""
+    start = html._JS.index("scope.classList.toggle('filtering'")
+    body = html._JS[start:start + 160]
+    assert "dateColumn >= 0" in body and "choiceColumn >= 0" in body
+
+
+def test_a_section_with_no_title_emits_no_heading():
+    """Mail's page title already says "Mail"; an `<h2>` repeating it is furniture, and an empty one
+    is worse — a screen reader announces a heading with nothing in it."""
+    assert "<h2>" not in str(html.section("", html.tag("p", "body")))
+    assert "<h2>Titled</h2>" in str(html.section("Titled", html.tag("p", "body")))

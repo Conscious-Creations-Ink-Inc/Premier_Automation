@@ -14,6 +14,8 @@ venv/
 # Editors
 .vscode/
 .idea/
+state/attachments/
+
 
 # Frontend — kept after the React app was deleted (11 Aug 2026) only so a stray `npm install`
 # in this tree cannot commit 1,700 packages. There is no build step and nothing to ignore.

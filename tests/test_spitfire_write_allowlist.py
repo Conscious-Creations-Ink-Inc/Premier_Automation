@@ -47,7 +47,9 @@ def test_the_posting_chain_is_permitted(method, path):
     ("DELETE", "/api/document/abc/attachments", "as above"),
     ("POST",   "/api/contact", "an empty body creates a blank contact; there is no validation"),
     ("POST",   "/api/system/supportcase", "files a case with Spitfire Management, an outside party"),
-    ("PUT",    "/api/document/abc/items", "an undiscoverable 500; the working call is POST"),
+    ("PUT",    "/api/document/abc/items",
+     "501 Not Implemented. The v23 schema documents it as 'Updates the item' and names the "
+     "alternative in its own description: PatchDocData, i.e. PATCH /session/changes"),
     ("PUT",    "/api/document/abc/attachments", "as above"),
     ("POST",   "/api/document/abc/date", "leaks raw SQL — FK_xsfDocDates_xsfDocDateType"),
 ])
@@ -93,3 +95,119 @@ def test_the_login_endpoint_is_not_reachable_from_the_write_connector():
     connector is allowed to call; here it is off the list, so even a caller that wanted to
     re-authenticate mid-post cannot."""
     assert not is_allowed("POST", "/api/Account")
+
+
+# --- the document-edit session ------------------------------------------------------------------
+#
+# The only route that can set a quantity on a receipt line. `POST /items` appends a row whose
+# every linking field is discarded on insert, and `PUT /items` answers 501.
+
+
+DOC = "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET",    "/api/document/abc/session"),
+    ("GET",    "/api/document/abc/session?freshenData=true"),
+    ("PATCH",  "/api/document/abc/session/changes"),
+    ("DELETE", f"/api/document/{DOC}/session?sessionID=xyz"),
+])
+def test_the_edit_session_is_permitted(method, path):
+    assert is_allowed(method, path)
+
+
+def test_the_delete_exception_requires_a_real_document_key():
+    """Deliberately stricter than the rest of the allowlist, which accepts any segment in a
+    wildcard. This is the one DELETE the connector may issue, so it is matched by shape and not by
+    position: a real GUID in the document slot, and `session` as the last word."""
+    assert not is_allowed("DELETE", "/api/document/abc/session")
+    assert is_allowed("DELETE", f"/api/document/{DOC}/session")
+
+
+@pytest.mark.parametrize("path", [
+    "/api/document/11111111-2222-3333-4444-555555555555",
+    "/api/document/11111111-2222-3333-4444-555555555555/items",
+    "/api/document/11111111-2222-3333-4444-555555555555/attachments",
+    "/api/document/11111111-2222-3333-4444-555555555555/items/all",
+    "/api/document/11111111-2222-3333-4444-555555555555/session/changes",
+    "/api/session/document/11111111-2222-3333-4444-555555555555",
+])
+def test_releasing_a_session_is_the_only_permitted_delete(path):
+    """`DELETE /api/document/{id}/session` commits an edit and removes nothing. It is matched by
+    shape — four segments, a real GUID, ending in `session` — so it cannot be widened into any of
+    the DELETEs below, each of which destroys something on a live ERP."""
+    assert not is_allowed("DELETE", path)
+
+
+def test_setting_a_quantity_drops_the_inherited_session_before_taking_its_own(monkeypatch):
+    """The subtlest failure in this chain, and one nothing in a response reveals.
+
+    `GET /session` does not create a session, it returns the one in force — and creating a receipt
+    and titling it leaves one behind. A change staged into that inherited session is silently
+    discarded. Measured on training 2026-08-22: two receipts built identically, one patched through
+    the inherited session and one through a session taken after releasing it. Every call in both
+    answered 200. The first read back 0.0, the second 4.0.
+    """
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return "session-guid"
+
+    client = spitfire_write.SpitfireWriteClient(base_url="https://example.invalid",
+                                                session_cookie="ticket")
+    monkeypatch.setattr(client, "_request",
+                        lambda method, path, **kw: (calls.append((method, path)), Response())[1])
+
+    client.set_line_quantity("abc", {"task-1": 4.0})
+
+    verbs = [m for m, _ in calls]
+    assert verbs[0] == "GET" and "session" in calls[0][1], "must look for an inherited session"
+    assert verbs[1] == "DELETE", "must release it before taking one of its own"
+    assert verbs.count("DELETE") == 2, "one release on the way in, one commit on the way out"
+    assert verbs[-1] == "DELETE", "the commit is the last thing that happens"
+    assert "PATCH" in verbs and calls[verbs.index("PATCH")][1].endswith("/session/changes")
+
+
+def test_a_quantity_is_sent_as_a_plain_decimal_string(monkeypatch):
+    """`DocFieldChange.Data` is a string. A whole number carries no trailing `.0`, which is how
+    sfPMS's own client sends it."""
+    sent = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return "session-guid"
+
+    client = spitfire_write.SpitfireWriteClient(base_url="https://example.invalid",
+                                                session_cookie="ticket")
+
+    def capture(method, path, **kw):
+        if method == "PATCH":
+            sent.extend(kw.get("json") or [])
+        return Response()
+
+    monkeypatch.setattr(client, "_request", capture)
+    client.set_line_quantity("abc", {"task-1": 4.0, "task-2": 2.5})
+
+    assert [c["Data"] for c in sent] == ["4", "2.5"]
+    assert {c["DataMember"] for c in sent} == {"DocItemTask"}
+    assert {c["DataField"] for c in sent} == {"Quantity"}
+    assert [c["InstanceKey"] for c in sent] == ["task-1", "task-2"]
+
+
+def test_nothing_is_sent_when_there_are_no_quantities(monkeypatch):
+    """No session is opened for an empty change set — taking an edit lock to do nothing would
+    leave one to be cleaned up for no reason."""
+    calls = []
+    client = spitfire_write.SpitfireWriteClient(base_url="https://example.invalid",
+                                                session_cookie="ticket")
+    monkeypatch.setattr(client, "_request", lambda *a, **k: calls.append(a))
+
+    client.set_line_quantity("abc", {})
+    assert calls == []

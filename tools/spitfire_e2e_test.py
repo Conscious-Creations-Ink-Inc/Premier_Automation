@@ -283,25 +283,72 @@ def create_receipt(h: Harness, run: Run, project: str, po_number: str, stamp: st
     return key
 
 
-def add_line(h: Harness, run: Run, receipt_key: str, picked: dict, qty: float) -> bool:
-    s = run.step("9", "add a receipt line")
-    it, task = picked["item"], picked["task"]
-    line = {
-        "Description": f"{TEST_MARKER} {_strip(it.get('SourceItemNumber'))}",
-        "SourceItemNumber": it.get("SourceItemNumber"),
-        "ItemQuantity": qty,
-        "DocItemTask": [{"UOM": task.get("UOM"), "ProjEntity": task.get("ProjEntity"),
-                         "Quantity": qty}],
-    }
-    r = h.write_call(s, "POST", f"/api/document/{receipt_key}/items", [line])
+def set_line_quantity(h: Harness, run: Run, receipt_key: str, picked: dict, qty: float) -> bool:
+    """Write the quantity onto the line Spitfire already built against this PO line.
+
+    Was `add_line`, which did `POST /items` and called the step a success if the document came back
+    with any rows at all. Both halves of that were wrong, and together they are why this harness
+    reported a working chain for weeks while nothing was ever counted:
+
+    * `POST /items` **appends** a row. `SCDocItemKey`, `Subcontract`, `ProjEntity`,
+      `AccountCategory`, `UOM` and the task quantity are all discarded on insert, leaving a line
+      attached to no purchase order line at all.
+    * Creating a receipt with `forBatch` already builds one item per PO line, correctly linked,
+      with only the quantity blank. The rows this step used to count were those — they would have
+      been there whether the POST had happened or not.
+
+    See `connectors.spitfire_write.set_line_quantity`, and
+    `dev_reports/2026-08-22-session-changes-verified.md` for the measurements.
+    """
+    s = run.step("9", "set the quantity on the receipt line")
+    it = picked["item"]
+    line_key = str((it.get("RelatedLineDetails") or {}).get("SCDocItemKey")
+                   or it.get("DocItemKey") or "")
+
+    rows = h.json_or_none(h.get(f"/api/document/{receipt_key}/items")) or []
+    target = next((row for row in rows
+                   if str((row.get("RelatedLineDetails") or {}).get("SCDocItemKey") or "").lower()
+                   == line_key.lower()), None)
+    if target is None:
+        s.ok = False
+        s.detail = f"the receipt carries no line against PO line {line_key[:8]}"
+        return False
+
+    task_key = str(((target.get("DocItemTask") or [{}])[0]).get("ItemTaskKey") or "")
+    if not task_key:
+        s.ok = False
+        s.detail = f"line {target.get('DocItemNumber')} has no ItemTaskKey"
+        return False
+
+    # Release the session left open by creating and titling the document. A change staged into an
+    # inherited session is silently discarded — every call still answers 200.
+    opened = h.json_or_none(h.get(f"/api/document/{receipt_key}/session"))
+    if isinstance(opened, str) and opened.strip():
+        h.write_call(s, "DELETE", f"/api/document/{receipt_key}/session?sessionID={opened}")
+
+    session = h.json_or_none(h.get(f"/api/document/{receipt_key}/session?freshenData=true"))
+    if not (isinstance(session, str) and session.strip()):
+        s.ok = False
+        s.detail = f"no edit session: {str(session)[:80]!r}"
+        return False
+
+    change = [{"DataMember": "DocItemTask", "DataField": "Quantity",
+               "InstanceKey": task_key, "Data": f"{qty:g}", "IsURIEncoded": False}]
+    r = h.write_call(s, "PATCH", f"/api/document/{receipt_key}/session/changes", change)
     if r is None:
         return False
-    rows = h.json_or_none(h.get(f"/api/document/{receipt_key}/items")) or []
-    s.ok = bool(rows)
-    s.detail = (f"{len(rows)} line(s); first={rows[0].get('DocItemNumber')} "
-                f"{rows[0].get('SourceItemNumber')} qty={rows[0].get('ItemQuantity')}"
-                if rows else f"{r.status_code} {r.text[:120]}")
-    return bool(rows)
+    # DELETE is what commits. POST /session/end answers 200 and does not.
+    h.write_call(s, "DELETE", f"/api/document/{receipt_key}/session?sessionID={session}")
+
+    # Read back only now, after the session is released — earlier returns the pre-change value.
+    after = h.json_or_none(h.get(f"/api/document/{receipt_key}/items")) or []
+    written = next((float(((row.get("DocItemTask") or [{}])[0]).get("Quantity") or 0.0)
+                    for row in after
+                    if row.get("DocItemNumber") == target.get("DocItemNumber")), 0.0)
+    s.ok = abs(written - qty) < 0.001
+    s.detail = (f"line {target.get('DocItemNumber')} "
+                f"{target.get('SourceItemNumber')} qty={written:g} (wanted {qty:g})")
+    return s.ok
 
 
 def attach_pod(h: Harness, run: Run, receipt_key: str, file_key: str) -> bool:
@@ -478,7 +525,7 @@ def main(argv=None) -> int:
                 file_key = upload_pod(h, run, stamp)
                 receipt_key = create_receipt(h, run, args.project, args.po, stamp)
                 if receipt_key:
-                    add_line(h, run, receipt_key, picked, qty)
+                    set_line_quantity(h, run, receipt_key, picked, qty)
                     if file_key:
                         attach_pod(h, run, receipt_key, file_key)
                     link_pay_request(h, run, args.project, args.po, receipt_key)

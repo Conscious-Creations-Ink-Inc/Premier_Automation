@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from config import settings
 from pipeline import completeness, dedupe, post_ledger, po_verify
@@ -74,8 +74,21 @@ class Decision:
     against. Copied from the order rather than derived, because a wrong one books the receipt to
     the wrong cost code and nothing downstream would notice."""
 
+    line_key: str = ""
+    """`DocItemKey` of the matched purchase order line — the GUID Spitfire uses to build the
+    receipt, and what `spitfire_write.find_prepopulated_line` matches on to find the row to write
+    the quantity into. Read from the mirror rather than carried on `LineCheck`, for the same reason
+    as `cost_code`: the Verify screen has no use for it."""
+
     verification: Optional[po_verify.RecordVerification] = None
     existing: Optional[post_ledger.PostAttempt] = None
+
+    body_evidence: str = ""
+    """Which signal in the email body stood in for a proof document, when there is none.
+
+    `"signer+date"` or `"carrier+tracking+date"` — see `body_evidence()`. Empty whenever a POD
+    exists, and empty on a record that reached POST through a person's waiver instead, so the two
+    routes past gate 2 are always distinguishable in the ledger and in the confirm dialog."""
 
     pod_waived_by: str = ""
     """Who accepted that this delivery may post with no proof document, when it has none.
@@ -94,6 +107,45 @@ class Decision:
 
 def _flag(record_id: int, reason: str, **extra: Any) -> Decision:
     return Decision(record_id=record_id, verdict=FLAG, reason=reason, **extra)
+
+
+def body_evidence(row: Any) -> str:
+    """The delivery evidence carried in the email body itself, or "" when there is none.
+
+    Premier's decision, 2026-08-22: a delivery whose particulars are all stated in the mail may
+    post without a proof document. This is what "all stated in the mail" is allowed to mean, and
+    it is deliberately narrower than "the record is complete".
+
+    Completeness alone would be the wrong test. 57 of the 92 records in the corpus come from
+    `Public Space - Pending Receipt Confirmation Orders.xlsx` and `Cameo Receivers.xlsx` — Premier's
+    own worklists of goods *awaiting* delivery. They are complete, they carry quantities and dates,
+    and nothing has arrived. Posting them would assert receipt of goods still in transit.
+
+    So the test is for evidence that someone took delivery: a person who signed for it, or a
+    carrier and a tracking number that can be checked against the carrier. Plus the date, because
+    a receipt has to state when.
+
+    Measured over the corpus, this admits exactly the sources that are genuine delivery
+    notifications and nothing else:
+
+        authority_delivered      10/10   carrier+tracking+date
+        authority_inbound         5/5    signer+date
+        pdf:carrier_pod           4/4    signer+date
+        html:confirmation_grid    1/5
+        excel:Hoja1               0/57    <- the pending-confirmation worklists
+        freetext                  0/10
+
+    Read only from fields the parsers extracted, never from prose. A signal this returns is a fact
+    the extraction already committed to, which is what makes it auditable after the fact.
+    """
+    if not str(_get(row, "pod_stated_date") or "").strip():
+        return ""
+    if str(_get(row, "received_by") or "").strip():
+        return "signer+date"
+    if (str(_get(row, "carrier_name") or "").strip()
+            and str(_get(row, "tracking_number") or "").strip()):
+        return "carrier+tracking+date"
+    return ""
 
 
 def decide(conn: sqlite3.Connection, row: Any,
@@ -145,7 +197,12 @@ def decide(conn: sqlite3.Connection, row: Any,
     #    in bulk. See `waiver_of` below and `api/ui/routes.py::waive_pod`.
     if not pod_md5:
         waived_by = str(_get(row, "pod_waived_by") or "").strip()
-        if not waived_by:
+        # Premier's decision, 2026-08-22: a delivery whose particulars are all stated in the mail
+        # may post without a proof document. `body_evidence` is deliberately narrower than "the
+        # record is complete" — it requires a signer or a carrier reference, which is what
+        # separates a delivery notification from a row on a pending-confirmation spreadsheet. The
+        # objection above still stands for everything it does not admit.
+        if not (waived_by or body_evidence(row)):
             # `pod_reason` distinguishes the two cases the caller can tell apart and this module
             # cannot: an email that carried nothing usable, versus an attachment whose bytes were
             # never stored. They need different fixes — one is a data problem at Premier's end, the
@@ -256,13 +313,16 @@ def decide(conn: sqlite3.Connection, row: Any,
                      "verify the PO once so the mirror records it",
                      po_number=po_number, verification=verification)
 
+    facts = _line_facts(conn, po_number, check)
     return Decision(
         record_id=record_id, verdict=POST, po_number=po_number, project_code=project_code,
         line_number=check.line_number, quantity=check.record_quantity,
         unit_of_measure=check.unit_of_measure, spec_code=check.spec_code,
-        description=check.description, cost_code=_cost_code_of(conn, po_number, check),
+        description=check.description, cost_code=facts["cost_code"], line_key=facts["line_key"],
         verification=verification,
-        pod_waived_by="" if pod_md5 else str(_get(row, "pod_waived_by") or "").strip())
+        pod_waived_by="" if pod_md5 else str(_get(row, "pod_waived_by") or "").strip(),
+        body_evidence="" if (pod_md5 or str(_get(row, "pod_waived_by") or "").strip())
+                      else body_evidence(row))
 
 
 def _describe_existing(attempt: post_ledger.PostAttempt) -> str:
@@ -299,21 +359,25 @@ def _project_of(conn: sqlite3.Connection, po_number: str) -> str:
     return str(row["project_code"]) if row and row["project_code"] else ""
 
 
-def _cost_code_of(conn: sqlite3.Connection, po_number: str,
-                  check: po_verify.LineCheck) -> str:
-    """`ProjEntity` for the matched line, from the mirrored PO lines.
+def _line_facts(conn: sqlite3.Connection, po_number: str,
+                check: po_verify.LineCheck) -> Dict[str, str]:
+    """`ProjEntity` and `DocItemKey` for the matched line, from the mirrored PO lines.
 
-    Read from the mirror rather than carried on `LineCheck`, which does not hold it — the Verify
-    screen has no use for a cost code, and adding one there for this module's sake would widen a
-    dataclass that exists to answer a different question.
+    Read from the mirror rather than carried on `LineCheck`, which holds neither — the Verify
+    screen has no use for a cost code or a line key, and adding them there for this module's sake
+    would widen a dataclass that exists to answer a different question.
+
+    One query for both, because they are always wanted together and always come from the same row.
     """
     if check.line_number is None:
-        return ""
+        return {"cost_code": "", "line_key": ""}
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        "SELECT cost_code FROM spitfire_po_lines WHERE po_number = ? AND line_number = ?",
+        "SELECT cost_code, line_key FROM spitfire_po_lines WHERE po_number = ? AND line_number = ?",
         (po_number, check.line_number)).fetchone()
-    return str(row["cost_code"]) if row and row["cost_code"] else ""
+    if row is None:
+        return {"cost_code": "", "line_key": ""}
+    return {"cost_code": str(row["cost_code"] or ""), "line_key": str(row["line_key"] or "")}
 
 
 def _get(row: Any, name: str) -> Any:

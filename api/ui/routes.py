@@ -18,6 +18,8 @@ nothing.
 Read-only except the four `POST /ui/automation/*` controls, all of which redirect so a refresh never
 re-submits. There are no filters, no sorting controls and no per-row actions.
 """
+import csv
+import io
 import os
 import sqlite3
 from collections import OrderedDict
@@ -76,19 +78,39 @@ def _chrome(conn: sqlite3.Connection) -> dict:
     """
     s = read_views.summary_across_sources()
     order = ("surface", "hold", "route", "hide", "error")
-    pairs = [("emails", s.emails)]
-    pairs += [(category, s.by_category[category]) for category in order if s.by_category.get(category)]
+    # The third element is the card's tone, and it is the badge ramp's, not a new one: a `surface`
+    # figure and a `surface` pill in the table below it are the same green. `alert` is spent once,
+    # on the only figure that means a person has to do something — and only while it is not zero.
+    tones = {"surface": "good", "hold": "warn", "error": "warn"}
+    pairs = [("emails", s.emails, "")]
+    pairs += [(category, s.by_category[category], tones.get(category, ""))
+              for category in order if s.by_category.get(category)]
     pairs += [
-        ("records", s.records_total),
-        ("ready", s.records_ready),
-        ("need a human", s.needs_human),
-        ("OCR pages", s.ocr_pages),
+        ("records", s.records_total, ""),
+        ("ready", s.records_ready, "good"),
+        ("need a human", s.needs_human, "alert" if s.needs_human else ""),
+        ("OCR pages", s.ocr_pages, ""),
     ]
     return {
         "header": html.stats(pairs),
-        "footer": f"Last run {s.last_run}" if s.last_run else "Never run.",
-        "counts": {"/ui/manual": s.needs_human},
+        # Clipped to the minute, and the `T` dropped. It reads in the sidebar now (see
+        # `html.page`), where `2026-08-17T17:41:18.142282+00:00` would wrap to three lines to
+        # deliver six digits of precision nobody has ever wanted from it.
+        "footer": (f"Last run {s.last_run[:16].replace('T', ' ')}" if s.last_run else "Never run."),
+        **_sidebar_counts(),
     }
+
+
+def _sidebar_counts() -> dict:
+    """Just the sidebar's queue figure, for a page that builds its own header.
+
+    Automation and Report show four figures of their own rather than the eight-chip strip, so they
+    cannot take `_chrome()` wholesale — and because they took none of it, they were the two pages
+    with no queue badge and no alert card at all. A rail that changes shape depending on which page
+    you are on reads as a bug in the rail, so the count is separable from the header it used to
+    arrive with.
+    """
+    return {"counts": {"/ui/manual": read_views.summary_across_sources().needs_human}}
 
 
 @router.get("", response_class=HTMLResponse)
@@ -120,8 +142,8 @@ def mails_page(refresh: int = 0,
     for a in pending:
         rows.append([
             html.badge("inbox", "inbox"),
-            html.when((a.received_at or "")[:16].replace("T", " ")),
-            _clipped(a.subject, 52), a.sender,
+            _stamp((a.received_at or "")[:16].replace("T", " ")),
+            _subject_cell(a.subject, a.sender),
             html.badge("not read yet", "hold"), html.muted("—"),
             html.muted("waiting for the next run"), html.muted("—"),
             "yes" if a.has_attachments else html.muted("0"),
@@ -129,37 +151,52 @@ def mails_page(refresh: int = 0,
         ])
 
     for m in mails_list:
-        sender = m.sender
-        if m.origin_sender and m.origin_sender != m.sender:
-            # Every corpus message is a Fw: from an internal expeditor, so the envelope sender is
-            # premierpm.com on all of them; the recovered origin is the one that means anything.
-            sender = html.Raw(html.esc(m.sender) + " " + str(html.muted(f"(via {m.origin_sender})")))
         attachments = str(m.attachment_count)
         if m.attachments_flagged:
             attachments = html.Raw(f"{m.attachment_count} " + str(html.muted(f"({m.attachments_flagged} flagged)")))
         rows.append([
             html.badge(m.source_label, m.source),
-            html.when(m.email_date[:16]),
-            # Truncated, with the whole thing on hover. A thirteenth column arrived with the source
-            # badge, and these two are the only free-text ones — left full they wrap to seven lines
-            # and every row stands 140px tall, which is what a dense grid exists to avoid.
-            _clipped(m.subject, 52), sender,
-            html.badge(m.category, m.category), html.token(m.matched_rule),
+            _stamp(m.email_date[:16]),
+            # Truncated, with the whole thing on hover. Subject and Why are the only free-text
+            # columns — left full they wrap to seven lines and every row stands 140px tall, which
+            # is what a dense grid exists to avoid.
+            _subject_cell(m.subject, m.sender, via=m.origin_sender),
+            html.badge(m.category, m.category), _stamp(m.matched_rule),
             _clipped(m.reason, 48), m.po_hints or html.muted("—"),
             attachments, m.records, m.ocr_attempted or html.muted("0"), m.folder,
         ])
+    # Built from the rows actually on the page, never a fixed list. A verdict nothing carries is a
+    # choice whose only possible outcome is an empty table, and `hide` is absent far more often
+    # than it is present.
+    verdicts = [(v, v) for v in sorted({m.category for m in mails_list if m.category})]
+    if pending:
+        # The arrivals' own cell reads "not read yet" rather than a category, so it needs its own
+        # entry — and it is the one people will reach for most, being the only actionable state.
+        verdicts.append(("not read yet", "not read yet"))
+    # One entry above the verdicts standing for all of them that mean a person still has to look.
+    # Asking "what is waiting on me" is the question this page gets asked most, and answering it
+    # by picking each verdict in turn and adding up is not answering it.
+    waiting = [v for v, _ in verdicts if v in ("hold", "error", "not read yet")]
+    views = ([("|".join(waiting), "My triage queue")] if waiting else []) + verdicts
+
     body = html.section(
-        "Mail, and what the orchestrator decided about it",
+        "",
         _unprocessed_note(refresh=bool(refresh), pending=len(pending)),
-        html.search_box("mail-table",
-                        placeholder="Search PO, subject, sender, verdict…",
-                        label="Search mail"),
-        html.date_filter("mail-table", label="received date"),
+        html.tag(
+            "div",
+            html.search_box("mail-table",
+                            placeholder="Search PO, subject, sender, verdict…",
+                            label="Search mail"),
+            html.date_filter("mail-table", label="received date", presets=True),
+            html.choice_filter("mail-table", views, label="View",
+                               all_label="All mail", boxed=True),
+            class_="controls",
+        ),
         html.table(
-            ["Source", "Received", "Subject", "From", "Verdict", "Rule", "Why", "POs",
+            ["Source", "Received", "Subject", "Verdict", "Rule", "Why", "POs",
              "Attachments", "Records", "OCR", "Filed to"],
-            rows, empty=_EMPTY_HINT, table_id="mail-table", page_size=50,
-            date_column="Received",
+            rows, empty=_EMPTY_HINT, table_id="mail-table", page_size=25, pane=True,
+            date_column="Received", choice_column="Verdict",
             # `src` is what reopens a message from the store it actually lives in. Without it every
             # row would be looked up in the corpus and live mail would report itself missing.
             #
@@ -175,11 +212,68 @@ def mails_page(refresh: int = 0,
             ),
             frag_title="Open this message",
         ),
-        note="Every email that has been through Stage 1, newest first, read from Premier's "
-             "receiving mailbox. One row per email, always. Click a row to read the message and "
-             "its attachments.",
     )
-    return html.page("Mail", "/ui/mails", body, **_chrome(conn))
+    return html.page(
+        "Mail", "/ui/mails", body,
+        subtitle="Every email through Stage 1, newest first. One row per email, always. "
+                 "Click a row to read the message and its attachments.",
+        actions=[_export_mail(), _check_now()],
+        **_chrome(conn))
+
+
+_MAIL_CSV_COLUMNS = ("Source", "Received", "Subject", "From", "Origin", "Verdict", "Rule", "Why",
+                     "POs", "Attachments", "Flagged", "Records", "OCR", "Filed to", "Email id")
+
+
+@router.get("/mails.csv")
+def mails_csv(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> Response:
+    """The Mail table as a file, whole and untruncated.
+
+    Read-only, like the page: the same `mails_across_sources()` the table is built from, with the
+    values full-length rather than clipped to a column width, and the arrivals nothing has read
+    yet in the same place they sit on screen — above the verdicts, marked as unread rather than
+    given one.
+
+    Values go through `_csv_safe`. Every cell here is a string a mail server chose, and a
+    spreadsheet treats one that opens with `=` as a formula to run.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(_MAIL_CSV_COLUMNS)
+    for a in mail_arrivals.pending(conn):
+        writer.writerow(_csv_safe([
+            "inbox", (a.received_at or "")[:16].replace("T", " "), a.subject, a.sender, "",
+            "not read yet", "", "waiting for the next run", "",
+            "yes" if a.has_attachments else "0", "", "", "0", "", a.email_id,
+        ]))
+    for m in read_views.mails_across_sources():
+        writer.writerow(_csv_safe([
+            m.source_label, m.email_date[:16], m.subject, m.sender, m.origin_sender or "",
+            m.category, m.matched_rule, m.reason, m.po_hints, m.attachment_count,
+            m.attachments_flagged, m.records, m.ocr_attempted, m.folder, m.email_id,
+        ]))
+    # A BOM, so Excel opens a UTF-8 file as UTF-8 instead of as the local codepage — without it
+    # every non-ASCII character in a subject line arrives as mojibake.
+    return Response(
+        buffer.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="premier-mail.csv"',
+                 "X-Content-Type-Options": "nosniff"},
+    )
+
+
+def _csv_safe(values) -> list:
+    """Cells a spreadsheet will not execute.
+
+    Excel and Sheets both treat a cell opening with `=`, `+`, `-` or `@` as a formula, and every
+    string in this file is text a mail server sent — the same untrusted input the rest of this
+    module escapes on the way into HTML. A leading apostrophe makes it text again.
+    """
+    out = []
+    for value in values:
+        text = "" if value is None else str(value)
+        out.append("'" + text if text[:1] in ("=", "+", "-", "@") else text)
+    return out
 
 
 def _gap_badge(row) -> html.Raw:
@@ -236,6 +330,72 @@ def _clipped(value, limit: int):
     return html.tag("span", text[:limit].rstrip() + "…", title=text, class_="nw")
 
 
+def _stamp(value) -> html.Raw:
+    """An identifier — a timestamp, a rule name — in the column's own monospaced face.
+
+    Two columns of these sit side by side on Mail, and in a proportional face `2026-08-17T17:41`
+    over `2026-08-12T14:08` does not line up digit for digit, so a column of times cannot be read
+    as a column. The prose columns beside them stay in the text face.
+    """
+    return html.tag("span", html.when(value), class_="mono")
+
+
+def _short_address(address: str, limit: int = 20) -> str:
+    """`Rahulconsciouscreations@outlook.com` → `Rahul…@outlook.com`.
+
+    The domain is kept whole and the local part gives way, because which mailbox this came from is
+    the part that identifies a sender at a glance — and a truncation that cut the domain off would
+    make every address on the page end in the same meaningless prefix.
+
+    The full address is still in the cell's `title`, which is also where the search box looks.
+    """
+    text = (address or "").strip()
+    if len(text) <= limit or "@" not in text:
+        return text
+    local, _, domain = text.partition("@")
+    keep = max(3, limit - len(domain) - 2)
+    if len(local) <= keep:
+        return text
+    return local[:keep] + "…@" + domain
+
+
+def _subject_cell(subject, sender, via: str = "") -> html.Raw:
+    """Subject over sender, in one cell.
+
+    They were two columns. One long address set the width of the sender column, which left the
+    subject — the thing anyone actually scans this table for — squeezed beside it, and the pair
+    took a third of the grid between them. Stacked, the subject gets the width and the sender is
+    still there to be read.
+
+    `via` is the recovered origin of a forward: every corpus message is a `Fw:` from an internal
+    expeditor, so the envelope sender is premierpm.com on all of them and the origin is the one
+    that means anything.
+    """
+    subject_text = (subject or "").strip() or "(no subject)"
+    shown = subject_text if len(subject_text) <= 52 else subject_text[:52].rstrip() + "…"
+    line = _short_address(sender)
+    full = (sender or "").strip()
+    if via and via.strip().lower() != (sender or "").strip().lower():
+        line = f"{line} (via {_short_address(via)})"
+        full = f"{full} (via {via})"
+    return html.tag(
+        "div",
+        html.tag("span", shown, class_="subj nw", title=subject_text),
+        html.tag("span", line or "—", class_="from nw", title=full or "no sender"),
+        class_="cell-subject",
+    )
+
+
+def _export_mail() -> html.Raw:
+    """The table someone is looking at, as a file they can keep.
+
+    Every row and every column, not the page on screen: an export that silently stopped at fifty
+    rows would be worse than none, because nothing about the file would say it was partial.
+    """
+    return html.tag("a", html.DOWNLOAD_ICON, "Export", href="/ui/mails.csv", class_="btn small",
+                    title="Download every row of this table as CSV")
+
+
 def _unprocessed_note(refresh: bool = False, pending: int = 0) -> html.Raw:
     """Mail sitting in the mailbox that nothing has read yet.
 
@@ -278,12 +438,24 @@ def _unprocessed_note(refresh: bool = False, pending: int = 0) -> html.Raw:
         state = html.muted("Not checked yet. ")
 
     return html.tag("p", text, state,
-                    html.tag("a", "Check now", href="/ui/mails?refresh=1",
-                             class_="btn ghost small", style="margin-left:4px"),
+                    # "Check now" is no longer here — it acts on the page, so it lives beside the
+                    # page title (`_check_now`). "Turn the watch on" stays, because it only makes
+                    # sense next to the sentence saying the watch is off.
                     (html.tag("a", "Turn the watch on", href="/ui/automation",
-                              class_="btn ghost small", style="margin-left:6px")
+                              class_="btn ghost small", style="margin-left:4px")
                      if not watch.enabled else html.Raw("")),
                     class_="note")
+
+
+def _check_now() -> html.Raw:
+    """The deep re-read, as a page-level action rather than a link inside a paragraph.
+
+    It is a plain `<a>` and not a form because it changes nothing of ours by being pressed — it is
+    `GET /ui/mails?refresh=1`, the same page asking to be built from a live mailbox read. Kept as
+    the page's one filled button: it is the only thing on Mail that reaches outside the database.
+    """
+    return html.tag("a", "Check now", href="/ui/mails?refresh=1", class_="btn primary small",
+                    title="Read the mailbox now instead of waiting for the next run")
 
 
 def _deep_refresh_note() -> html.Raw:
@@ -367,7 +539,8 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
         mm = flags.get(r["id"])
         rows.append([
             r["id"],
-            # Second column, not last. This table is eighteen columns wide and scrolls sideways, so
+            # Second and third columns, not last. This table is twenty columns wide and scrolls
+            # sideways, so
             # a Verify cell on the far right is a control nobody can reach without already knowing
             # it is there — which is exactly what happened. It reads this row's purchase order back
             # out of Spitfire and shows those quantities against the ones the email stated. The row
@@ -381,6 +554,9 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             # posted row reads "Posted" rather than inviting a second attempt that the ledger
             # would only refuse.
             _post_cell(posted.get(r["id"]), r, has_pod=r["source_email_id"] in pod_emails),
+            # Whether a receiver line could be built from this row, in front of the row itself.
+            # It is the question this page exists to answer, and it used to be the sixth column.
+            _gap_badge(r),
             # Two destinations, deliberately distinguishable rather than one link that does a
             # surprising thing: the number goes to the purchase order, the envelope opens the email
             # this line was read from, so the two can be compared.
@@ -388,15 +564,16 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
                      + str(html.mail_link(r["source_email_id"], "✉",
                                           title="Open the email this line was read from"))),
             html.badge(po.label, po.status) if po else html.muted("—"),
-            _gap_badge(r),
-            r["po_line_number"] if r["po_line_number"] is not None else html.muted("—"),
-            _mm(html.token(r["spec_code"]), mm, "spec"),
-            (r["item_description"] or "")[:70],
+            _mm(_stamp(r["spec_code"]), mm, "spec"),
+            _clipped(r["item_description"], 46),
             _mm(_num(r["quantity_received"]), mm, "qty"),
             _mm(r["unit_of_measure"] or html.muted("—"), mm, "uom"),
-            package or html.muted("—"), html.when(r["pod_stated_date"]),
-            r["carrier_name"] or html.muted("—"), html.token(r["tracking_number"]),
-            r["received_by"] or html.muted("—"), f"{r['extraction_confidence']:.2f}",
+            _stamp(r["tracking_number"]),
+            r["received_by"] or html.muted("—"),
+            r["po_line_number"] if r["po_line_number"] is not None else html.muted("—"),
+            package or html.muted("—"), _stamp(r["pod_stated_date"]),
+            r["carrier_name"] or html.muted("—"),
+            f"{r['extraction_confidence']:.2f}",
             html.origin_badge(r["origin"], r["created_by"]),
             r["extraction_source"],
             # The row itself opens the delivery bar, so the message keeps its own control here
@@ -405,63 +582,112 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             # and carried no `src`, so it resolved against the corpus and reported itself missing.
             html.mail_link(r["source_email_id"], r["email_subject"][:40] or "(no subject)"),
         ])
+    # Which rows still need a person, as a value the filter can match. It cannot be read off the
+    # Complete cell: that cell holds a badge, a Fill button and a tooltip, so its rendered text is
+    # "3 gaps Fill" rather than anything a dropdown could name.
+    complete_flags = [completeness.gaps(r).is_complete for r in records]
+    choice_values = ["complete" if flag else "gaps" for flag in complete_flags]
+    views = []
+    if not all(complete_flags):
+        views.append(("gaps", "My triage queue"))
+    if any(complete_flags):
+        views.append(("complete", "Complete"))
+
     body = html.section(
-        "Ready to process further",
-        html.search_box("records-table",
-                        placeholder="Search PO, spec, description, carrier, tracking…",
-                        label="Search records"),
-        html.date_filter("records-table", label="POD date"),
+        "",
+        html.tag(
+            "div",
+            html.search_box("records-table",
+                            # Short enough to survive the field, which is a third of the width it
+                            # was. The hint is not a contract: the filter matches the whole row and
+                            # every `title` on it, carrier and tracking among them.
+                            placeholder="Search PO, spec, description…",
+                            label="Search records"),
+            html.date_filter("records-table", label="POD date", presets=True),
+            html.choice_filter("records-table", views, label="View",
+                               all_label="All records", boxed=True),
+            class_="controls",
+        ),
         html.table(
-            ["#", "Verify", "Post", "PO", "Delivery", "Complete", "Line", "Spec", "Description",
-             "Qty", "UOM", "Package", "POD date", "Carrier", "Tracking", "Received by", "Conf",
-             "Origin", "Source", "From email"],
-            rows, empty=_EMPTY_HINT, table_id="records-table", page_size=50,
+            ["#", "Verify", "Post", "Complete", "PO", "Status", "Spec", "Description",
+             "Qty", "Unit", "Tracking", "Received by", "Line", "Package", "POD date", "Carrier",
+             "Conf", "Origin", "Source", "From email"],
+            rows, empty=_EMPTY_HINT, table_id="records-table", page_size=25, pane=True,
             date_column="POD date", no_sort=("Verify", "Post"),
+            num_columns=("Qty", "Conf"),
+            # The tick is what makes "Verify all against Spitfire" mean "verify these five".
+            select_ids=[r["id"] for r in records], select_noun="record",
+            choice_values=choice_values,
             frag_urls=[f"/ui/po/{quote(r['po_number'])}/bar" for r in records],
             frag_title="Show this delivery's progress",
         ),
-        note=f"{len(records)} pending record(s) carrying a PO, non-zero confidence and no "
-             f"cross-source quantity conflict — which is all being *ready* has ever meant. The "
-             f"Complete column is the stronger test: it asks whether a receiver line could actually "
-             f"be built from the row, and anything short of that is also listed on the manual page "
-             f"with the missing fields named. Nothing here is withheld from the pipeline for being "
-             f"incomplete. Click a row to see where that delivery stands. Verify reads the purchase "
-             f"order from Spitfire and shows what it holds against what the email said — it states "
-             f"the figures and does not decide whether they are acceptable.",
-        action=html.verify_button(
-            "/ui/records/verify", "Verify all against Spitfire",
-            title="Read every listed purchase order from Spitfire and compare quantities"),
     )
+    # The Receiver report sheet used to sit under this table, with its own search, its own pager and
+    # its own .xlsx download. It was the same report over the same data as `/ui/report` — see that
+    # route's docstring, which said one of the two should go and that the choice was Premier's.
+    # Removed here on 2026-08-22 by that decision; the sidebar entry is the one that survived.
+    return html.page(
+        "Records", "/ui/records", body,
+        subtitle="Pending records carrying a PO, non-zero confidence and no quantity conflict. "
+                 "Verify reads the purchase order from Spitfire.",
+        actions=[
+            _export_records(),
+            html.verify_button(
+                "/ui/records/verify", "Verify all against Spitfire", primary=True,
+                selection="records-table",
+                title="Read every listed purchase order from Spitfire and compare quantities"),
+        ],
+        **_chrome(conn))
 
-    # The same builder the operations console uses, so the sheet on screen here and the file
-    # Premier downloads from either place cannot drift apart.
-    report = receipt_log.build(conn)
-    sheet = html.section(
-        "Receiver report",
-        # A real button, not a styled link: it produces a file, which is an action.
-        html.Raw(
-            '<form method="get" action="/ui/records/receiver.xlsx" style="margin:0 0 12px">'
-            '<button class="btn" type="submit">Download .xlsx</button></form>'
-        ),
-        html.search_box("receipt-sheet", placeholder="Search PO, vendor, spec, receiver…",
-                        label="Search the receiver report"),
-        # Paged by purchase order, not by row, and `plain` because the sheet brings its own row
-        # styling. Ten POs at a time: a page boundary inside a PO would split the block someone is
-        # holding beside Spitfire's own Receipt Log, and that block is the whole point of the sheet.
-        # "All" is one press away in the pager, and the .xlsx download is never paged.
-        html.scroll_block(html.Raw(receipt_log.to_html(report)), table_id="receipt-sheet",
-                          page_size=10, unit="group", plain=True),
-        note="Laid out like Spitfire's own Receipt Log and grouped by PO number, so the two can be "
-             "compared line by line. Shown ten purchase orders at a time — set 'per page' to All, "
-             "or download the .xlsx, to get the whole sheet at once. Order Qty comes from the "
-             "purchase order and fills in once that PO has been read from Spitfire; Net is "
-             "Order Qty minus Received and follows it. Both stay blank until then rather than "
-             "showing a number nothing supports. Final is always blank — it is a flag a person "
-             "sets in Spitfire and cannot be worked out from quantities. The Receiver column says "
-             "who took delivery, or how the record was made when nobody signed.",
+
+def _export_records() -> html.Raw:
+    """Every listed record, as a file. See `_export_mail`."""
+    return html.tag("a", html.DOWNLOAD_ICON, "Export", href="/ui/records.csv", class_="btn small",
+                    title="Download every row of this table as CSV")
+
+
+_RECORDS_CSV_COLUMNS = ("#", "Complete", "PO", "Status", "Spec", "Description", "Qty", "Unit",
+                        "Tracking", "Received by", "Line", "Package", "POD date", "Carrier",
+                        "Conf", "Origin", "Created by", "Source", "From email", "Posted")
+
+
+@router.get("/records.csv")
+def records_csv(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> Response:
+    """The Records table as a file, whole and untruncated — see `mails_csv`.
+
+    Complete is the gap count rather than a badge, and Posted says what the ledger holds, which is
+    the two on-screen columns a file cannot carry as controls.
+    """
+    records = read_views.records_ready(conn)
+    delivery = {p.po_number: p for p in read_views.po_delivery_status(conn)}
+    posted = {a.record_id: a for a in post_ledger.latest_by_record(conn)}
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(_RECORDS_CSV_COLUMNS)
+    for r in records:
+        row_gaps = completeness.gaps(r)
+        po = delivery.get(r["po_number"])
+        sent = posted.get(r["id"])
+        writer.writerow(_csv_safe([
+            r["id"],
+            "complete" if row_gaps.is_complete else f"{row_gaps.count} gaps: {row_gaps.describe()}",
+            r["po_number"], po.label if po else "", r["spec_code"], r["item_description"],
+            _num(r["quantity_received"]), r["unit_of_measure"], r["tracking_number"],
+            r["received_by"],
+            "" if r["po_line_number"] is None else r["po_line_number"],
+            f"{_num(r['package_quantity'])} {r['package_uom'] or ''}".strip(),
+            r["pod_stated_date"], r["carrier_name"], f"{r['extraction_confidence']:.2f}",
+            r["origin"], r["created_by"], r["extraction_source"], r["email_subject"],
+            # The ledger's own word for where the attempt got to — `posted`, `blocked`, `pending`.
+            # It is the only source: Spitfire reads 0.0 against an unapproved receipt.
+            sent.state if sent else "",
+        ]))
+    return Response(
+        buffer.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="premier-records.csv"',
+                 "X-Content-Type-Options": "nosniff"},
     )
-    return html.page("Records", "/ui/records", body, sheet,
-                     **_chrome(conn))
 
 
 # --- Verify against Spitfire ------------------------------------------------------------------
@@ -953,10 +1179,25 @@ def _post_outcome_fragment(*, ok: bool, heading: str, message: str,
 
 
 @router.post("/records/verify", response_class=HTMLResponse)
-def verify_all_fragment(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+def verify_all_fragment(ids: str = "",
+                        conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Every listed record against Spitfire — or only the ticked ones, if `ids` names any.
+
+    The selection arrives as a query string rather than a posted form because the control that
+    sends it is the shared `data-verify` button, which the one inline script POSTs; see
+    `html.verify_button(selection=...)`. It narrows what is verified and can never widen it: an id
+    that is not on this page is not in `records_ready` and is dropped, so a crafted `?ids=` reaches
+    nothing the page was not already offering.
+    """
     rows = read_views.records_ready(conn)
     if not rows:
         return str(html.tag("p", "There are no records to verify.", class_="empty"))
+    wanted = {piece.strip() for piece in ids.split(",") if piece.strip()}
+    if wanted:
+        rows = [r for r in rows if str(r["id"]) in wanted]
+        if not rows:
+            return str(html.tag("p", "None of the selected records are still listed here.",
+                                class_="empty"))
     results = po_verify.verify_records(conn, rows)
 
     # Same rule as the single-record route, applied across the page: an exact spec match whose
@@ -1296,9 +1537,15 @@ def _pod_chooser(conn, email_id: str, chosen) -> html.Raw:
                        checked=(str(chosen or "") == str(row["id"]))),
             # The viewer, not the raw route: it renders markup we built, or a sandboxed iframe with
             # no `allow-scripts`. Choosing a proof means looking at it first.
+            #
+            # `data-frag-into` sends it to the panel on the right instead of the popup. This button
+            # sits in the left column, outside the panel, so `_JS` cannot work that out from where
+            # it is — it has to be named. Deciding which file is the proof is the one moment the
+            # file and these radios most need to be on screen together.
             html.tag("button", "Open", type="button", class_="btn ghost small",
                      data_frag=(f"/ui/mail/attachment/view?id={quote(email_id)}"
                                 f"&n={row['ordinal']}&src={html.DEFAULT_MAIL_SOURCE}"),
+                     data_frag_into="mail-pane",
                      data_frag_title=f"Attachment — {row['filename'] or 'file'}"),
             class_="pod-option"))
 
@@ -1323,21 +1570,10 @@ def _create_form(conn, email_id: str, *, values=None, chosen=None, created_by=""
                  note_text="", problem=None) -> str:
     """The form itself, rendered fresh or re-rendered after a refusal carrying what was typed."""
     values = values if values is not None else record_create.prefill(conn, email_id)
-    subject = conn.execute("SELECT subject FROM email_log WHERE email_id = ?",
-                           (email_id,)).fetchone()
-    subject = (subject[0] if subject else "") or "(no subject)"
 
     parts = []
     if problem is not None:
         parts.append(html.errors(problem.message, problem.missing))
-
-    parts.append(html.section(
-        "The message",
-        html.tag("p", subject, class_="lede"),
-        html.tag("p", html.mail_link(email_id, "Open the message and its attachments",
-                                     title="Read what this record is being built from")),
-        note="Everything below describes this one message. Read it before recording anything.",
-    ))
 
     parts.append(html.section(
         "What arrived",
@@ -1365,7 +1601,20 @@ def _create_form(conn, email_id: str, *, values=None, chosen=None, created_by=""
                                                  value=email_id),
                      *parts, submit="Create the record", cancel="/ui/manual",
                      cancel_label="Back to Needs a human")
-    return html.page("Create a record", "/ui/manual", body, **_chrome(conn))
+    # The message itself, beside the form rather than in the popup over it. `bare=1` for the reason
+    # `_mail_fragment_html` gives: the Create control that header would carry links back to this
+    # very page, and following it throws away everything typed.
+    host = html.mail_url(email_id, "", html.DEFAULT_MAIL_SOURCE) + "&bare=1"
+    pane = html.mail_pane(
+        host,
+        _mail_fragment_html(email_id, src=html.DEFAULT_MAIL_SOURCE, bare=True),
+        note="Every field on the left comes from this message or from the proof attached to it. "
+             "Open an attachment and it opens here, beside the form, not over it.",
+    )
+    # The way out, in the header where it is visible on arrival. The form's Cancel goes to the same
+    # place but sits below the last field, so on this form it is four sections down.
+    return html.page("Create a record", "/ui/manual", html.split(body, pane),
+                     back="/ui/manual", back_label="Needs a human", **_chrome(conn))
 
 
 @router.get("/records/new", response_class=HTMLResponse)
@@ -1378,7 +1627,7 @@ def new_record_form(email_id: str = "",
                                       html.tag("p", "Open this from a message on the Needs a "
                                                     "human page — a record is always built from "
                                                     "one.", class_="empty")),
-                         **_chrome(conn))
+                         back="/ui/manual", back_label="Needs a human", **_chrome(conn))
     if conn.execute("SELECT 1 FROM email_log WHERE email_id = ?", (email_id,)).fetchone() is None:
         raise HTTPException(status_code=404, detail="no such message")
     return _create_form(conn, email_id)
@@ -1654,55 +1903,109 @@ def po_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
         notices = ", ".join(
             f"{t.replace('_', ' ')}" + (f" ×{n}" if n > 1 else "") for t, n in sorted(p.notifications.items())
         )
+        # The reason, with the moment it happened on hover. Both were in the cell, stacked, which
+        # made every row on the page three lines tall to carry a timestamp that is already the
+        # subject of the Last heard column beside it.
         released = (
-            html.Raw(str(html.when(p.released_at[:16])) + " " + str(html.muted(p.release_reason)))
+            html.tag("span", p.release_reason or "released", class_="muted nw",
+                     title=f"Released {p.released_at[:16]}")
             if p.released_at else html.muted("—")
         )
         rows.append([
             html.tag("a", p.po_number, href=f"/ui/po/{p.po_number}"),
             html.badge(p.label, p.status),
-            notices or html.muted("—"),
+            _clipped(notices, 46),
             p.records or html.muted("0"),
             p.lines_seen or html.muted("—"),
             _num(p.qty_received) or html.muted("—"),
             # None, not 0 — the Spitfire mirror is empty, and a zero here would read as
-            # "nothing was ordered" rather than "we have not been told".
+            # "nothing was ordered" rather than "we have not been told". They fill in once the
+            # Spitfire read has mirrored the PO lines.
             _num(p.qty_ordered) if p.qty_ordered is not None else html.muted("—"),
             _num(p.qty_outstanding) if p.qty_outstanding is not None else html.muted("—"),
             released,
-            html.when(p.last_seen[:16]),
+            _stamp(p.last_seen[:16]),
         ])
 
-    unreachable = ", ".join(
-        delivery_status.STATUS_LABELS[s] for s in read_views.UNREACHABLE_STATUSES
-    )
+    # Built from the statuses actually on the page, like Mail's verdicts — offering a status
+    # nothing carries is a filter whose only possible outcome is an empty table. The cell holds the
+    # label, so that is what the option has to match.
+    labels = sorted({p.label for p in pos if p.label})
+    # Everything that has not arrived, plus loss-or-claim, which never will and needs a claim filed
+    # against the carrier. Cancelled is left out on purpose: there is nothing to chase.
+    waiting_statuses = {delivery_status.STATUS_LABELS[s]
+                        for s in (delivery_status.OPEN, delivery_status.IN_TRANSIT,
+                                  delivery_status.AT_WAREHOUSE, delivery_status.LOSS_OR_CLAIM)}
+    waiting = [label for label in labels if label in waiting_statuses]
+    views = ([("|".join(waiting), "My triage queue")] if waiting else [])
+    views += [(label, label) for label in labels]
+
     body = html.section(
-        "Where each purchase order stands",
-        html.search_box("po-table", placeholder="Search PO, status, date…",
-                        label="Search purchase orders"),
-        html.date_filter("po-table", label="last heard"),
+        "",
+        html.tag(
+            "div",
+            html.search_box("po-table", placeholder="Search PO, status, date…",
+                            label="Search purchase orders"),
+            html.date_filter("po-table", label="last heard", presets=True),
+            html.choice_filter("po-table", views, label="View",
+                               all_label="All purchase orders", boxed=True),
+            class_="controls",
+        ),
         html.table(
             ["PO", "Status", "Notifications", "Records", "Lines", "Received",
              "Ordered", "Outstanding", "Released", "Last heard"],
-            rows, empty=_EMPTY_HINT, table_id="po-table", page_size=50,
-            date_column="Last heard",
-        ),
-        note=f"{len(pos)} purchase order(s) the pipeline has heard about, most recent first. Status "
-             f"is inferred from the notifications received, not recorded — {unreachable} cannot be "
-             f"reached at all yet, because no receipt is staged here and nothing writes to Spitfire.",
-    )
-    caveat = html.section(
-        "Why Ordered and Outstanding are empty",
-        html.tag(
-            "p",
-            "They live on the purchase order inside Spitfire and no delivery email carries them, so "
-            "filling them in would mean inventing numbers. They populate here once the Spitfire read "
-            "has run and mirrored the PO lines — no change to this page is needed.",
-            class_="note",
+            rows, empty=_EMPTY_HINT, table_id="po-table", page_size=25, pane=True,
+            date_column="Last heard", choice_column="Status",
+            num_columns=("Records", "Lines", "Received", "Ordered", "Outstanding"),
         ),
     )
-    return html.page("Delivery status", "/ui/po", body, caveat,
-                     **_chrome(conn))
+    return html.page(
+        "Delivery status", "/ui/po", body,
+        subtitle="Where each purchase order stands. Status is inferred from the notifications "
+                 "received, not recorded.",
+        actions=[_export_po()],
+        **_chrome(conn))
+
+
+def _export_po() -> html.Raw:
+    """Every purchase order this page knows about, as a file. See `_export_mail`."""
+    return html.tag("a", html.DOWNLOAD_ICON, "Export", href="/ui/po.csv", class_="btn small",
+                    title="Download every row of this table as CSV")
+
+
+_PO_CSV_COLUMNS = ("PO", "Status", "Notifications", "Records", "Lines", "Received", "Ordered",
+                   "Outstanding", "Released", "Released at", "Last heard")
+
+
+@router.get("/po.csv")
+def po_csv(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> Response:
+    """The Delivery status table as a file, whole and untruncated — see `mails_csv`.
+
+    Two columns where the page has one: the release reason is what the cell shows and the moment it
+    happened is what its `title` carries, and a file has no hover.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(_PO_CSV_COLUMNS)
+    for p in read_views.po_delivery_status(conn):
+        notices = ", ".join(
+            f"{t.replace('_', ' ')}" + (f" ×{n}" if n > 1 else "")
+            for t, n in sorted(p.notifications.items())
+        )
+        writer.writerow(_csv_safe([
+            p.po_number, p.label, notices, p.records, p.lines_seen, p.qty_received,
+            "" if p.qty_ordered is None else p.qty_ordered,
+            "" if p.qty_outstanding is None else p.qty_outstanding,
+            p.release_reason if p.released_at else "",
+            p.released_at[:16] if p.released_at else "",
+            p.last_seen[:16],
+        ]))
+    return Response(
+        buffer.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="premier-delivery-status.csv"',
+                 "X-Content-Type-Options": "nosniff"},
+    )
 
 
 def _size(value) -> str:
@@ -1770,8 +2073,7 @@ _ATTACHMENT_DISPOSITIONS = {
 
 
 @router.get("/attachments", response_class=HTMLResponse)
-def attachments_page(inline: str = "",
-                     conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+def attachments_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
     """Every file taken off every email, with what we know about each one.
 
     The only page that answers "what have we actually got?". `/ui/manual` lists the attachments
@@ -1779,15 +2081,14 @@ def attachments_page(inline: str = "",
     bytes arrived twice under different filenames, which is exactly what the two FedEx PDFs on the
     210634 thread do.
 
-    Inline attachments are listed by default because they were downloaded too and the count on
-    screen should match the count in the database. `?inline=hide` puts them aside — they are
-    signature logos and letterhead, and they outnumber the real files better than two to one.
+    Every attachment is listed, always: they were all downloaded and all take up disk, so the count
+    on screen matches the count in the database. Signature logos and letterhead outnumber the real
+    files better than two to one, and the View dropdown is where they are put aside — that used to
+    be `?inline=hide`, a link that reloaded the whole page to hide rows it had already rendered.
     """
-    hide_inline = inline == "hide"
-    rows_in = read_views.attachments(conn, include_inline=not hide_inline)
-    total = len(read_views.attachments(conn))
+    rows_in = read_views.attachments(conn)
 
-    rows = []
+    rows, states = [], []
     for a in rows_in:
         pod = (html.Raw(str(html.badge("POD", "pod")) + " "
                         + str(html.token(a["pod_po_numbers"] or "unnamed")))
@@ -1800,65 +2101,166 @@ def attachments_page(inline: str = "",
                     f"&src=inbox&download=1")
         rows.append([
             a["id"],
-            html.when((a["email_date"] or a["first_seen_at"] or "")[:16]),
-            html.mail_link(a["email_id"], (a["email_subject"] or "(no subject)")[:38],
-                           title="Open the email this arrived on"),
-            # The filename opens the file itself. The row does too, but a filename that is not
-            # clickable reads as inert, and this is the cell a person aims at.
-            html.tag("button", (a["filename"] or "(unnamed)")[:44], type="button",
-                     class_="link-btn", data_frag=view, title="Open this attachment"),
-            html.badge(a["sniffed_kind"] or "unknown", "attachment"),
-            _size(a["size_bytes"]),
-            html.badge("inline", "hide") if a["is_inline"] else html.muted("—"),
+            _stamp((a["email_date"] or a["first_seen_at"] or "")[:16]),
+            # Filename over what it weighs and what became of it. Size was its own column and is
+            # not worth one: nobody scans a table by kilobytes, but "1.2 MB · decorative" beside a
+            # filename is the whole story of that row in six words.
+            _file_cell(a, view),
+            html.muted((a["sniffed_kind"] or "unknown").upper()),
             _po_evidence(a),
+            a["records_extracted"] or html.muted("0"),
+            stored,
+            html.badge("inline", "hide") if a["is_inline"] else html.muted("—"),
             pod,
-            asserts or html.muted("—"),
+            _clipped(asserts, 26),
             html.badge((a["disposition"] or "").replace("_", " "),
                        _ATTACHMENT_DISPOSITIONS.get(a["disposition"], "plain")),
             a["claimed_by"] or html.muted("—"),
-            a["records_extracted"] or html.muted("0"),
-            stored,
+            html.mail_link(a["email_id"], _clipped(a["email_subject"] or "(no subject)", 34),
+                           title="Open the email this arrived on"),
             # View before Download, and both visible. The filename opens the file too, but a
             # filename rendered as text carries no affordance — the page read as download-only
-            # even though the in-page viewer was there all along.
+            # even though the in-page viewer was there all along. The envelope is the third of the
+            # same kind: the file, the bytes, the message it came on.
             html.Raw(
                 str(html.tag("button", "View", type="button", class_="btn ghost small",
                              data_frag=view, title="Open this file in the page"))
                 + " "
-                + str(html.tag("a", "Download", href=download, class_="btn ghost small"))),
+                + str(html.tag("a", "Download", href=download, class_="btn ghost small"))
+                + " "
+                + str(html.mail_link(a["email_id"], "✉", cls="btn ghost small",
+                                     title="Open the email this arrived on"))),
         ])
+        states.append(_attachment_state(a))
 
-    inline_count = sum(1 for a in read_views.attachments(conn) if a["is_inline"])
-    toggle = (html.tag("a", f"Show all {total}, including inline", href="/ui/attachments")
-              if hide_inline else
-              html.tag("a", f"Hide the {inline_count} inline images", href="/ui/attachments?inline=hide"))
+    # The inline toggle used to be a link that reloaded the page with `?inline=hide`. It is a view
+    # of the same rows, so it is one of the views — and the dropdown can say the other two things
+    # the old link could not: which files could not be read, and the logos on their own.
+    present = set(states)
+    views = [(value, label) for value, label in (
+        ("unread", "My triage queue"),
+        ("file", "Real files only"),
+        ("inline", "Inline images only"),
+    ) if any(value in state.split() for state in present)]
 
     body = html.section(
-        "Everything downloaded from every email",
-        html.search_box("attachments-table",
-                        placeholder="Search filename, kind, email, disposition…",
-                        label="Search attachments"),
-        html.date_filter("attachments-table", label="received"),
+        "",
+        html.tag(
+            "div",
+            html.search_box("attachments-table",
+                            placeholder="Search filename, PO, type…",
+                            label="Search attachments"),
+            html.date_filter("attachments-table", label="received", presets=True),
+            html.choice_filter("attachments-table", views, label="View",
+                               all_label="All attachments", boxed=True),
+            class_="controls",
+        ),
         html.table(
-            ["#", "Received", "From email", "File", "Kind", "Size", "Inline", "PO", "POD",
-             "POD says", "Disposition", "Read by", "Records", "Stored", ""],
+            ["#", "Received", "Filename", "Type", "PO", "Records", "Stored", "Inline", "POD",
+             "POD says", "Disposition", "Read by", "From mail", ""],
             rows, empty="No attachments have been downloaded yet.",
-            table_id="attachments-table", page_size=50, date_column="Received",
-            no_sort=("", "File"),
+            table_id="attachments-table", page_size=25, pane=True, date_column="Received",
+            no_sort=("", "Filename"), num_columns=("Records",), choice_values=states,
             frag_urls=[f"/ui/mail/attachment/view?id={quote(a['email_id'])}"
                        f"&n={a['ordinal']}&src=inbox" for a in rows_in],
             frag_title="Open this attachment",
         ),
-        action=toggle,
-        note=(f"{len(rows_in)} of {total} attachment(s). "
-              f"Kind is what the bytes are, not what the sender called them. POD is decided once "
-              f"when the file is read — from a PDF's text, or from OCR on a photograph — so a "
-              f"blank there on a file that plainly is one means nothing has read it yet. "
-              f"A purchase order in black was named by the file itself; one in grey came from the "
-              f"email or from the records it produced, which ties the file to the order far more "
-              f"loosely and is not enough to attach it to a receipt."),
     )
-    return html.page("Attachments", "/ui/attachments", body, **_chrome(conn))
+    return html.page(
+        "Attachments", "/ui/attachments", body,
+        subtitle="Everything downloaded from the receiving mailbox, one row per file.",
+        actions=[_export_attachments()],
+        **_chrome(conn))
+
+
+_DISPOSITION_WORDS = {
+    "extracted": "read",
+    "dropped_decorative": "decorative",
+    "dropped_duplicate": "duplicate",
+    "corrupt": "corrupt",
+    "empty": "empty",
+    "not_dispatched": "not read",
+}
+"""The disposition in one word, for the line under a filename.
+
+Deliberately shorter than the Disposition column's own wording, which stays `dropped duplicate` in
+full — this one sits in a cell with a filename above it and has to be read at a glance, not parsed.
+"""
+
+
+def _file_cell(a, view_url: str) -> html.Raw:
+    """The filename, over what it weighs and what became of it.
+
+    The filename opens the file. The row does too, but a filename that is not clickable reads as
+    inert, and this is the cell a person aims at.
+    """
+    name = a["filename"] or "(unnamed)"
+    shown = name if len(name) <= 46 else name[:46].rstrip() + "…"
+    detail = _DISPOSITION_WORDS.get(a["disposition"] or "", "")
+    sub = _size(a["size_bytes"]) + (f" · {detail}" if detail else "")
+    return html.tag(
+        "div",
+        html.tag("button", shown, type="button", class_="link-btn subj nw",
+                 data_frag=view_url, title=f"Open {name}"),
+        html.tag("span", sub, class_="from nw",
+                 title=a["disposition_detail"] or "how this file was handled"),
+        class_="cell-subject",
+    )
+
+
+def _attachment_state(a) -> str:
+    """What this row *is*, for the view dropdown, as space-separated words.
+
+    Not a column: "this is a signature logo" and "nothing could read this" are two different facts
+    and a row can carry both, so neither is a cell the filter could match against. `is_inline` is
+    the ledger's own flag; unread is the union of the three ways a file ends up with nothing read
+    out of it — the reader raised, the bytes were unusable, or the bytes never landed at all.
+    """
+    words = ["inline" if a["is_inline"] else "file"]
+    if a["error_type"] or a["disposition"] in ("corrupt", "empty") or not a["stored_sha"]:
+        words.append("unread")
+    return " ".join(words)
+
+
+def _export_attachments() -> html.Raw:
+    """Every file the ledger knows about. See `_export_mail`."""
+    return html.tag("a", html.DOWNLOAD_ICON, "Export", href="/ui/attachments.csv",
+                    class_="btn small", title="Download every row of this table as CSV")
+
+
+_ATTACHMENTS_CSV_COLUMNS = ("#", "Received", "Filename", "Type", "Size", "PO", "Records", "Stored",
+                            "Inline", "POD", "POD PO numbers", "POD date", "POD signed by",
+                            "Disposition", "Disposition detail", "Read by", "Error",
+                            "From mail", "Sender")
+
+
+@router.get("/attachments.csv")
+def attachments_csv(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> Response:
+    """The Attachments table as a file, whole and untruncated — see `mails_csv`.
+
+    Size in bytes rather than "1.2 MB": the page rounds it for reading, and a spreadsheet is where
+    someone goes to add it up.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(_ATTACHMENTS_CSV_COLUMNS)
+    for a in read_views.attachments(conn):
+        writer.writerow(_csv_safe([
+            a["id"], (a["email_date"] or a["first_seen_at"] or "")[:16], a["filename"],
+            a["sniffed_kind"], a["size_bytes"],
+            a["pod_po_numbers"] or a["email_po_hints"] or a["pos_via_records"] or "",
+            a["records_extracted"], a["stored_sha"],
+            "yes" if a["is_inline"] else "", "yes" if a["is_pod"] else "",
+            a["pod_po_numbers"], a["pod_delivery_date"], a["pod_signed_by"],
+            (a["disposition"] or "").replace("_", " "), a["disposition_detail"],
+            a["claimed_by"], a["error_type"], a["email_subject"], a["sender"],
+        ]))
+    return Response(
+        buffer.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="premier-attachments.csv"',
+                 "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @router.get("/po/{po_number}", response_class=HTMLResponse)
@@ -2014,33 +2416,50 @@ def _store_for(src: str):
     return getattr(settings, setting_name)
 
 
-@router.get("/mail", response_class=HTMLResponse)
-def mail_fragment(id: str = "", reason: str = "", images: int = 0, src: str = "") -> str:
-    """The popup's contents. Fetched by the page, never navigated to.
+def _mail_fragment_html(email_id: str, *, src: str = "", reason: str = "", images: bool = False,
+                        bare: bool = False) -> str:
+    """One message rendered as a bare fragment: header, sandboxed body frame, attachment list.
 
-    Resolution falls back through the cache, the accumulated payload, and finally the `.msg`
-    files — the last of which is how ROUTE mail (cancellations, loss and claim notices) is
-    recoverable at all, since it never accumulates.
+    Shared by the popup route below and by the panel beside the Create-a-record form, which renders
+    it into the page rather than fetching it. One function so the two can never drift on which
+    store an attachment is looked for in — the `src` threading below is the whole reason that
+    matters.
+
+    `bare` drops the Create control. It exists for the create page: that header offers a link to
+    `/ui/records/new?email_id=…`, which on that page is the page you are already on, and following
+    it silently discards everything typed into the form.
     """
-    if not id:
+    if not email_id:
         return '<p class="empty">No message was requested.</p>'
     db_path = _store_for(src)
-    mail = mail_view.resolve(id, db_path=db_path)
+    mail = mail_view.resolve(email_id, db_path=db_path)
     # Offered from the message itself, because that is where somebody works out that the pipeline
     # missed something — reading the mail, not scanning the queue that listed it. Says what has
     # already been made from this message rather than inviting a second record for one delivery.
-    header = _create_from_mail(id)
+    header = "" if bare else _create_from_mail(email_id)
     return header + mail_view.render(
-        mail, reason=reason, remote_images=bool(images),
+        mail, reason=reason, remote_images=images,
         # `src` is carried through so an attachment link inside the popup looks in the same store
         # the message itself came from.
         attachment_url=f"/ui/mail/attachment?src={quote(src)}" if src else "/ui/mail/attachment",
         # The viewer route, minus the ordinal — `_attachments` appends `&n=` per row. Carries `src`
         # for the same reason `attachment_url` does: an attachment must be looked for in the store
         # its message came from.
-        view_url=f"/ui/mail/attachment/view?id={quote(id)}&src={quote(src)}",
+        view_url=f"/ui/mail/attachment/view?id={quote(email_id)}&src={quote(src)}",
         db_path=db_path,
     )
+
+
+@router.get("/mail", response_class=HTMLResponse)
+def mail_fragment(id: str = "", reason: str = "", images: int = 0, src: str = "",
+                  bare: int = 0) -> str:
+    """The popup's contents. Fetched by the page, never navigated to.
+
+    Resolution falls back through the cache, the accumulated payload, and finally the `.msg`
+    files — the last of which is how ROUTE mail (cancellations, loss and claim notices) is
+    recoverable at all, since it never accumulates.
+    """
+    return _mail_fragment_html(id, src=src, reason=reason, images=bool(images), bare=bool(bare))
 
 
 def _create_from_mail(email_id: str) -> str:
@@ -2503,6 +2922,7 @@ def automation_page(refused: str = "") -> str:
 
     return html.page("Automation", "/ui/automation", status, schedule_card, watch_card, history,
                      subtitle="Run the automation, or have it run itself.",
+                     **_sidebar_counts(),
                      # Only while a run is in flight, so the page stops reloading the moment it
                      # settles. `running` was read once above, before the render, so a run that
                      # finishes mid-render still leaves one last refresh to show the result.
@@ -2692,10 +3112,16 @@ def report_page() -> str:
     )
 
     blank_note = html.card(
-        html.tag("p", "Order Qty, Net and Final are deliberately blank. They live on the purchase "
-                      "order inside Spitfire and no delivery email carries them, so filling them "
-                      "in would mean inventing numbers. They will populate once the connection to "
-                      "Spitfire is in place.", class_="note", style="margin:0"),
+        # Reworded when the sheet moved here from Records on 2026-08-22, because the card it
+        # replaced still said all three columns were unreachable — untrue since 2026-08-21, when
+        # Order Qty and Net began filling from the mirrored purchase order.
+        html.tag("p", "Order Qty comes from the purchase order and fills in once that PO has been "
+                      "read from Spitfire; Net is Order Qty minus Received and follows it. Both "
+                      "stay blank until then rather than showing a number nothing supports. Final "
+                      "is always blank — it is a flag a person sets in Spitfire and cannot be "
+                      "worked out from quantities. The Receiver column says who took delivery, or "
+                      "how the record was made when nobody signed.",
+                 class_="note", style="margin:0"),
         title="Why three columns are empty",
     )
 
@@ -2737,10 +3163,32 @@ def report_page() -> str:
                                title="Needs attention")]
 
     # `to_html` returns a plain escaped string so it can serve any caller; wrap it here.
-    preview = html.modal("preview", "Receiver report", html.Raw(receipt_log.to_html(report)))
+    #
+    # The search box and the group pager came with the sheet when it moved off Records on
+    # 2026-08-22. Without them this modal was a single unbroken sheet of every purchase order, so
+    # "which line did Spitfire disagree about" meant scrolling — the two controls are the reason
+    # the sheet is usable at all, and dropping the duplicate should not have cost them.
+    preview = html.modal(
+        "preview", "Receiver report",
+        html.Raw(
+            str(html.search_box("receipt-sheet", placeholder="Search PO, vendor, spec, receiver…",
+                                label="Search the receiver report"))
+            # Paged by purchase order, not by row, and `plain` because the sheet brings its own row
+            # styling. Ten POs at a time: a page boundary inside a PO would split the block someone
+            # is holding beside Spitfire's own Receipt Log, and that block is the whole point of the
+            # sheet. "All" is one press away in the pager, and the .xlsx download is never paged.
+            + str(html.scroll_block(html.Raw(receipt_log.to_html(report)),
+                                    table_id="receipt-sheet", page_size=10, unit="group",
+                                    plain=True))
+            + str(html.tag("p", "Laid out like Spitfire's own Receipt Log and grouped by PO "
+                                "number, so the two can be compared line by line. Shown ten "
+                                "purchase orders at a time — set Rows to All, or download the "
+                                ".xlsx, to get the whole sheet at once.", class_="note"))
+        ))
     mailbox = settings.GRAPH_MAILBOX_ADDRESS or "the receiving mailbox"
     return html.page("Receiver report", "/ui/report", summary, blank_note, *attention, preview,
-                     subtitle=f"Built from {mailbox} · generated {report.generated_at}")
+                     subtitle=f"Built from {mailbox} · generated {report.generated_at}",
+                     **_sidebar_counts())
 
 
 @router.get("/report.xlsx")

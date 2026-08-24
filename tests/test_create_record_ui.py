@@ -6,13 +6,15 @@ points into the form exist at all. The form was the missing half of the whole fl
 stage worked, and mail the pipeline could not finish had nowhere to go.
 """
 
+import re
 import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
+from api.ui import html
 from config import settings
-from pipeline import email_log, state_db
+from pipeline import email_log, mail_cache, state_db
 
 FORM = {
     "email_id": "mail-ui", "created_by": "M Gutierrez",
@@ -45,11 +47,18 @@ def store(tmp_path, monkeypatch):
             sha256, size_bytes, first_seen_at, is_pod, pod_po_numbers)
            VALUES (11, 'mail-ui', 0, 0, 'signed-bol.jpg', 'image', 'extracted', 0,
                    'sha-bol', 12, 'now', 0, '')""")
-    conn.execute(
-        """INSERT INTO mail_attachment
-           (email_id, ordinal, filename, content_type, kind, size_bytes, is_inline, content)
-           VALUES ('mail-ui', 0, 'signed-bol.jpg', 'image/jpeg', 'image', 12, 0, ?)""",
-        (b"\xff\xd8\xff\xe0 photo",))
+    # Through `mail_cache` rather than a bare INSERT into `mail_attachment`, because the form now
+    # renders the message itself beside the fields. Without a body to resolve, the panel correctly
+    # reports the message as unreadable — which is a real state, but not the one these tests are
+    # about. This writes `mail_body` too, so `mail_view.resolve` finds it in the cache and stops.
+    mail_cache.cache_mail(
+        conn, email_id="mail-ui", subject="Delivered - 208491 - 11 EA",
+        sender="routing@authoritylogistics.com", received_at="2026-08-21 09:00:00",
+        body_html="<p>PO 208491 &mdash; 11 EA delivered 01 Oct.</p>", body_text=None,
+        source="Outlook (read-only)", cached_at="2026-08-21 09:00:00",
+        attachments=[{"ordinal": 0, "filename": "signed-bol.jpg", "content_type": "image/jpeg",
+                      "kind": "image", "size_bytes": 12, "is_inline": 0,
+                      "content": b"\xff\xd8\xff\xe0 photo"}])
     conn.commit()
     conn.close()
     return path
@@ -112,6 +121,95 @@ def test_opening_it_on_no_message_explains_rather_than_500s(client):
 
 def test_opening_it_on_a_message_that_does_not_exist_is_a_404(client):
     assert client.get("/ui/records/new?email_id=nope").status_code == 404
+
+
+def test_the_way_out_is_in_the_header_not_only_under_the_last_field(client):
+    """This page is gone into from one row of a queue, and the sidebar cannot be the way back out:
+    Needs a human is the entry already lit, so it reads as where you are. The form's Cancel goes to
+    the same place, but it sits below the last field — four sections down past everything you
+    decided not to fill in. Both, and the header one is on screen when you land.
+
+    Also asserted on the no-message branch, which does not build a form at all and would otherwise
+    be a page with no exit whatsoever.
+    """
+    for url in ("/ui/records/new?email_id=mail-ui", "/ui/records/new"):
+        bar = re.search(r'<div class="bar">.*?</div>', client.get(url).text, re.S)
+        assert bar, f"{url}: no header bar"
+        assert 'class="back-link"' in bar.group(0), f"{url}: no way back in the header"
+        assert 'href="/ui/manual"' in bar.group(0), f"{url}: the back link goes somewhere else"
+        # It reads "Back". The destination is in the tooltip and the accessible name instead:
+        # spelled out in the link it competes with the title beside it for the same glance.
+        assert "Back</a>" in bar.group(0), f"{url}: the link no longer reads Back"
+        assert 'aria-label="Back to Needs a human"' in bar.group(0), \
+            f"{url}: nothing says where it goes for a reader who cannot see the tooltip"
+
+    # A real link, not history.back(): a refusal is a POST landing on this same URL, so one step
+    # back is the form again rather than the queue.
+    assert "history.back" not in html._JS
+
+    # And it stays a per-page choice — nothing else grew one by accident.
+    assert 'class="back-link"' not in client.get("/ui/manual").text
+
+
+# --- the message beside the form ----------------------------------------------------------------
+# Five of the six fields can only be answered from the email and the file attached to it. The page
+# used to show neither: one button opened the message in the popup, on top of the fields it was
+# meant to fill, so filling the form meant opening and closing it once per number.
+
+
+def test_the_message_is_on_the_page_not_behind_a_button(client):
+    """Rendered server-side into the panel, not fetched into it. No flash on first paint, no extra
+    round trip, and the message is readable even if the fetch path is broken."""
+    page = client.get("/ui/records/new?email_id=mail-ui").text
+
+    assert 'class="split"' in page, "the form and the message are not laid out side by side"
+    assert 'class="pane-body"' in page and "data-frag-host" in page
+    assert 'iframe class="mail-body"' in page, "the panel arrived empty — nothing rendered into it"
+    assert "signed-bol.jpg" in page, "the panel does not list the attachment"
+    # The rule this page is most likely to break, re-asserted here because the panel is new markup.
+    assert page.count("<script>") == 1
+    assert 'src="http' not in page
+
+
+def test_the_panel_asks_for_the_message_without_its_create_control(client):
+    """`bare=1` is not cosmetic. `/ui/mail` normally carries a Create control, and on this page that
+    is a link to `/ui/records/new?email_id=…` — the page you are already on. Following it reloads
+    the form and silently discards everything typed into it."""
+    page = client.get("/ui/records/new?email_id=mail-ui").text
+    host = re.search(r'data-frag-host="([^"]+)"', page)
+
+    assert host, "the panel has no host URL, so nothing can render back into it"
+    assert "bare=1" in host.group(1)
+
+    bare = client.get("/ui/mail?id=mail-ui&src=inbox&bare=1").text
+    assert "/ui/records/new" not in bare, "the bare fragment still offers to create a record"
+    assert 'iframe class="mail-body"' in bare, "bare dropped the message along with the control"
+    # Without it, the control is still there — the flag is doing the work, not a coincidence.
+    assert "/ui/records/new" in client.get("/ui/mail?id=mail-ui&src=inbox").text
+
+
+def test_choosing_the_proof_shows_it_beside_the_fields_it_fills(client):
+    """The POD chooser's Open button sits in the form column, outside the panel, so `_JS` cannot
+    work out from its position where it should render — it has to name the target. Deciding which
+    file is the proof is the one moment the file and these radios most need to be on screen at
+    once, and it used to put the file in the popup covering them."""
+    page = client.get("/ui/records/new?email_id=mail-ui").text
+
+    opener = re.search(r'<button[^>]*data-frag="[^"]*attachment/view[^"]*"[^>]*>', page)
+    assert opener, "the chooser no longer offers to open the file"
+    assert 'data-frag-into="mail-pane"' in opener.group(0)
+    assert 'id="mail-pane"' in page, "the named target does not exist on the page"
+    assert "data-frag-into" in html._JS, "nothing listens for data-frag-into"
+
+
+def test_a_refusal_comes_back_with_the_message_still_beside_it(client, store):
+    """The refusal path re-renders through the same builder, so this holds automatically — which is
+    the point of asserting it. Losing the message on the one screen where you are being told to go
+    and re-read it would be the worst moment for it to disappear."""
+    refused = client.post("/ui/records/new", data=dict(FORM, spec_code=""))
+
+    assert 'class="errors"' in refused.text
+    assert 'class="pane-body"' in refused.text and 'iframe class="mail-body"' in refused.text
 
 
 # --- refusals -----------------------------------------------------------------------------------

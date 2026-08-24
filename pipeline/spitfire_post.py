@@ -99,6 +99,20 @@ def post_record(conn: sqlite3.Connection, row: Any, *,
     return post_report(conn, row, client=client, actor=actor)
 
 
+def _no_pod_because(decision) -> str:
+    """Why this receipt carries no proof document, in the terms the ledger and the reviewer need.
+
+    Two routes past the POD gate and they are not interchangeable: a person accepted the omission,
+    or the mail itself carried the evidence. Anyone reading the ledger a month later needs to know
+    which, so neither is described in the other's words.
+    """
+    if decision.pod_waived_by:
+        return f"waived by {decision.pod_waived_by}"
+    if decision.body_evidence:
+        return f"the delivery is evidenced in the email body ({decision.body_evidence})"
+    return "no proof of delivery"
+
+
 def post_pod(conn: sqlite3.Connection, row: Any, *,
              client: Optional[SpitfireWriteClient] = None,
              read_client_factory=None, actor: str = "") -> PostResult:
@@ -186,23 +200,50 @@ def post_pod(conn: sqlite3.Connection, row: Any, *,
                 f"purchase order, so nothing further was attached")
         steps.append(f"linked to PO via SubContract (DocNo {doc_no or '?'})")
 
-        # --- 3. the line ----------------------------------------------------------------------
-        client.add_line(
-            receipt_key,
-            description=f"{TEST_MARKER} {_strip(decision.description) or decision.spec_code}",
-            quantity=float(decision.quantity or 0),
-            source_item_number=decision.spec_code or None,
-            uom=decision.unit_of_measure or None,
-            proj_entity=decision.cost_code or None)
-        steps.append(f"line added ({post_decision.po_verify.fmt_qty(decision.quantity)} "
+        # --- 3. the quantity, onto the line Spitfire already built ----------------------------
+        # Not `add_line`. Creating the receipt with `forBatch` builds one item per purchase order
+        # line, already carrying `SCDocItemKey`, the spec, the cost code and the unit — the only
+        # empty field is the quantity. Appending a line instead produced an orphan whose every
+        # linking field was stripped on insert, which is why nothing this system posted before
+        # 2026-08-22 was ever counted. See `spitfire_write.set_line_quantity`.
+        line = client.find_prepopulated_line(receipt_key, decision.line_key)
+        if line is None:
+            raise RuntimeError(
+                f"the receipt was created but carries no line against purchase order line "
+                f"{decision.line_number} ({decision.line_key or 'no key'}) — Spitfire builds a "
+                f"receipt from the order, so a missing line means the order moved underneath us; "
+                f"nothing was written")
+        task = (line.get("DocItemTask") or [{}])[0]
+        task_key = str(task.get("ItemTaskKey") or "")
+        if not task_key:
+            raise RuntimeError(
+                f"receipt line {line.get('DocItemNumber')!r} has no ItemTaskKey, so there is no "
+                f"row to write the quantity into")
+
+        quantity = float(decision.quantity or 0)
+        client.set_line_quantity(receipt_key, {task_key: quantity})
+        steps.append(f"quantity set on line {line.get('DocItemNumber')} "
+                     f"({post_decision.po_verify.fmt_qty(decision.quantity)} "
                      f"{decision.unit_of_measure})".rstrip())
+
+        # Read back only now, after the session has been released. A read taken any earlier
+        # returns the pre-change value — that staleness made a correct write look like a failure
+        # twice while this was being worked out.
+        written = client.verify_quantities(receipt_key, {task_key: quantity})
+        if abs(written.get(task_key, 0.0) - quantity) >= 0.001:
+            raise RuntimeError(
+                f"the quantity was sent but reading the receipt back shows "
+                f"{written.get(task_key, 0.0):g} on line {line.get('DocItemNumber')} rather than "
+                f"{quantity:g} — the receipt does not say what we asked it to say")
+        steps.append("quantity read back and confirmed")
 
         # --- 4-5. the POD, when there is one --------------------------------------------------
         # Skipped entirely for a delivery stated in the email body with nothing attached. Reaching
-        # here at all means `post_decision` found a waiver from a named person, so the omission is
-        # a decision somebody made rather than an oversight — it is named in the ledger detail and
-        # in the result below, and the receiver report attached at step 6 still lands on this
-        # receipt, so the document is not left bare.
+        # here at all means `post_decision` opened that path by one of exactly two routes — a
+        # waiver from a named person, or evidence in the body itself (a signer, or a carrier and
+        # tracking number, with the date) — so the omission is always a decision rather than an
+        # oversight. Which route it was is named in the ledger detail and in the result below, and
+        # the receiver report attached at step 6 still lands on this receipt, so it is not bare.
         pod_key = ""
         if pod:
             pod_name = _safe_name(pod.filename, f"POD_{po_number}")
@@ -225,19 +266,21 @@ def post_pod(conn: sqlite3.Connection, row: Any, *,
                     "the POD was attached but reading the receipt back did not show it")
             steps.append("read back and confirmed")
         else:
-            steps.append(f"no proof of delivery — waived by {decision.pod_waived_by}")
+            why = _no_pod_because(decision)
+            steps.append(f"no proof of delivery — {why}")
 
-        settled = (f"receipt {doc_no or receipt_key[:8]} — report not posted" if pod else
-                   f"receipt {doc_no or receipt_key[:8]} — no POD, waived by "
-                   f"{decision.pod_waived_by}; report not posted")
+        receipt_name = doc_no or receipt_key[:8]
+        settled = (f"receipt {receipt_name} — report not posted" if pod else
+                   f"receipt {receipt_name} — no POD, {_no_pod_because(decision)}; "
+                   f"report not posted")
         post_ledger.settle(conn, key, post_ledger.POD_POSTED, settled, client.audit_rows())
         return PostResult(
             ok=True, state=post_ledger.POD_POSTED, record_id=record_id, po_number=po_number,
-            message=((f"the proof of delivery is on receipt {doc_no or receipt_key[:8]}. "
+            message=((f"the proof of delivery is on receipt {receipt_name}. "
                       f"The receiver report has not been posted yet.") if pod else
-                     (f"receipt {doc_no or receipt_key[:8]} was created with no proof of delivery "
-                      f"attached, as accepted by {decision.pod_waived_by}. The receiver report has "
-                      f"not been posted yet.")),
+                     (f"receipt {receipt_name} was created with no proof of delivery attached — "
+                      f"{_no_pod_because(decision)}. The receiver report has not been posted "
+                      f"yet.")),
             receipt_key=receipt_key, receipt_doc_no=doc_no, pod_file_key=pod_key, steps=steps)
 
     except SpitfireSessionExpired as exc:

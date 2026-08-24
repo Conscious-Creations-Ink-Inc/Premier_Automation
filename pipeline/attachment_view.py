@@ -498,9 +498,14 @@ def _table(rows: Sequence[Sequence], table_id: str) -> str:
             f'<table class="sheet"><tbody>{body}</tbody></table></div>'
             f'<div class="pager" data-pager-for="{_esc(table_id)}" data-page-size="50" '
             f'data-unit="row">'
-            f'<button type="button" class="btn ghost small" data-page="prev">‹ Prev</button>'
-            f'<span class="pager-label"></span>'
-            f'<button type="button" class="btn ghost small" data-page="next">Next ›</button>'
+            f'<span class="pager-showing" role="status" aria-live="polite"></span>'
+            f'<div class="pager-pages">'
+            f'<button type="button" class="page-btn" data-page="prev" title="Previous page" '
+            f'aria-label="Previous page">&lsaquo;</button>'
+            f'<span class="pager-nums"></span>'
+            f'<button type="button" class="page-btn" data-page="next" title="Next page" '
+            f'aria-label="Next page">&rsaquo;</button>'
+            f'</div>'
             f'</div>')
 
 

@@ -29,6 +29,7 @@ class FakeWriteClient:
         self.calls: list = []
         self.attachments: list = []
         self.uploads: dict = {}
+        self.quantities: dict = {}
         self._next_file = 0
 
     def _maybe_fail(self, step: str) -> None:
@@ -55,6 +56,37 @@ class FakeWriteClient:
     def add_line(self, doc_key, **kwargs):
         self._maybe_fail("add_line")
         self.line = kwargs
+
+    # --- the pre-populated line, and writing a quantity onto it ---------------------------------
+    # Creating a receipt with `forBatch` does not produce an empty document: Spitfire builds one
+    # item per purchase order line, already linked by `SCDocItemKey` and carrying its
+    # `ItemTaskKey`, with only the quantity blank. Modelled here because `post_pod` now finds that
+    # row and writes into it rather than appending one of its own.
+
+    def read_items(self, doc_key):
+        self._maybe_fail("read_items")
+        return [{"DocItemNumber": "0001",
+                 "SourceItemNumber": "LT-03b",
+                 "RelatedLineDetails": {"SCDocItemKey": "k1", "Subcontract": self.sub_contract},
+                 "DocItemTask": [{"ItemTaskKey": "task-1",
+                                  "Quantity": self.quantities.get("task-1", 0.0)}]}]
+
+    def find_prepopulated_line(self, doc_key, po_line_key):
+        self._maybe_fail("find_prepopulated_line")
+        wanted = (po_line_key or "").strip().lower()
+        for item in self.read_items(doc_key):
+            related = item.get("RelatedLineDetails") or {}
+            if str(related.get("SCDocItemKey") or "").lower() == wanted:
+                return item
+        return None
+
+    def set_line_quantity(self, doc_key, quantities):
+        self._maybe_fail("set_line_quantity")
+        self.quantities.update({k: float(v) for k, v in quantities.items()})
+
+    def verify_quantities(self, doc_key, quantities):
+        self._maybe_fail("verify_quantities")
+        return {k: self.quantities.get(k, 0.0) for k in quantities}
 
     def upload_file(self, content, filename, keywords="", when=None):
         self._maybe_fail("upload_file")
@@ -261,6 +293,7 @@ def test_an_unlinked_receipt_stops_the_chain(conn, record, offline):
 def test_a_record_with_no_stored_pod_bytes_is_flagged_not_posted(conn, record, offline):
     """17 of 35 live attachments carry no bytes. A receipt asserting delivery with no proof
     attached is worse than no receipt."""
+    _strip_the_evidence(conn)
     # The ledger row stays. This is the "we know the file existed and we no longer have it" case,
     # which is ours to investigate — deleting the row too would be "the email carried nothing",
     # a different situation with a different fix, and `_pod_absence_reason` now tells them apart.
@@ -270,7 +303,7 @@ def test_a_record_with_no_stored_pod_bytes_is_flagged_not_posted(conn, record, o
     conn.commit()
 
     client = FakeWriteClient()
-    result = spitfire_post.post_record(conn, record, read_client_factory=offline, client=client)
+    result = spitfire_post.post_record(conn, _row(conn), read_client_factory=offline, client=client)
 
     assert not result.ok
     assert "no stored bytes" in result.message
@@ -280,11 +313,12 @@ def test_a_record_with_no_stored_pod_bytes_is_flagged_not_posted(conn, record, o
 def test_an_email_that_carried_no_attachments_says_exactly_that(conn, record, offline):
     """A different situation from the one above, and the message used to conflate them — sending
     people to look in the attachment store for a file Premier never sent."""
+    _strip_the_evidence(conn)
     conn.execute("DELETE FROM mail_attachment")
     conn.execute("DELETE FROM attachment_ledger")
     conn.commit()
 
-    result = spitfire_post.post_record(conn, record, read_client_factory=offline,
+    result = spitfire_post.post_record(conn, _row(conn), read_client_factory=offline,
                                        client=FakeWriteClient())
 
     assert not result.ok
@@ -331,12 +365,13 @@ def test_a_pod_naming_another_purchase_order_is_refused(conn, record, offline):
     """The interesting failure: the paperwork and the record disagree. Rejected rather than used
     as a fallback, because on this corpus two byte-identical PDFs arrive under filenames citing
     different specs — the filename cannot be trusted and neither can proximity."""
+    _strip_the_evidence(conn)
     conn.execute("""UPDATE attachment_ledger SET sniffed_kind='image', is_pod=1,
                         pod_po_numbers='999999' WHERE email_id='mail-1'""")
     conn.commit()
 
     client = FakeWriteClient()
-    result = spitfire_post.post_record(conn, record, read_client_factory=offline, client=client)
+    result = spitfire_post.post_record(conn, _row(conn), read_client_factory=offline, client=client)
 
     assert not result.ok
     assert "names purchase order 999999" in result.message
@@ -346,11 +381,12 @@ def test_a_pod_naming_another_purchase_order_is_refused(conn, record, offline):
 def test_an_email_whose_attachments_were_never_read_says_so(conn, record, offline):
     """Distinct from "the bytes are missing", which is what this used to say for every case. One
     is a gap in the readers; the other is a storage problem. They need different fixes."""
+    _strip_the_evidence(conn)
     conn.execute("""UPDATE attachment_ledger SET sniffed_kind='xlsx', filename='tracker.xlsx',
                         is_pod=0, pod_po_numbers='' WHERE email_id='mail-1'""")
     conn.commit()
 
-    result = spitfire_post.post_record(conn, record, read_client_factory=offline,
+    result = spitfire_post.post_record(conn, _row(conn), read_client_factory=offline,
                                        client=FakeWriteClient())
 
     assert not result.ok
@@ -408,7 +444,8 @@ def test_a_partial_delivery_books_what_arrived(conn, record, offline):
     result = spitfire_post.post_record(conn, partial, read_client_factory=offline, client=client)
 
     assert result.ok, result.message
-    assert client.line["quantity"] == 2.0
+    # On the line Spitfire built against PO line k1, not on one we appended.
+    assert client.quantities == {"task-1": 2.0}
 
 
 def test_nothing_in_the_chain_ever_routes(conn, record, offline):
@@ -845,6 +882,15 @@ def test_a_choice_whose_bytes_are_missing_does_not_fall_back(conn):
 # make that call, so a named person waives it and nothing else can.
 
 
+def _strip_the_evidence(conn):
+    """Leave the record with nothing showing anyone took delivery — no signer, no carrier
+    reference. Since 2026-08-22 a body-only delivery that *does* carry one of those may post
+    without a proof document, so a test about refusing a missing POD has to remove both."""
+    conn.execute("UPDATE extracted_records SET received_by = '', carrier_name = '', "
+                 "tracking_number = '' WHERE id = 1")
+    conn.commit()
+
+
 def _strip_the_pod(conn):
     """Leave the record with no attachment of any kind, as a body-only notification arrives."""
     conn.execute("DELETE FROM mail_attachment WHERE email_id = 'mail-1'")
@@ -852,8 +898,14 @@ def _strip_the_pod(conn):
     conn.commit()
 
 
-def test_automation_will_not_post_a_body_only_delivery(conn, offline):
-    """The rule that must survive everything else in this file."""
+def test_automation_will_not_post_a_body_only_delivery_with_no_evidence(conn, offline):
+    """The rule that must survive everything else in this file.
+
+    Widened on 2026-08-22, not removed: a body-only delivery may post when the mail itself shows
+    someone took receipt. With no signer and no carrier reference there is nothing behind the
+    assertion, and this is the shape of a pending-confirmation spreadsheet row.
+    """
+    _strip_the_evidence(conn)
     _strip_the_pod(conn)
 
     result = spitfire_post.post_pod(conn, _row(conn), read_client_factory=offline,
@@ -877,7 +929,8 @@ def test_a_waived_body_only_delivery_posts_without_an_upload(conn, offline):
     assert result.ok, result.message
     assert result.state == post_ledger.POD_POSTED
     assert "upload_file" not in client.calls and "attach_file" not in client.calls
-    assert "create_receipt" in client.calls and "add_line" in client.calls
+    assert "create_receipt" in client.calls and "set_line_quantity" in client.calls
+    assert "add_line" not in client.calls
     assert not result.pod_file_key
     assert "M Gutierrez" in result.message
 
@@ -933,3 +986,91 @@ def test_the_ledger_key_is_unchanged_whenever_a_pod_exists(conn, offline):
     spitfire_post.post_pod(conn, _row(conn), read_client_factory=offline, client=FakeWriteClient())
     stored = conn.execute("SELECT pod_md5 FROM spitfire_post WHERE record_id = 1").fetchone()[0]
     assert stored == expected
+
+
+def test_a_body_only_delivery_the_mail_evidences_posts_without_an_upload(conn, offline):
+    """Premier's decision, 2026-08-22: a delivery whose particulars are all stated in the mail may
+    post without a proof document. The seed record is signed for by J Smith on a stated date, so it
+    goes through with nothing uploaded and nobody asked to waive anything."""
+    _strip_the_pod(conn)
+
+    client = FakeWriteClient()
+    result = spitfire_post.post_pod(conn, _row(conn), read_client_factory=offline, client=client)
+
+    assert result.ok, result.message
+    assert result.state == post_ledger.POD_POSTED
+    assert "upload_file" not in client.calls and "attach_file" not in client.calls
+    assert "create_receipt" in client.calls
+    assert not result.pod_file_key
+
+
+def test_the_ledger_says_which_route_opened_the_pod_less_path(conn, offline):
+    """A waiver and body evidence are different facts. Someone reading the ledger a month later has
+    to be able to tell which one this receipt rests on, so neither is described in the other's
+    words."""
+    _strip_the_pod(conn)
+    spitfire_post.post_pod(conn, _row(conn), read_client_factory=offline, client=FakeWriteClient())
+
+    detail = post_ledger.existing_for_record(conn, 1)[0].detail
+    assert "evidenced in the email body" in detail
+    assert "signer+date" in detail
+    assert "waived by" not in detail
+
+
+# --- the quantity actually lands, and a post that cannot prove it fails -------------------------
+#
+# The original bug shipped because the end-to-end test asserted HTTP 200. Spitfire accepted every
+# line, stored it, and counted nothing: `add_line` appends a row whose `SCDocItemKey`,
+# `ProjEntity`, `AccountCategory`, `UOM` and task quantity are all discarded on insert. These are
+# the assertions that would have caught it.
+
+
+def test_the_quantity_goes_onto_the_line_spitfire_built_not_a_new_one(conn, record, offline):
+    client = FakeWriteClient()
+    result = spitfire_post.post_pod(conn, record, read_client_factory=offline, client=client)
+
+    assert result.ok, result.message
+    assert "add_line" not in client.calls, "appending a line produces an orphan that never counts"
+    assert client.quantities == {"task-1": 19.0}
+
+
+def test_a_quantity_that_does_not_read_back_fails_the_post(conn, record, offline):
+    """A 200 from this API is not evidence. The receipt has to say what we asked it to say."""
+    client = FakeWriteClient()
+    client.set_line_quantity = lambda doc_key, quantities: client.calls.append("set_line_quantity")
+
+    result = spitfire_post.post_pod(conn, record, read_client_factory=offline, client=client)
+
+    assert not result.ok
+    assert "rather than 19" in result.message
+    assert post_ledger.existing_for_record(conn, 1)[0].state == post_ledger.PARTIAL
+
+
+def test_a_receipt_with_no_line_against_the_po_line_is_refused(conn, record, offline):
+    """Spitfire builds the receipt from the order, so a missing line means the order moved. Better
+    to stop than to append one — an appended line is exactly the orphan this replaced."""
+    client = FakeWriteClient()
+    client.find_prepopulated_line = lambda doc_key, po_line_key: None
+
+    result = spitfire_post.post_pod(conn, record, read_client_factory=offline, client=client)
+
+    assert not result.ok
+    assert "carries no line against purchase order line" in result.message
+    assert not client.quantities
+
+
+def test_the_matched_po_line_key_is_what_finds_the_receipt_line(conn, record, offline):
+    """Matched on `SCDocItemKey`, never on the spec: 82 of 179 lines share a spec with a sibling,
+    so a spec match would reintroduce the ambiguity the matcher exists to resolve."""
+    seen = []
+    client = FakeWriteClient()
+    real = client.find_prepopulated_line
+
+    def spy(doc_key, po_line_key):
+        seen.append(po_line_key)
+        return real(doc_key, po_line_key)
+
+    client.find_prepopulated_line = spy
+    spitfire_post.post_pod(conn, record, read_client_factory=offline, client=client)
+
+    assert seen == ["k1"]

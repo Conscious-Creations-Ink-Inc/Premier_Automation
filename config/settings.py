@@ -134,7 +134,15 @@ TESSERACT_CMD_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # dev/test
 
 # --- Stage 4: Reconcile & Match --------------------------------------------
 
-DESC_MATCH_THRESHOLD = 80   # RapidFuzz token_sort_ratio, 0-100
+DESC_MATCH_THRESHOLD = 80   # RapidFuzz token_set_ratio, 0-100
+
+# How far clear of the runner-up the best description score must be before it is allowed to
+# resolve a line on its own. A score alone says "this line is plausible"; only the gap says "and
+# no other line is". Measured on the 92-record corpus: 12 keeps every genuine resolution and
+# refers the four real ties ("Exit" and "Accesible Lift" both score 100 against 8 and 23
+# candidates on PO 207514 — the email genuinely does not say which sign arrived).
+DESC_MATCH_GAP = 12
+
 MATERIAL_COST_CODE_PREFIX = "1"   # shared with Stage 5
 
 # --- Stage 5: Verify ---------------------------------------------------------

@@ -20,6 +20,12 @@ COMPLETE = {
 }
 
 
+# Complete in every field, but with nothing showing that anyone took delivery: no signer, no
+# carrier reference. This is the shape of a row on one of Premier's pending-confirmation
+# spreadsheets — 57 of the 92 records in the corpus look like this, and none of them has arrived.
+NO_DELIVERY_EVIDENCE = {k: v for k, v in COMPLETE.items() if k != "received_by"}
+
+
 @pytest.fixture
 def conn():
     c = state_db.get_connection(":memory:")
@@ -64,7 +70,7 @@ def test_an_incomplete_record_is_refused_and_names_the_missing_field(conn):
 def test_a_record_with_no_pod_bytes_is_refused(conn):
     """Measured 2026-08-14: only 17 of 35 stored attachments carry their bytes. A receipt asserting
     a delivery with no proof attached is worse than no receipt."""
-    decision = post_decision.decide(conn, COMPLETE, verification(), pod_md5="")
+    decision = post_decision.decide(conn, NO_DELIVERY_EVIDENCE, verification(), pod_md5="")
     assert not decision.may_post
     assert "no proof of delivery" in decision.reason
 
@@ -74,7 +80,7 @@ def test_the_callers_reason_is_shown_rather_than_the_generic_one(conn):
     attachments. `spitfire_post._pod_absence_reason` can, and those need different fixes, so when
     it supplies a reason that is the sentence the reviewer reads."""
     decision = post_decision.decide(
-        conn, COMPLETE, verification(), pod_md5="",
+        conn, NO_DELIVERY_EVIDENCE, verification(), pod_md5="",
         pod_reason="the delivery email carried no attachments, so there is no proof of delivery")
 
     assert not decision.may_post
@@ -243,10 +249,14 @@ def test_a_read_failure_is_reported_rather_than_assumed_clean(conn):
 
 
 def test_automation_cannot_post_a_record_with_no_pod(conn):
-    """The rule this whole mechanism exists to keep. Nothing about a record — not completeness,
-    not a clean quantity match, not a perfect spec resolution — opens the POD-less path on its own.
+    """Completeness alone still does not open the POD-less path.
+
+    Premier widened this on 2026-08-22 — a delivery whose particulars are all stated in the mail
+    may post without a proof document — but "complete" was never allowed to be the test. A
+    pending-confirmation spreadsheet row is complete and nothing has arrived, so what opens the
+    path is evidence someone took delivery, not the absence of missing fields.
     """
-    decision = post_decision.decide(conn, COMPLETE, verification(), pod_md5="")
+    decision = post_decision.decide(conn, NO_DELIVERY_EVIDENCE, verification(), pod_md5="")
     assert not decision.may_post
     assert decision.reason == "there is no proof of delivery to upload"
 
@@ -263,7 +273,7 @@ def test_a_blank_waiver_is_not_a_waiver(conn):
     """Whitespace is how an empty form field arrives. Treating it as a name would let a POST with
     nothing typed in it permit a receipt carrying no proof."""
     for empty in ("", "   ", None):
-        row = dict(COMPLETE, pod_waived_by=empty)
+        row = dict(NO_DELIVERY_EVIDENCE, pod_waived_by=empty)
         assert not post_decision.decide(conn, row, verification(), pod_md5="").may_post
 
 
@@ -286,3 +296,64 @@ def test_a_record_with_a_pod_never_reports_a_waiver(conn):
     row = dict(COMPLETE, pod_waived_by="M Gutierrez")
     decision = post_decision.decide(conn, row, verification(), pod_md5="ABC123")
     assert decision.may_post and decision.pod_waived_by == ""
+
+
+# --- a delivery stated in the mail body, with no proof document --------------------------------
+#
+# Premier's decision, 2026-08-22. The gate stays shut on everything that does not carry positive
+# evidence someone took delivery, because completeness alone describes a spreadsheet row just as
+# well as it describes a delivery.
+
+
+def test_a_delivery_signed_for_in_the_mail_may_post_without_a_pod(conn):
+    decision = post_decision.decide(conn, COMPLETE, verification(), pod_md5="")
+
+    assert decision.may_post, decision.reason
+    assert decision.body_evidence == "signer+date"
+    assert decision.pod_waived_by == ""      # not a waiver — nobody was asked
+
+
+def test_a_carrier_reference_and_a_date_also_count(conn):
+    """`authority_delivered` notifications carry no signer but name the carrier and the tracking
+    number on 10 of 10 records in the corpus."""
+    row = {k: v for k, v in COMPLETE.items() if k != "received_by"}
+    row.update(carrier_name="FedEx", tracking_number="884603885067")
+    decision = post_decision.decide(conn, row, verification(), pod_md5="")
+
+    assert decision.may_post, decision.reason
+    assert decision.body_evidence == "carrier+tracking+date"
+
+
+def test_a_carrier_with_no_tracking_number_is_not_evidence(conn):
+    """Half a carrier reference cannot be checked against the carrier, so it proves nothing."""
+    row = {k: v for k, v in COMPLETE.items() if k != "received_by"}
+    row.update(carrier_name="FedEx", tracking_number="")
+
+    assert post_decision.body_evidence(row) == ""
+    assert not post_decision.decide(conn, row, verification(), pod_md5="").may_post
+
+
+def test_a_signer_with_no_date_is_not_evidence(conn):
+    """A receipt has to state when the goods arrived. 37 of 92 records carry no POD date."""
+    row = dict(COMPLETE, pod_stated_date="")
+
+    assert post_decision.body_evidence(row) == ""
+
+
+def test_body_evidence_is_not_claimed_when_a_pod_exists(conn):
+    """The two routes past gate 2 must stay distinguishable in the ledger: a receipt carrying a
+    proof document has not used the body-evidence path, whatever the record also happens to say."""
+    decision = post_decision.decide(conn, COMPLETE, verification(), pod_md5="ABC123")
+
+    assert decision.may_post
+    assert decision.body_evidence == ""
+
+
+def test_a_waiver_is_recorded_as_a_waiver_not_as_body_evidence(conn):
+    """A person's decision and a parsed signal are different facts and must not be conflated —
+    a reviewer waived this one, and the ledger has to say so even though the body would qualify."""
+    row = dict(COMPLETE, pod_waived_by="M Gutierrez")
+    decision = post_decision.decide(conn, row, verification(), pod_md5="")
+
+    assert decision.pod_waived_by == "M Gutierrez"
+    assert decision.body_evidence == ""

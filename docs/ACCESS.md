@@ -105,6 +105,69 @@ transcribes `@PODTK` one character short. They cannot be confirmed from the API:
 `/api/configuration/*` endpoint returns `500 … not yet implemented (case 36629)`, read and write
 alike, and faults before the auth check.
 
+### 3d. Pre-shared key (PSK) — a third scheme, discovered 2026-08-22
+
+| | |
+|---|---|
+| env | `SPITFIRE_API_CLIENT_ID`, `SPITFIRE_API_CLIENT_KEY` |
+| what | Two request **headers**, `APIClientID` and `APIClientKey`. `APIClientID` is an sfPMS *user key GUID*; `APIClientKey` is that user's Spitfire federated key (`UserFederatedKey` for provider `Spitfire`) |
+| requires | `UserPSKAuthOK` enabled on that user |
+| granted by | Premier / Spitfire — Ref **Case 36867** |
+| renew | The key can be rotated without changing the id |
+| status | **supplied but not working on Training — see below** |
+
+This is not the session cookie (§3a) and not the `POST /api/Account` service login (§3b). It
+arrived with the vendor's `sfPMS-PO-Receipt` Postman collection, which authenticates every one
+of its 15 requests this way. **It matters more than the other two: a PSK does not lapse on
+idle**, so it is the thing that would close the gap §3a calls "the single largest gap between
+the mechanics work and the automation runs".
+
+The pair issued for `REST Automation` returns `401 {"ThisReason":"Invalid"}` on every
+authenticated endpoint of the training host, and `GET /api/account/session` returns `false`
+under it. Tested as-supplied, lowercased, dash-stripped, brace-wrapped and with id and key
+swapped — all identical, so it is not a formatting problem. Note the reason differs from the
+no-credential case (`"Not authenticated"`), which proves the scheme is switched on and is
+actively rejecting these values rather than ignoring them.
+
+**RESOLVED 2026-08-22 -- the user exists on Training but has no federated identity linked.**
+Found with GET endpoints only, no admin console needed. `GET /api/contact/{userKey}` accepts the
+`apiClientId` directly, because that value *is* a user key:
+
+```http
+GET /api/contact/3DA6B772-2AF4-49FE-8D72-5DA8C8939EA3
+-> 200
+{"UserKey":"3da6b772-2af4-49fe-8d72-5da8c8939ea3",
+ "UserName":"Receiving Automation",
+ "UserLogin":"ReceivingAutomation@example.com",
+ "FederatedIdentityInfo":"No linked accounts"}
+```
+
+`FederatedIdentityInfo` is a human-readable summary of that contact's linked identities, capped
+at 50 chars. Sampled across the routees of PO 207030 it reads `"ID;  last used Feb 02 "` or
+`"Profile Picture and  2 linked identities;  last used Aug 27, 2025 "` for people who actually
+log in, and `"No linked accounts"` for the `Spitfire` system account and for vendor contacts who
+never do. `Receiving Automation` reads **"No linked accounts"**.
+
+So of the three candidates, it is the third: the account is on the right host, but **no
+`UserFederatedKey` for provider `Spitfire` has ever been issued for it**, which is why the
+supplied `apiClientKey` matches nothing and every call 401s. `UserPSKAuthOK` is moot until a key
+exists. Note the login is `ReceivingAutomation@example.com` -- an `example.com` address, so the
+account looks provisioned from a template and never finished.
+
+**The key itself can never be read back.** `PSK`, `APIClient` and `ClientKey` appear **zero**
+times across all 300 paths and every schema of the v23 OpenAPI document, and the account record
+from `GET /api/Account` carries no key field. `FederatedIdentityInfo` reports only *that* an
+identity exists and when it was last used. The scheme is header-level and evaluated before
+routing -- which is also why a write-shaped POST returns the same `401 Invalid` as a GET.
+
+**Open ask (Spitfire Case 36867):** issue a `UserFederatedKey` for provider `Spitfire` against
+user `3da6b772-2af4-49fe-8d72-5da8c8939ea3` (`Receiving Automation`) on the Training site, enable
+`UserPSKAuthOK` on it, and send the key. Confirm too whether that account is meant to be the
+identity automation writes are attributed to -- it currently has an `example.com` login.
+
+Evidence: `dev_reports/Postman_Full_Sweep_2026-08-22/REPORT.md` calls 1-6, and `PSK_DIAGNOSIS.md`
+in the same directory.
+
 ## 4. Azure DevOps
 
 | | |

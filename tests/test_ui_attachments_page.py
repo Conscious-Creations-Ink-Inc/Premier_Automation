@@ -85,14 +85,26 @@ def test_every_attachment_is_listed_including_the_inline_one(store):
     assert "POD.pdf" in body and "logo.png" in body
 
 
-def test_the_inline_toggle_puts_the_logos_aside(store):
+def test_the_logos_can_be_put_aside_from_the_view_dropdown(store):
     """Signature logos outnumber real attachments better than two to one on the live store, so a
-    page that only ever showed everything would bury what matters."""
-    body = TestClient(app).get("/ui/attachments?inline=hide").text
+    page that only ever showed everything would bury what matters.
 
-    assert len(rows_of(body)) == 2
-    assert "logo.png" not in body
-    assert "POD.pdf" in body
+    This was `?inline=hide`, a link that reloaded the whole page to hide rows it had already
+    rendered. It is a view of the same rows, so it is one of the views — and the dropdown can say
+    the two things the link could not: which files nothing could read, and the logos on their own.
+    Every row is still in the page; the filter hides them by class, as it does everywhere else.
+    """
+    body = TestClient(app).get("/ui/attachments").text
+
+    assert len(rows_of(body)) == 3, "every attachment is still rendered"
+    assert '<option value="file">Real files only</option>' in body
+    assert '<option value="inline">Inline images only</option>' in body
+    # The row says what it is; the dropdown names one of those words. A row can be both a logo and
+    # unreadable, which is why this is a set of words and not a column.
+    states = dict(zip(re.findall(r'data-choice-value="([^"]*)"', body),
+                      re.findall(r'<button[^>]*class="link-btn subj nw"[^>]*>([^<]*)<', body)))
+    assert any(name == "logo.png" and "inline" in words for words, name in states.items())
+    assert any(name == "POD.pdf" and "file" in words for words, name in states.items())
 
 
 def test_the_same_bytes_under_two_names_are_visibly_the_same_file(store):
@@ -192,11 +204,20 @@ def test_view_is_a_button_and_download_is_a_link(store):
 
 
 def _po_cell(body: str, filename: str) -> str:
+    """The PO cell of the row holding `filename`.
+
+    The column is found by its heading rather than by a hard-coded index. It was `cells[7]`, and
+    reordering the table to the agreed layout moved it to 4 — a fixed index in a test is the same
+    trap `table(date_column=...)` exists to avoid in the page itself.
+    """
     table = re.search(r'id="attachments-table".*?</table>', body, re.S).group(0)
+    heads = [re.sub(r"<[^>]+>", "", h).strip()
+             for h in re.findall(r"<th[^>]*>(.*?)</th>", table, re.S)]
+    column = heads.index("PO")
     at = table.find(filename)
     row = table[table.rfind("<tr", 0, at):table.find("</tr>", at)]
     cells = [re.sub(r"<[^>]+>", "", c).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
-    return cells[7]
+    return cells[column]
 
 
 def test_a_po_named_by_the_file_itself_is_shown_plainly(store):

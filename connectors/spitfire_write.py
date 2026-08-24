@@ -71,8 +71,18 @@ class SpitfireWriteViolation(RuntimeError):
 _ALLOWED_WRITES: Tuple[Tuple[str, str], ...] = (
     ("POST",  "/api/catalog/upload"),          # multipart fileMeta + file -> {"key": fileKey}
     ("PATCH", "/api/document/{}/Title"),       # body is a bare JSON string, not an object
-    ("POST",  "/api/document/{}/items"),       # array. PUT /items is an undiscoverable 500
+    ("POST",  "/api/document/{}/items"),       # array. PUT /items is 501, see set_line_quantity
     ("POST",  "/api/document/{}/attachments"), # array. file link OR doc link, see attach_*
+    # The document-edit session — how sfPMS's own UI changes a field, and the only route that can
+    # set a quantity on a receipt line. See `set_line_quantity`.
+    #
+    # `DELETE /session` is how a session is committed, and it is the *only* DELETE this module
+    # permits — see the narrow exception in `is_allowed`. It destroys nothing: it releases an edit
+    # lock and writes the staged changes. `POST /session/end` returns 200 and does **not** commit;
+    # measured on training 2026-08-22, four lines patched and released that way all read back 0.0,
+    # and the same four committed the moment the session was released with DELETE instead.
+    ("PATCH",  "/api/document/{}/session/changes"),
+    ("DELETE", "/api/document/{}/session"),
 )
 
 # Document creation is `POST /api/document/{parent}/{typeKey}` and is NOT in the table above,
@@ -84,10 +94,25 @@ _ALLOWED_WRITES: Tuple[Tuple[str, str], ...] = (
 _GUID_LENGTH = 36
 
 
+def _fmt_quantity(value: float) -> str:
+    """A quantity as `DocFieldChange.Data` wants it: a plain decimal string, no thousands
+    separator and no trailing `.0` on a whole number, which is how sfPMS's own client sends it."""
+    number = float(value)
+    return str(int(number)) if number == int(number) else repr(number)
+
+
 def _is_guid(value: str) -> bool:
     parts = value.split("-")
     return (len(value) == _GUID_LENGTH and len(parts) == 5
             and all(c in "0123456789abcdefABCDEF" for c in value.replace("-", "")))
+
+
+def _is_session_release(path: str) -> bool:
+    """`/api/document/{guid}/session` exactly — the commit-and-release call, and nothing else."""
+    segments = tuple(path.strip("/").split("/"))
+    return (len(segments) == 4 and segments[0].lower() == "api"
+            and segments[1].lower() == "document" and _is_guid(segments[2])
+            and segments[3].lower() == "session")
 
 
 def _is_document_create(method: str, segments: Sequence[str]) -> bool:
@@ -102,6 +127,7 @@ _ALLOWED_READBACKS: Tuple[Tuple[str, str], ...] = (
     ("GET",  "/api/catalog/{}/versions"),      # DataHash — the server's own MD5
     ("GET",  "/api/session/who"),              # liveness; a lapsed cookie must be nameable
     ("POST", "/api/project/{}/docs"),          # read despite the verb: finds the PO and pay requests
+    ("GET",  "/api/document/{}/session"),       # opens an edit session; returns a bare GUID string
 )
 
 _ALLOWED = _ALLOWED_WRITES + _ALLOWED_READBACKS
@@ -129,7 +155,10 @@ def is_allowed(method: str, path: str) -> bool:
     lowered = bare.lower()
     if any(bad in lowered for bad in _DENIED_SUBSTRINGS):
         return False
-    if method.upper() == "DELETE":
+    if method.upper() == "DELETE" and not _is_session_release(bare):
+        # DELETE stays refused everywhere else. Releasing a document-edit session is the one
+        # exception: it removes nothing, it is how a change is committed, and leaving sessions open
+        # would strand edit locks on documents in Premier's system that nobody can see to clear.
         return False
     got = tuple(bare.strip("/").split("/"))
     if _is_document_create(method.upper(), got):
@@ -383,7 +412,17 @@ class SpitfireWriteClient:
     def add_line(self, doc_key: str, *, description: str, quantity: float,
                  source_item_number: Optional[str] = None, uom: Optional[str] = None,
                  proj_entity: Optional[str] = None) -> None:
-        """Add one receipt line. Body is an **array**; `PUT /items` is an undiscoverable 500.
+        """Append a receipt line. **Almost certainly not what you want — see `set_line_quantity`.**
+
+        A receipt created with `forBatch` is *already* built from the purchase order: one item per
+        PO line, correctly linked, with only the quantity blank. This method adds a further row
+        beside those, and Spitfire discards everything on it that would make it count —
+        `SCDocItemKey`, `Subcontract`, `ProjEntity`, `AccountCategory`, `UOM` and the task quantity
+        all read back null or zero. Every line this system posted before 2026-08-22 was one of
+        those orphans, which is why no purchase order ever moved.
+
+        Kept because appending a line is a real operation Spitfire supports and one may some day be
+        wanted; it is no longer on the receipt path. Body is an **array**; `PUT /items` is 501.
 
         `UOM` and `ProjEntity` are copied from the matching PO line's `DocItemTask[0]` rather than
         invented: `ProjEntity` is the cost code the receipt posts against, and a wrong one books
@@ -406,6 +445,158 @@ class SpitfireWriteClient:
                                  note="add line")
         if response.status_code >= 400:
             raise RuntimeError(f"adding the receipt line failed — {self._explain(response)}")
+
+    def find_prepopulated_line(self, doc_key: str, po_line_key: str) -> Optional[Dict[str, Any]]:
+        """The receipt line already standing against this purchase order line, or None.
+
+        Creating a receipt with `forBatch` does not produce an empty document. Spitfire builds it
+        from the purchase order: one item per PO line, each already carrying `SCDocItemKey`,
+        `SourceItemNumber`, `AccountCategory`, `ProjEntity`, `GLAcct`, `UOM` and `Rate`, numbered
+        to match the order — gaps included. The only empty field is the quantity.
+
+        Verified on training 2026-08-22 against PO 212559: `create_receipt` returned a document
+        whose items 0001, 0002, 0004 and 0005 were already linked to that PO's four lines.
+
+        Matched on `SCDocItemKey` — the PO line's own `DocItemKey` — because that is the identity
+        Spitfire itself used to build the row. Matching on the spec would reintroduce exactly the
+        ambiguity the matcher exists to resolve: 82 of 179 lines share a spec with a sibling.
+        """
+        wanted = (po_line_key or "").strip().lower()
+        if not wanted:
+            return None
+        for item in self.read_items(doc_key):
+            related = item.get("RelatedLineDetails") or {}
+            if str(related.get("SCDocItemKey") or "").strip().lower() == wanted:
+                return item
+        return None
+
+    def set_line_quantity(self, doc_key: str, quantities: Dict[str, float]) -> None:
+        """Set the received quantity on lines Spitfire already built. `{ItemTaskKey: quantity}`.
+
+        **Not `add_line`.** `POST /items` appends a *new* row, and everything that would make it
+        count is discarded on insert — `SCDocItemKey`, `Subcontract`, `ProjEntity`,
+        `AccountCategory`, `UOM` and the task quantity all read back null or zero, leaving an
+        orphan attached to nothing. Every line this system posted before 2026-08-22 was one of
+        those, which is why no purchase order ever moved. `POST /items` against a row that already
+        exists answers `406 Column ItemNumber is constrained to be unique` — and still inserts.
+
+        There is no item-level write route. `PUT /api/document/{id}/items` is documented in the v23
+        schema as *"Updates the item"* but answers 501 on this server, and its own description names
+        the alternative: *"Consider using PatchDocData (session/changes)"*. That is a document-edit
+        session — the lock sfPMS's own UI takes when a person types in the box — and it is what
+        this method drives:
+
+            DELETE /api/document/{id}/session?sessionID=...       -> drop the inherited session
+            GET    /api/document/{id}/session?freshenData=true    -> session id, a bare GUID
+            PATCH  /api/document/{id}/session/changes             -> [DocFieldChange, ...]
+            DELETE /api/document/{id}/session?sessionID=...       -> commits and releases
+
+        **`DELETE` is what commits, not `POST /session/end`.** Both answer 200 and neither reports
+        a difference; measured on training 2026-08-22, four lines patched and released with the
+        POST read back 0.0, and the same four appeared the moment a session was released with
+        DELETE. The POST leaves the changes staged in a session that stays open, which is worse
+        than discarding them — the next writer inherits them.
+
+        `InstanceKey` is the line's **`ItemTaskKey`**, out of `DocItemTask[0]` — not its
+        `DocItemKey`. Every change goes in one PATCH: a whole delivery is one round trip, and a
+        partial failure cannot leave half a receipt filled in.
+
+        Two things learned the hard way and easy to reintroduce:
+
+        * **Do not send `releaseSession=true`.** It answers
+          `409 Violation of PRIMARY KEY constraint PK_xsfDocTopic`.
+        * **`GET /session` returns the session already open**, not a new one, so a session left
+          behind by an earlier failure is inherited rather than replaced. Ending it is therefore
+          always safe, and always ours to do.
+
+        The caller must read back *after* this returns, never inside it — see `verify_quantities`.
+        """
+        if not quantities:
+            return
+
+        # Release whatever session is already open on this document before taking one of our own.
+        #
+        # `GET /session` does not create a session, it returns the one in force — and creating a
+        # receipt and titling it leaves one behind. A change staged into that inherited session is
+        # **silently discarded**: measured on training 2026-08-22, two receipts built identically,
+        # one patched through the inherited session and one through a session taken after
+        # releasing it. Both answered 200 to every call. The first read back 0.0, the second 4.0.
+        #
+        # This is the whole difference between a quantity that lands and one that does not, and
+        # nothing in any response distinguishes them — which is why the read-back in
+        # `verify_quantities` is not optional.
+        self._release_session(doc_key)
+
+        session = self._json_or_raise(
+            self._request("GET", f"/api/document/{doc_key}/session?freshenData=true",
+                          note="open document session"),
+            f"opening an edit session on {doc_key}")
+        session_id = session if isinstance(session, str) else str(
+            (session or {}).get("SessionID") or "")
+        if not session_id:
+            raise RuntimeError(
+                f"opening an edit session on the receipt returned {str(session)[:120]!r}, "
+                "which is not a session key — nothing was changed")
+
+        changes = [{"DataMember": "DocItemTask", "DataField": "Quantity",
+                    "InstanceKey": task_key, "Data": _fmt_quantity(quantity),
+                    "IsURIEncoded": False}
+                   for task_key, quantity in quantities.items()]
+        try:
+            response = self._request("PATCH", f"/api/document/{doc_key}/session/changes",
+                                     json=changes, note="set line quantities")
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"setting the receipt line quantities failed — {self._explain(response)}")
+        finally:
+            # Always, including after a failure: a session left open holds an edit lock on a
+            # document in Premier's system that nobody can see in order to release it — and the
+            # changes staged in it stay staged, so the next writer inherits them.
+            self._release_session(doc_key, session_id)
+
+    def _release_session(self, doc_key: str, session_id: str = "") -> None:
+        """Commit and release the document's edit session. Safe when there is nothing to release.
+
+        `DELETE /session` is what commits staged changes; `POST /session/end` answers 200 and does
+        not. Called both before taking a session (to drop an inherited one, whose staged changes
+        would otherwise be discarded along with ours) and after patching (to commit).
+
+        Never raises. On the way in, a document with no session is the normal case; on the way out
+        this runs in a `finally` where the real error is the one already in flight.
+        """
+        if not session_id:
+            try:
+                current = self._request("GET", f"/api/document/{doc_key}/session",
+                                        note="check for an open session")
+                session_id = current.json() if current.status_code == 200 else ""
+            except Exception:                                          # noqa: BLE001
+                return
+            if not isinstance(session_id, str) or not session_id.strip():
+                return
+        try:
+            self._request("DELETE", f"/api/document/{doc_key}/session?sessionID={session_id}",
+                          note="commit and release document session")
+        except Exception:                                              # noqa: BLE001
+            _logger.warning("could not release the edit session on document %s", doc_key)
+
+    def verify_quantities(self, doc_key: str, quantities: Dict[str, float]) -> Dict[str, float]:
+        """Read the receipt back and return `{ItemTaskKey: quantity}` as Spitfire now holds it.
+
+        Separate from `set_line_quantity` so that it is called *after* the session has been
+        released. A read taken while the session is still open returns the pre-change value: on
+        2026-08-22 a line read `0.0` immediately after its session was dropped and `4.0` moments
+        later. That staleness made a correct write look like a failure twice during the
+        investigation, and is exactly the trap a read-back is supposed to close.
+        """
+        found = {}
+        for item in self.read_items(doc_key):
+            for task in (item.get("DocItemTask") or []):
+                if not isinstance(task, dict):
+                    continue
+                task_key = str(task.get("ItemTaskKey") or "")
+                if task_key in quantities:
+                    found[task_key] = float(task.get("Quantity") or 0.0)
+        return found
 
     # --- 3. attachments -------------------------------------------------------------------------
     # One endpoint, two shapes. Premier's own receipt 209330 carries both in a single collection:
