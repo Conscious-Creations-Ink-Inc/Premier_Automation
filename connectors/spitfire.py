@@ -1,8 +1,8 @@
 """Read-only Spitfire (sfPMS) REST connector.
 
 Premier's ERP is Spitfire sfPMS 2023.0.9692.36214, reachable at
-`https://training.remingtonhotels.com/Training`. The v23 OpenAPI document describes 288 paths /
-405 operations across 16 tags; this connector uses eleven of them, all reads.
+`https://spitfire-host.test/instance`. The v23 OpenAPI document describes 288 paths /
+405 operations across 16 tags; `_ALLOWED` below lists the ones this connector may call, all reads.
 
 **This module cannot write to Spitfire.** Every request passes through `_request`, which checks
 the (method, path) pair against `_ALLOWED` and raises before a socket is opened if it is not on
@@ -12,7 +12,7 @@ which is exactly the visible, reviewable act it should be.
 
 Two things the 8 August 2026 browser probe established, and one it got wrong:
 
-* The field mapping below is that probe's §2, re-expressed as code. PO 212456 is the fixture.
+* The field mapping below is that probe's §2, re-expressed as code. PO 912456 is the fixture.
 * `DocItem.ItemQuantity` reads 0.0 on lines that genuinely order 2 units, and
   `DocItem.Specification` is null while the spec code sits in `SourceItemNumber`. Both are
   handled in `_to_po_line`.
@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 import requests
 
 from config import settings
-from connectors import spitfire_cassette
+from connectors import spitfire_auth, spitfire_cassette
 from pipeline.models import POLine
 
 _logger = logging.getLogger(__name__)
@@ -41,11 +41,11 @@ _logger = logging.getLogger(__name__)
 ADDR_FROM, ADDR_REMIT_TO, ADDR_SHIP_TO, ADDR_TO = "F", "R", "S", "T"
 
 # A tax line is a real DocItem: it has a number, an amount, and it sorts in with the others.
-# On PO 212456 line 0002 is Tax — ContractUnits 0.0, null UOM, null ItemStatus — and nothing
+# On PO 912456 line 0002 is Tax — ContractUnits 0.0, null UOM, null ItemStatus — and nothing
 # about its shape distinguishes it from an under-populated goods line. The account category is
 # the only reliable discriminator.
 #
-# Freight was added 10 Aug after pulling corpus PO 208491, which carries "Air Freight - FF&E"
+# Freight was added 10 Aug after pulling corpus PO 908491, which carries "Air Freight - FF&E"
 # (0023) and "Freight - FF&E" (0024) as FRT-FP0 alongside seven TAX-FP0 lines: **10 of its 25
 # lines are non-receivable, 40%**. Tax alone would have offered ten phantom candidates to the
 # matcher, several with the same project words as the goods they relate to.
@@ -101,6 +101,25 @@ _ALLOWED: Tuple[Tuple[str, str], ...] = (
     ("GET", "/api/choices/{}/{}"),
     ("GET", "/api/suggestions/{}/{}"),
     ("GET", "/api/xts/map/{}/sfpms/{}"),
+
+    # --- added for the warehouse sweep (pipeline/spitfire_warehouse.py) ---------
+    # All measured 200 on build 2023.0.9728.39704. They are here rather than being called around
+    # the allowlist because the credential is NOT read-only: `POST /api/account/allows` answers 31
+    # (Read+Insert+Update+Delete+Blanket). This list is the only thing between a sweep and a write.
+    ("POST", "/api/viewable/DocMasterAlt"),         # PO number -> DocMasterKey, no project needed
+    ("GET", "/api/document/{}/comments"),
+    ("GET", "/api/document/{}/dialog/{}"),          # 13 named dialogs, all read-only menus
+    ("GET", "/api/catalog/{}/meta"),
+    ("GET", "/api/catalog/{}/versions"),            # DataHash: the server's own MD5 of the bytes
+    ("GET", "/api/catalog/{}/AccessHistory"),
+    ("GET", "/api/catalog/{}/file/url"),
+    ("GET", "/api/uicfg/live/{}"),                  # the field dictionary the Swagger omits
+    ("GET", "/api/session/reports/{}"),             # names the SSRS reports; cannot render one
+    ("GET", "/api/project/{}/TypeSummary"),
+    ("GET", "/api/project/{}/cost/committed"),
+    ("GET", "/api/project/{}/cost/transactions"),
+    ("GET", "/api/history/{}/{}/{}"),               # per-field audit trail
+    ("GET", "/api/contact/{}"),
 )
 
 _ALLOWED_SEGMENTS = frozenset(
@@ -185,10 +204,10 @@ def order_date_of(header) -> Optional[str]:
     consecutive pairs, and `SourceDate` inverts on 11. Whatever `SourceDate` is, it is not this.
 
     Not from `/api/document/{id}/dates`, despite the name. That endpoint returns *schedule* rows
-    keyed by a `DocDateTypeKey` GUID with no type name, and on PO 208491 it held a single
+    keyed by a `DocDateTypeKey` GUID with no type name, and on PO 908491 it held a single
     2023-06-09 → 2024-12-01 span unrelated to the order. It is not called.
 
-    The one remaining outlier is PO 212379, whose earliest line is due 2025-07-17 against a
+    The one remaining outlier is PO 912379, whose earliest line is due 2025-07-17 against a
     `DocDate` of 2025-12-15. That is a backdated line, not a bad `DocDate`, and it surfaces on the
     timeline as a conflict rather than being smoothed away.
     """
@@ -215,8 +234,8 @@ def strip_html(value: Optional[str]) -> str:
 def clean_description(value: Optional[str]) -> str:
     """Strip HTML, then the label boilerplate Spitfire embeds in `Description`.
 
-    On PO 212456 the description is plain prose, which is why this was not needed at first. Corpus
-    PO 208491 shows the other shape — every one of its 25 lines begins:
+    On PO 912456 the description is plain prose, which is why this was not needed at first. Corpus
+    PO 908491 shows the other shape — every one of its 25 lines begins:
 
         Item Number: STE-400-LT
         Item Description: <the actual text>
@@ -234,7 +253,7 @@ def clean_description(value: Optional[str]) -> str:
 
     # Real Premier POs put the item *name* first and a full manufacturing specification after a
     # "Description:" label — 1,000-2,000 characters of dimensions, UL listings, cord colours and
-    # finish notes. Corpus PO 208491 line 1 is 1,500 characters of which the first 30 are the only
+    # finish notes. Corpus PO 908491 line 1 is 1,500 characters of which the first 30 are the only
     # part a delivery email could ever echo:
     #
     #   Table Lamp at Hospitality Unit | Description: Budget Code: 53-600-077 Custom lamp at ...
@@ -249,12 +268,23 @@ def clean_description(value: Optional[str]) -> str:
     return next((seg for seg in segments if seg), "")
 
 
+PO_FOUND = "found"
+PO_ABSENT = "absent"
+"""Spitfire answered and holds no such purchase order. Nothing a person can do about it."""
+PO_UNREACHABLE = "unreachable"
+"""No strategy completed, so we know nothing either way. Must be retried, never recorded as absent."""
+
+
 class SpitfireReadClient:
     """Authenticated, read-only sfPMS REST client.
 
-    Holds a `requests.Session`; `POST /api/Account` puts the ASP.NET_SessionId / sfPMSAuth /
-    sfSession / sfSettings cookies on it and every later call rides that. Sessions lapse, so
-    `_ensure_session` re-authenticates on demand rather than assuming one login lasts a run.
+    Holds a `requests.Session`; `POST /api/Account` puts the sfPMSAuth / sfSession / sfSettings
+    cookies on it and every later call rides that. Sessions lapse, so `_ensure_session`
+    re-authenticates on demand rather than assuming one login lasts a run.
+
+    Which credential is used is decided by `connectors/spitfire_auth.py`: the account in
+    `SPITFIRE_UID`/`SPITFIRE_PW` when set, else a borrowed `SPITFIRE_SESSION_COOKIE`. The ticket
+    is shared process-wide, so a new client reuses a live login instead of opening another.
     """
 
     def __init__(
@@ -267,8 +297,12 @@ class SpitfireReadClient:
         session_cookie: Optional[str] = None,
     ):
         self.base_url = (base_url or settings.SPITFIRE_BASE_URL or "").rstrip("/")
-        self.uid = uid or settings.SPITFIRE_UID
-        self.pw = pw or settings.SPITFIRE_PW
+        account = spitfire_auth.credentials()
+        # Passed-in credentials are pinned; configured ones are re-read on every login so a changed
+        # password in `.env` takes effect without touching code.
+        self._pinned_credentials = bool(uid or pw)
+        self.uid = uid or (account.uid if account else None)
+        self.pw = pw or (account.pw if account else None)
         self.tz_offset = settings.SPITFIRE_TZ_OFFSET if tz_offset is None else tz_offset
         self.timeout = timeout
         self._session = requests.Session()
@@ -281,17 +315,27 @@ class SpitfireReadClient:
         if not self.base_url:
             raise ValueError("SpitfireReadClient needs SPITFIRE_BASE_URL (check .env)")
 
-        # Cookie mode. `sfPMSAuth` alone is the FormsAuthentication ticket and is sufficient —
-        # the other three cookies the browser holds are session id, settings and a session GUID,
-        # none of which authenticate. Set on the jar rather than as a header so redirects and any
-        # later Set-Cookie from the server merge normally.
-        self.session_cookie = session_cookie or settings.SPITFIRE_SESSION_COOKIE
+        self._host = urlparse(self.base_url).hostname
+
+        # Precedence: a cookie handed to this constructor, then the account, then a cookie from
+        # config. The account beats a configured cookie so a stale ticket left in `.env` can never
+        # shadow it — and it is the only mode that can renew itself.
+        self.login_mode = not session_cookie and bool(self.uid and self.pw)
+        self.session_cookie = None if self.login_mode else (session_cookie
+                                                            or spitfire_auth.session_cookie())
         self.cookie_mode = bool(self.session_cookie)
         if self.cookie_mode:
-            host = urlparse(self.base_url).hostname
-            self._session.cookies.set("sfPMSAuth", self.session_cookie, domain=host, path="/")
+            # `sfPMSAuth` alone is the FormsAuthentication ticket and is sufficient — the other
+            # cookies the browser holds are session id, settings and a session GUID, none of which
+            # authenticate. Set on the jar rather than as a header so redirects and any later
+            # Set-Cookie from the server merge normally.
+            self._session.cookies.set("sfPMSAuth", self.session_cookie, domain=self._host, path="/")
             self._authenticated = True
             _logger.info("using a supplied sfPMSAuth session cookie for %s", self.base_url)
+        elif self.login_mode:
+            ticket = spitfire_auth.cached_ticket(self.base_url, self.uid)
+            if ticket:
+                self._load_ticket(ticket)
 
     # --- transport ----------------------------------------------------------
 
@@ -340,6 +384,33 @@ class SpitfireReadClient:
         response.raise_for_status()
         return response.json()
 
+    def read(self, path: str, payload: Any = None) -> requests.Response:
+        """One allowlisted read, returned unraised so the caller can see what happened.
+
+        `_get_json` is right for the pipeline, which wants a PO or an exception. A sweep wants the
+        opposite: a 404 on one of a document's thirteen dialogs is data about that document, not a
+        reason to abandon it, and the status and raw bytes both have to be recorded. Public
+        because `tools/spitfire_warehouse_sync.py` must go through the allowlist, not around it —
+        reaching for `_get_json` would have been the easy way to end up bypassing `_request`.
+        """
+        self._ensure_session()
+        if payload is None:
+            return self._request("GET", path)
+        return self._request("POST", path, json=payload)
+
+    def read_json(self, path: str, payload: Any = None, default: Any = None) -> Any:
+        """`read`, decoded, with `default` for any non-2xx or unparseable body."""
+        try:
+            response = self.read(path, payload)
+        except (requests.RequestException, RuntimeError):
+            return default
+        if not response.ok:
+            return default
+        try:
+            return response.json()
+        except ValueError:
+            return default
+
     # --- session ------------------------------------------------------------
 
     def server_version(self) -> str:
@@ -372,21 +443,66 @@ class SpitfireReadClient:
         credentials. `tzOffset` is the client's offset from UT and is what Spitfire stamps
         server-side dates against, so a wrong value shifts received dates by hours.
         """
+        if not self._pinned_credentials:
+            # `.env` as it is now, not as it was at startup: this is what makes a password change
+            # a one-file edit. A lapsed ticket re-logs in with whatever the file says today.
+            account = spitfire_auth.credentials()
+            if account:
+                self.uid, self.pw = account.uid, account.pw
         missing = [n for n, v in (("SPITFIRE_UID", self.uid), ("SPITFIRE_PW", self.pw)) if not v]
         if missing:
             raise ValueError(f"SpitfireReadClient is missing required config: {', '.join(missing)} (check .env)")
+        self._session.cookies.clear()      # never send a lapsed ticket alongside the login
         response = self._request("POST", "/api/Account", json={
             "UID": self.uid, "PW": self.pw, "IsHashed": False, "tzOffset": self.tz_offset,
         })
         if response.status_code != 200:
             raise RuntimeError(
-                f"Spitfire login failed for {self.uid}: HTTP {response.status_code} {response.text[:200]}"
+                f"Spitfire login failed for {self.uid}: HTTP {response.status_code} "
+                f"{response.text[:200]} (check SPITFIRE_UID / SPITFIRE_PW in .env)"
             )
+        if not self._ticket_value():
+            # A 200 without a ticket authenticates nothing, and every later call would 401 with a
+            # message about permissions. Say what actually happened.
+            raise RuntimeError(f"Spitfire login for {self.uid} answered 200 but issued no "
+                               f"sfPMSAuth ticket")
         self._authenticated = True
+        if self.login_mode:
+            spitfire_auth.store_ticket(self.base_url, self.uid, self.ticket_cookies())
         _logger.info("authenticated to %s as %s", self.base_url, self.uid)
 
+    def ticket_cookies(self) -> Dict[str, str]:
+        """The cookies Spitfire issued this session, by name. Handed to the write client."""
+        return {c.name: c.value for c in self._session.cookies if c.value is not None}
+
+    def _ticket_value(self) -> Optional[str]:
+        return next((c.value for c in self._session.cookies if c.name == "sfPMSAuth"), None)
+
+    def _load_ticket(self, cookies: Dict[str, str]) -> None:
+        self._session.cookies.clear()
+        for name, value in cookies.items():
+            self._session.cookies.set(name, value, domain=self._host, path="/")
+        self._authenticated = True
+
+    def ensure_session(self) -> None:
+        """Public form of `_ensure_session`: a live session on return, or an exception."""
+        self._ensure_session()
+
     def _ensure_session(self) -> None:
+        if self.login_mode and spitfire_cassette.mode() == spitfire_cassette.REPLAY:
+            # Offline: there is no server to log in to, and the recorded responses answer anyway.
+            return
         if self._authenticated and self.has_session():
+            return
+        if self.login_mode:
+            with spitfire_auth.lock():
+                # Another client may have renewed the shared ticket while this one waited.
+                shared = spitfire_auth.cached_ticket(self.base_url, self.uid)
+                if shared and shared.get("sfPMSAuth") != self._ticket_value():
+                    self._load_ticket(shared)
+                    if self.has_session():
+                        return
+                self.authenticate()
             return
         if self.cookie_mode:
             # Deliberately not falling through to authenticate(): in cookie mode there is no
@@ -404,7 +520,7 @@ class SpitfireReadClient:
     def resolve_po(self, po_number: str, po_doc_type_key: Optional[str] = None) -> Optional[str]:
         """PO number -> `DocMasterKey`, the gap nothing on disk crosses.
 
-        Emails give us `212456`. Every read endpoint worth calling is keyed by GUID, and the
+        Emails give us `912456`. Every read endpoint worth calling is keyed by GUID, and the
         August probe was handed that GUID by a human reading it out of a browser. Two strategies,
         in order of how little they assume:
 
@@ -421,8 +537,28 @@ class SpitfireReadClient:
         the *file* catalog, not the document store. Project-scoped search is the one that returns
         the PO, so it goes first and the catalog search is kept only as a long shot.
         """
+        return self.resolve_po_with_outcome(po_number, po_doc_type_key)[0]
+
+    def resolve_po_with_outcome(self, po_number: str,
+                                po_doc_type_key: Optional[str] = None) -> "tuple":
+        """`(DocMasterKey | None, outcome)` — the same search, saying *why* it came back empty.
+
+        `resolve_po` cannot tell "Spitfire answered, and has no such purchase order" apart from
+        "not one of the three strategies got an answer at all": every one of them swallows its
+        HTTP failure and moves on, and the caller sees `None` either way. Downstream that becomes
+        "purchase order X was not found", which is a statement about *their* data made on the
+        strength of *our* connection.
+
+        The distinction matters because a record whose PO genuinely is not in Spitfire is nobody's
+        work — nothing can be done about it — while one we simply could not look up must be tried
+        again. Marking a whole backlog "not in Spitfire" during an outage would quietly close every
+        one of them.
+
+        `PO_ABSENT` is only returned when at least one strategy completed and reported nothing.
+        """
         self._ensure_session()
         doc_type = po_doc_type_key or settings.SPITFIRE_PO_DOC_TYPE_KEY
+        answered = False
         filters: Dict[str, Any] = {
             "DocNoLike": po_number,
             "IncludeDocs": True,
@@ -438,24 +574,67 @@ class SpitfireReadClient:
                 docs = self._post_json(f"/api/project/{project_id}/docs", filters)
             except (requests.HTTPError, ValueError):
                 continue
+            answered = True
             key = self._first_matching_key(docs, po_number)
             if key:
-                return key
+                return key, PO_FOUND
+
+        key, alt_answered = self._resolve_po_alt_with_outcome(po_number, doc_type)
+        answered = answered or alt_answered
+        if key:
+            return key, PO_FOUND
 
         try:
             results = self._post_json(
                 f"/api/catalog/search/{settings.SPITFIRE_SEARCH_SCOPE}/contents", filters)
-            return self._first_matching_key(results, po_number)
         except (requests.HTTPError, ValueError) as e:
             _logger.warning("catalog search for PO %s failed (%s)", po_number, type(e).__name__)
-            return None
+            return None, (PO_ABSENT if answered else PO_UNREACHABLE)
+        key = self._first_matching_key(results, po_number)
+        return (key, PO_FOUND) if key else (None, PO_ABSENT)
+
+    def resolve_po_alt(self, po_number: str, po_doc_type_key: Optional[str] = None) -> Optional[str]:
+        """PO number -> `DocMasterKey` in one call, with no project id at all.
+
+        `POST /api/viewable/DocMasterAlt` returns a bare quoted GUID, or `""` for no match — a
+        clean negative, unlike the 500-is-not-404 trap everywhere else on this API. It reaches
+        purchase orders outside `SPITFIRE_PROJECT_IDS`, which the project-scoped search above
+        structurally cannot: that search is the reason POs like 912456 read as unresolvable.
+
+        Kept as a fallback rather than promoted to first strategy because the project search is
+        what every recorded cassette and every test replays; changing the primary path is a
+        separate, reviewable change.
+        """
+        return self._resolve_po_alt_with_outcome(po_number, po_doc_type_key)[0]
+
+    def _resolve_po_alt_with_outcome(self, po_number: str,
+                                     po_doc_type_key: Optional[str] = None) -> "tuple":
+        """`(key | None, answered)` — `answered` is False when the call itself did not complete.
+
+        `DocMasterAlt` returns a bare quoted GUID or `""` for no match, so it is the one endpoint
+        here that gives a clean negative. That is only worth something if a transport failure is
+        told apart from it, which is what the second element carries.
+        """
+        doc_type = po_doc_type_key or settings.SPITFIRE_PO_DOC_TYPE_KEY
+        try:
+            found = self._post_json("/api/viewable/DocMasterAlt", {
+                "RequestID": "1",
+                "DVName": "DocMasterAlt",
+                "MatchingValue": str(po_number).strip(),
+                "DependsOn": [doc_type, "empty", "empty"],
+            })
+        except (requests.HTTPError, ValueError, RuntimeError) as e:
+            _logger.warning("DocMasterAlt for PO %s failed (%s)", po_number, type(e).__name__)
+            return None, False
+        key = str(found or "").strip()
+        return (key or None), True
 
     @staticmethod
     def _first_matching_key(payload: Any, po_number: str) -> Optional[str]:
-        """`DocNoLike` is a *like* filter, so `2124` would return 212456 alongside 212457.
+        """`DocNoLike` is a *like* filter, so `2124` would return 912456 alongside 912457.
 
         Every candidate is therefore re-checked for an exact hit on `DocNo` or `SubContract`
-        before its key is accepted. On PO 212456 both fields carry the number; which one is
+        before its key is accepted. On PO 912456 both fields carry the number; which one is
         authoritative depends on the doc type, so both are compared.
         """
         rows = payload if isinstance(payload, list) else (payload or {}).get("Rows") or []
@@ -497,7 +676,7 @@ class SpitfireReadClient:
     # --- PO read ------------------------------------------------------------
 
     def read_po(self, doc_master_key: str) -> PODocument:
-        """The five reads assembled into one object."""
+        """The four reads, assembled by `build_po_document`."""
         self._ensure_session()
         header = self._get_json(f"/api/document/{doc_master_key}")
         items = self._get_json(f"/api/document/{doc_master_key}/items") or []
@@ -506,49 +685,7 @@ class SpitfireReadClient:
         # `/dates` is deliberately NOT called: it returns schedule rows keyed by an unnamed
         # `DocDateTypeKey` GUID and carries no order date — see `order_date_of`. One request per
         # PO for nothing.
-
-        vendor = _address_of_type(addresses, ADDR_TO)
-        ship_to = _address_of_type(addresses, ADDR_SHIP_TO)
-        po_number = str(header.get("DocNo") or header.get("SubContract") or "").strip()
-        project_code = str(header.get("Project") or "").strip()
-        project_name = str(header.get("Project_dv") or "").strip()
-
-        # `ResponsibleParty_dv` reads empty on real POs, so the purchasing agent comes from the
-        # route, with the F (From/Author) address as the fallback the probe recommended.
-        agent = next((str(r.get("UserName")) for r in route
-                      if isinstance(r, dict) and r.get("UserName")), None)
-        if not agent:
-            from_addr = _address_of_type(addresses, ADDR_FROM)
-            agent = (from_addr or {}).get("Contact") or (from_addr or {}).get("Company")
-
-        # Payment terms exist only as prose. There is no structured pay-terms field anywhere on
-        # the document, which is why Stage 5's CBD/ADR rule cannot yet be driven from Spitfire.
-        pay_terms = header.get("Notes") or header.get("NoteEML")
-
-        doc = PODocument(
-            doc_master_key=str(doc_master_key),
-            po_number=po_number,
-            project_code=project_code,
-            project_name=project_name,
-            doc_status=str(header.get("Status") or ""),
-            doc_status_label=str(header.get("Status_dv") or ""),
-            source_date=header.get("SourceDate"),
-            order_date=order_date_of(header),
-            vendor_name=str((vendor or {}).get("Company") or ""),
-            vendor_email=(vendor or {}).get("Email"),
-            ship_to=(ship_to or {}).get("Company") or (ship_to or {}).get("Address1"),
-            pay_terms_prose=strip_html(pay_terms) or None,
-            assigned_agent=agent,
-        )
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if is_tax_line(item):
-                doc.tax_lines_skipped += 1
-                continue
-            doc.lines.append(_to_po_line(item, doc))
-        return doc
+        return build_po_document(doc_master_key, header, items, addresses, route)
 
     def read_po_lines(self, po_number: str) -> List[POLine]:
         """Convenience for the matcher: PO number straight to lines, or [] if unresolvable."""
@@ -648,7 +785,7 @@ def _to_float(value: Any) -> Optional[float]:
 def _to_po_line(item: dict, doc: PODocument) -> POLine:
     """One `DocItem` -> one `POLine`, with the three field traps handled.
 
-    * **Quantity.** `DocItem.ItemQuantity` reads 0.0 on PO 212456 line 0001, which orders 2 units.
+    * **Quantity.** `DocItem.ItemQuantity` reads 0.0 on PO 912456 line 0001, which orders 2 units.
       `RelatedLineDetails.ContractUnits` is the ordered quantity; `DocItemTask[0].Quantity` is the
       fallback. `ItemQuantity` is never trusted on its own.
     * **Spec code.** `DocItem.Specification` is null. The spec lives in `SourceItemNumber` — which
@@ -666,13 +803,13 @@ def _to_po_line(item: dict, doc: PODocument) -> POLine:
         qty_ordered = _to_float(item.get("ItemQuantity")) or 0.0
 
     # `DocItemNumber` is a display string and is NOT safe to treat as an integer:
-    #   * PO 208491 carries a line whose number is the literal text "Remitted Tax";
+    #   * PO 908491 carries a line whose number is the literal text "Remitted Tax";
     #   * receipt documents number their lines "0001-001", i.e. {DocNo}-{seq};
     #   * the lines come back unordered (0011, 0023, 0020, 0018 ...), so position means nothing.
     # Leading digits are taken where they exist and 0 stands for "unnumbered" — never raising,
     # because one oddly-numbered line must not cost us the other twenty-four.
     #
-    # **This is not a match key.** The Authority Inbound cites "208491 : 300" while the same spec
+    # **This is not a match key.** The Authority Inbound cites "908491 : 300" while the same spec
     # (STE-402-LT) is DocItemNumber 0003 in Spitfire — 300 and 0003 are different numbering
     # schemes and their relationship is not established. `models.py:150` calls po_line_number
     # "the single most valuable field on the record"; until that mapping is proven, match on
@@ -713,3 +850,63 @@ def _to_po_line(item: dict, doc: PODocument) -> POLine:
         assigned_agent=doc.assigned_agent,
         pay_terms=doc.pay_terms_prose,
     )
+
+
+def build_po_document(doc_master_key: str, header: Any, items: Sequence[Any],
+                      addresses: Sequence[Any], route: Sequence[Any]) -> PODocument:
+    """The four payloads of a purchase order, assembled into one `PODocument`. No I/O.
+
+    Split out of `SpitfireReadClient.read_po` so the warehouse can rebuild the same object from
+    mirrored rows — `pipeline.spitfire_mirror.refresh_from_warehouse` — without a second parser.
+    Every field trap lives on this path exactly once (`ItemQuantity` reading 0.0, the spec code in
+    `SourceItemNumber`, HTML descriptions, `TAX-`/`FRT-` lines), so the offline projection and the
+    live read cannot drift apart. `read_po` passes API responses; the mirror passes rows rebuilt
+    into the same shape, which is why `sf_document` keeps Spitfire's own PascalCase field names.
+    """
+    header = header if isinstance(header, dict) else {}
+    items = items or []
+    addresses = addresses or []
+    route = route or []
+
+    vendor = _address_of_type(addresses, ADDR_TO)
+    ship_to = _address_of_type(addresses, ADDR_SHIP_TO)
+    po_number = str(header.get("DocNo") or header.get("SubContract") or "").strip()
+    project_code = str(header.get("Project") or "").strip()
+    project_name = str(header.get("Project_dv") or "").strip()
+
+    # `ResponsibleParty_dv` reads empty on real POs, so the purchasing agent comes from the
+    # route, with the F (From/Author) address as the fallback the probe recommended.
+    agent = next((str(r.get("UserName")) for r in route
+                  if isinstance(r, dict) and r.get("UserName")), None)
+    if not agent:
+        from_addr = _address_of_type(addresses, ADDR_FROM)
+        agent = (from_addr or {}).get("Contact") or (from_addr or {}).get("Company")
+
+    # Payment terms exist only as prose. There is no structured pay-terms field anywhere on
+    # the document, which is why Stage 5's CBD/ADR rule cannot yet be driven from Spitfire.
+    pay_terms = header.get("Notes") or header.get("NoteEML")
+
+    doc = PODocument(
+        doc_master_key=str(doc_master_key),
+        po_number=po_number,
+        project_code=project_code,
+        project_name=project_name,
+        doc_status=str(header.get("Status") or ""),
+        doc_status_label=str(header.get("Status_dv") or ""),
+        source_date=header.get("SourceDate"),
+        order_date=order_date_of(header),
+        vendor_name=str((vendor or {}).get("Company") or ""),
+        vendor_email=(vendor or {}).get("Email"),
+        ship_to=(ship_to or {}).get("Company") or (ship_to or {}).get("Address1"),
+        pay_terms_prose=strip_html(pay_terms) or None,
+        assigned_agent=agent,
+    )
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if is_tax_line(item):
+            doc.tax_lines_skipped += 1
+            continue
+        doc.lines.append(_to_po_line(item, doc))
+    return doc

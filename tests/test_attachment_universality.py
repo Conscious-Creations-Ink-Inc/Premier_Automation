@@ -33,7 +33,7 @@ NOW = "2026-08-03T00:00:00Z"
 
 def make_pdf() -> bytes:
     from tests.test_extract import make_pdf_bytes
-    return make_pdf_bytes([["PO", "Spec", "Qty"], ["208491", "STE-402-LT-B", "11"]])
+    return make_pdf_bytes([["PO", "Spec", "Qty"], ["908491", "STE-402-LT-B", "11"]])
 
 
 def make_xlsx() -> bytes:
@@ -41,7 +41,7 @@ def make_xlsx() -> bytes:
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.append(["Vendor", "PO#", "Spec#", "QTY", "Item Description", "Confirmed Received: Yes or No"])
-    sheet.append(["Daniel Stuart", "207030", "LOB-203-PI", 12, '18"x18" Throw Pillow', "yes"])
+    sheet.append(["Daniel Stuart", "907030", "LOB-203-PI", 12, '18"x18" Throw Pillow', "yes"])
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
@@ -64,7 +64,7 @@ def make_doc() -> bytes:
 def make_docx() -> bytes:
     import docx
     document = docx.Document()
-    document.add_paragraph("Received 11 EA of STE-402-LT-B against PO 208491.")
+    document.add_paragraph("Received 11 EA of STE-402-LT-B against PO 908491.")
     buffer = io.BytesIO()
     document.save(buffer)
     return buffer.getvalue()
@@ -81,7 +81,7 @@ def make_pptx() -> bytes:
 def make_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("notes.txt", "Received against PO 208491, spec STE-402-LT-B, 11 EA.")
+        archive.writestr("notes.txt", "Received against PO 908491, spec STE-402-LT-B, 11 EA.")
     return buffer.getvalue()
 
 
@@ -106,17 +106,17 @@ def make_image() -> bytes:
 def make_html() -> bytes:
     return (b"<html><body><table>"
             b"<tr><th>PO</th><th>Spec</th><th>Qty</th></tr>"
-            b"<tr><td>208491</td><td>STE-402-LT-B</td><td>11</td></tr>"
+            b"<tr><td>908491</td><td>STE-402-LT-B</td><td>11</td></tr>"
             b"</table></body></html>")
 
 
 def make_text() -> bytes:
-    return b"Vendor,PO#,Spec#,QTY\nDaniel Stuart,207030,LOB-203-PI,12\n"
+    return b"Vendor,PO#,Spec#,QTY\nDaniel Stuart,907030,LOB-203-PI,12\n"
 
 
 def make_archive() -> bytes:
     import gzip
-    return gzip.compress(b"Received against PO 208491")
+    return gzip.compress(b"Received against PO 908491")
 
 
 def make_archive_unsupported() -> bytes:
@@ -310,3 +310,42 @@ def test_a_zip_bomb_is_refused_not_expanded(conn):
     member = next(r for r in attachment_ledger.for_email(conn, "msg-bomb") if r.depth == 1)
     assert member.disposition == attachment_ledger.DROPPED_OVERSIZE
     assert "compression ratio" in member.disposition_detail
+
+
+def test_a_forwarded_notification_expands_whether_it_is_named_eml_or_msg():
+    """The same bytes arrive under both extensions and must read identically.
+
+    Graph hands a forwarded message over as MIME with `contentType: message/rfc822`; whether the
+    connector names it `.eml` or `.msg` is incidental. Premier's mailbox holds one message where
+    the `.msg` copy expanded into its two MIME parts and the `.eml` copy — byte-for-byte identical,
+    same sha256 — was handed to the OLE reader and died `BadZipFile: File is not a zip file`,
+    taking a Delivered Notification with it. Deciding by extension is what makes that possible, so
+    this asserts the extension cannot decide anything.
+    """
+    from pipeline.stage3_extract.base import ExtractionSource
+    from pipeline.stage3_extract.containers import Budget, MsgContainerAdapter
+
+    raw = (
+        b"Received: from LV8PR14MB7645.namprd14.prod.outlook.com (2603::1) by mx.example\r\n"
+        b"From: routing@example-logistics.test\r\n"
+        b"Subject: [External] 99985 - Delivered Notification - 910634\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/alternative; boundary="b1"\r\n'
+        b"\r\n--b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Authority #: 99985\r\nDelivered: 09/10/2025 Signed by: U ALI\r\n"
+        b"\r\n--b1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        b"<html><body><p>Authority #: 99985</p></body></html>\r\n--b1--\r\n"
+    )
+
+    expanded = {}
+    for name in ("notification.eml", "notification.msg"):
+        source = ExtractionSource(
+            source_email_id="msg-1", email_date="2026-08-12", source_type="attachment",
+            filename=name, content_bytes=raw, content_type="message/rfc822",
+        )
+        adapter = MsgContainerAdapter()
+        assert adapter.can_expand(source), name
+        expanded[name] = [child.filename for child in adapter.expand(source, Budget.fresh())]
+
+    assert expanded["notification.eml"], "MIME bytes named .eml must still expand"
+    assert expanded["notification.eml"] == expanded["notification.msg"]

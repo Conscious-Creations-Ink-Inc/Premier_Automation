@@ -6,7 +6,7 @@ allowlist is exhaustive, path matching cannot be tricked into authorising a long
 rejected request never reaches the network.
 
 The field-mapping tests below are the second half of the same idea — they pin the three traps the
-8 August 2026 probe found on PO 212456, each of which silently produces a wrong receiver rather
+8 August 2026 probe found on PO 912456, each of which silently produces a wrong receiver rather
 than an error.
 """
 
@@ -29,7 +29,7 @@ def client(monkeypatch):
     """A client with credentials that would work, and a session that cannot be used.
 
     Any request that gets past the allowlist blows up loudly instead of quietly reaching
-    training.remingtonhotels.com — the test suite must never touch Premier's ERP.
+    training.example-hotels.test — the test suite must never touch Premier's ERP.
     """
     monkeypatch.setattr(spitfire.settings, "SPITFIRE_UID", "test@example.com", raising=False)
     monkeypatch.setattr(spitfire.settings, "SPITFIRE_PW", "unused", raising=False)
@@ -179,16 +179,16 @@ def test_five_hundred_is_retried_once_then_raises(client, monkeypatch):
 def _doc() -> PODocument:
     return PODocument(
         doc_master_key="6aad38da-39f6-41b7-afc2-480f372e1fa4",
-        po_number="212456", project_code="PNW025TB100012",
+        po_number="912456", project_code="PNW025TB100012",
         project_name="Westin Princeton Public Space", doc_status="M",
         doc_status_label="Committed", source_date=None,
-        vendor_name="Peerless Industries Inc", vendor_email="KPetrin@peerless-av.com",
+        vendor_name="Northgate Industries Inc", vendor_email="contact@example-mounts.test",
         ship_to="***DO NOT SHIP ON YOUR OWN***", assigned_agent="Delfina Marsetti",
         pay_terms_prose=None,
     )
 
 
-# Line 0001 of PO 212456, as the API actually returned it: ItemQuantity 0.0 despite ordering 2,
+# Line 0001 of PO 912456, as the API actually returned it: ItemQuantity 0.0 despite ordering 2,
 # Specification null, Description wrapped in HTML.
 _GOODS_LINE = {
     "DocItemKey": "45fd1906-0b83-4868-b12a-bdcac04a8bfc",
@@ -297,7 +297,7 @@ def test_uom_falls_back_to_related_details():
 
 
 def test_line_number_is_normalised_to_an_integer():
-    """Spitfire displays "0001"; Premier's Authority Inbound cites "208491 : 300". Comparing
+    """Spitfire displays "0001"; Premier's Authority Inbound cites "908491 : 300". Comparing
     ExtractedRecord.po_line_number to a Spitfire line at all depends on this normalisation."""
     assert spitfire._to_po_line(_GOODS_LINE, _doc()).line_number == 1
 

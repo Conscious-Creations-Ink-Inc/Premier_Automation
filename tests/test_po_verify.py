@@ -15,16 +15,16 @@ from pipeline.models import POLine
 def line(spec="GR-350a-WTF", *, number=1, ordered=196.0, received=0.0, in_transit=0.0,
          uom="YD", description="Main Drapery Fabric") -> POLine:
     return POLine(
-        po_number="210634", line_number=number, line_key=f"key-{number}", spec_code=spec,
+        po_number="910634", line_number=number, line_key=f"key-{number}", spec_code=spec,
         description=description, vendor_name="P. Kaufmann", unit_of_measure=uom,
         qty_ordered=ordered, qty_received=received, qty_in_transit=in_transit,
-        cost_code="", project_code="MRC024PB100003", project_name="", line_status="Open",
+        cost_code="", project_code="PRJ001PB100003", project_name="", line_status="Open",
         expected_date=None, ship_to=None, assigned_agent=None,
     )
 
 
 def facts(**overrides) -> po_verify.RecordFacts:
-    base = dict(id=131, po_number="210634", spec_code="GR-350a-WTF",
+    base = dict(id=131, po_number="910634", spec_code="GR-350a-WTF",
                 parent_spec_code="GR-350a-WTF", item_description="Main Drapery Fabric",
                 quantity_received=196.0, unit_of_measure="YD")
     base.update(overrides)
@@ -32,7 +32,7 @@ def facts(**overrides) -> po_verify.RecordFacts:
 
 
 def doc(**overrides) -> PODocument:
-    base = dict(doc_master_key="k", po_number="210634", project_code="MRC024PB100003",
+    base = dict(doc_master_key="k", po_number="910634", project_code="PRJ001PB100003",
                 project_name="", doc_status="M", doc_status_label="Committed",
                 source_date=None, vendor_name="P. Kaufmann", vendor_email=None, ship_to=None,
                 assigned_agent=None, pay_terms_prose=None, order_date="2025-08-17")
@@ -160,7 +160,7 @@ def test_a_line_matched_but_no_quantity_stated_compares_nothing():
 
 
 def test_a_po_that_was_not_found_does_not_claim_it_does_not_exist():
-    result = po_verify.verify_record(facts(po_number="212456"), None, [])
+    result = po_verify.verify_record(facts(po_number="912456"), None, [])
     assert result.po_found is False
     assert "not the same as it not existing" in notes(result)
 
@@ -204,7 +204,7 @@ def test_a_line_reached_by_description_alone_is_flagged_as_the_weaker_claim():
 
 
 def test_a_surcharge_line_sharing_a_spec_does_not_steal_the_match():
-    """Live PO 210635, and the reason the tie-break exists. Spec GR-350c-WTF sits on two lines —
+    """Live PO 910635, and the reason the tie-break exists. Spec GR-350c-WTF sits on two lines —
     0001 is 84 YD of sheer fabric, 0003 is a 1 EA tariff surcharge on it. Both match the spec
     exactly, and the surcharge's shorter description scored higher, so the screen reported "84 YD
     is 83 more than the 1 EA ordered" — a discrepancy that existed only because the wrong line had
@@ -253,7 +253,7 @@ def test_only_a_clean_agreeing_comparison_counts_as_nothing_to_report():
     assert clean.has_finding is False
     for broken in (po_verify.verify_record(facts(quantity_received=202.0), doc(), [line()]),
                    po_verify.verify_record(facts(unit_of_measure="EA"), doc(), [line()]),
-                   po_verify.verify_record(facts(po_number="212456"), None, [])):
+                   po_verify.verify_record(facts(po_number="912456"), None, [])):
         assert broken.has_finding is True
 
 
@@ -284,7 +284,7 @@ def test_a_lapsed_cookie_falls_back_to_the_mirror_under_a_warning(monkeypatch, t
         def read_po(self, key):
             raise RuntimeError("the supplied sfPMSAuth cookie has expired or was rejected.")
 
-    row = _Row(id=131, po_number="210634", spec_code="GR-350a-WTF",
+    row = _Row(id=131, po_number="910634", spec_code="GR-350a-WTF",
                parent_spec_code=None, item_description="Main Drapery Fabric",
                quantity_received=196.0, unit_of_measure="YD",
                package_quantity=None, package_uom=None)
@@ -316,13 +316,13 @@ def test_a_successful_live_read_refreshes_the_mirror(tmp_path):
         def read_po(self, key):
             return doc(lines=[line(received=12.0)])
 
-    row = _Row(id=131, po_number="210634", spec_code="GR-350a-WTF", parent_spec_code=None,
+    row = _Row(id=131, po_number="910634", spec_code="GR-350a-WTF", parent_spec_code=None,
                item_description=None, quantity_received=196.0, unit_of_measure="YD",
                package_quantity=None, package_uom=None)
     result = po_verify.verify_records(conn, [row], client_factory=Live)[0]
 
     assert result.source == po_verify.SOURCE_LIVE
     assert result.error is None
-    assert [l.spec_code for l in spitfire_mirror.lines_for(conn, "210634")] == ["GR-350a-WTF"]
-    assert spitfire_mirror.refreshed_at(conn, "210634") is not None
+    assert [l.spec_code for l in spitfire_mirror.lines_for(conn, "910634")] == ["GR-350a-WTF"]
+    assert spitfire_mirror.refreshed_at(conn, "910634") is not None
     conn.close()

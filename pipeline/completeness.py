@@ -17,10 +17,14 @@ Carrier and tracking are `ADVISORY` on purpose. A warehouse Inbound notification
 carries neither — the goods moved inside the 3PL's own network — so demanding them would park
 correct records in a human queue for ever.
 
-**Nothing here blocks.** Gaps are reported, not enforced: an incomplete record still reaches the
-Records page, flagged. Whoever builds the write path must refuse a record whose `is_complete` is
-False, or **a receiver with no delivery date reaches Premier's ERP** — that is the one this list
-still exists to prevent, and `post_decision` honours it.
+**This list decides what reaches the Records page.** It did not always: gaps were once reported
+and not enforced, and an incomplete record appeared there flagged. That was reversed on 2026-08-24
+— `records_ready` filters on `is_complete`, so Records means postable and anything with a gap is on
+the manual queue, where the controls that close gaps live. `read_views` carries the reasoning.
+
+The write path refuses an incomplete record too, and must: `post_decision` gate 1 is this same
+test, and without it **a receiver with no delivery date reaches Premier's ERP** — the one thing
+this list exists to prevent. Two gates, one definition, deliberately.
 
 A *missing POD file* is no longer part of that judgement. It is a separate gate, in
 `post_decision`, because it has a separate remedy: a person may waive it for a delivery stated

@@ -185,6 +185,13 @@ def has_bytes(conn: sqlite3.Connection, row: Any) -> bool:
         conn.row_factory = prior
     if cached is not None and cached["content"]:
         return True
+    # The same ladder `attachment_bytes.resolve` walks. This is a second copy of that logic and has
+    # to learn every step of it: a cached row whose bytes moved to the store would otherwise be
+    # badged "bytes not stored" here and refused by `set_delivery_proof`, for a file the viewer
+    # serves perfectly well.
+    if cached is not None and cached["content_sha256"]:
+        if attachment_store.exists(str(cached["content_sha256"])):
+            return True
     for column in ("blob_sha256", "sha256"):
         digest = _field(row, column)
         if digest and attachment_store.exists(str(digest)):
@@ -379,6 +386,43 @@ def records_from(conn: sqlite3.Connection, email_id: str) -> Sequence[sqlite3.Ro
         conn.row_factory = prior
 
 
+LINE_FIELDS = ("spec_code", "item_description", "quantity_received")
+"""What differs between two lines of one delivery, and therefore what is never carried forward."""
+
+DELIVERY_FIELDS = ("po_number", "pod_stated_date", "unit_of_measure")
+"""What every line of one delivery shares, and therefore what "another line" starts from."""
+
+
+def line_seed(conn: sqlite3.Connection, record_id: int) -> Dict[str, Any]:
+    """Open the create form on another line of the delivery `record_id` belongs to.
+
+    Deliberately not `prefill`. That reads the last record staged from the message and carries
+    *everything* on it, which is right when nothing is known yet and wrong here: the spec, the
+    description and the quantity are the whole of what makes this a second line, and offering the
+    previous line's values for them invites a duplicate of the row just written — which is also the
+    one thing `dedupe.delivery_key` cannot catch, because a person who accepts three prefilled
+    fields has still typed a different quantity by the time it is checked.
+
+    An unknown `record_id` seeds nothing rather than raising. The form is usable empty, and a
+    missing record here means a stale link, not a broken system.
+    """
+    prior = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT po_number, pod_stated_date, unit_of_measure FROM extracted_records "
+            "WHERE id = ?", (record_id,)).fetchone()
+    finally:
+        conn.row_factory = prior
+
+    values: Dict[str, Any] = {name: "" for name in LINE_FIELDS + DELIVERY_FIELDS}
+    if row is not None:
+        for name in DELIVERY_FIELDS:
+            if row[name] is not None and str(row[name]).strip():
+                values[name] = str(row[name]).strip()
+    return values
+
+
 def waive_pod(conn: sqlite3.Connection, record_id: int, *, by: str,
               now: Optional[str] = None) -> Created:
     """Accept that an *automatically* staged record has no proof of delivery and may post anyway.
@@ -402,12 +446,174 @@ def waive_pod(conn: sqlite3.Connection, record_id: int, *, by: str,
                        message=f"already accepted without a proof of delivery by "
                                f"{row['pod_waived_by']}")
 
-    conn.execute(
-        "UPDATE extracted_records SET pod_waived_by = ?, pod_waived_at = ?, pod_source = ?, "
-        "updated_at = ? WHERE id = ?",
-        (by, now, POD_EMAIL_BODY, now, record_id))
+    _waive_one(conn, record_id, by=by, now=now)
     conn.commit()
     return Created(
         ok=True, record_id=record_id,
         message=(f"record #{record_id} may now be posted with no proof of delivery attached. "
                  f"The receipt will carry the receiver report and nothing else."))
+
+
+def _waive_one(conn: sqlite3.Connection, record_id: int, *, by: str, now: str) -> None:
+    """The waiver itself, without the commit.
+
+    Split out so `waive_delivery_pod` can sign thirty-two records inside one transaction. A commit
+    per record would let a crash halfway leave seventeen lines signed under a page that said
+    thirty-two — a partial signature, which is not a thing a person can be asked to stand behind.
+    """
+    conn.execute(
+        "UPDATE extracted_records SET pod_waived_by = ?, pod_waived_at = ?, pod_source = ?, "
+        "updated_at = ? WHERE id = ?",
+        (by, now, POD_EMAIL_BODY, now, record_id))
+
+
+@dataclass
+class DeliveryProof:
+    """What one delivery-wide decision did, per record, for the page to report back."""
+    ok: bool
+    message: str
+    changed: List[int] = field(default_factory=list)
+    unchanged: List[str] = field(default_factory=list)
+    """One sentence per record left alone, naming who had already decided it. Not an error: a
+    second visit to the page is the ordinary way somebody checks what they signed."""
+
+
+def waive_delivery_pod(conn: sqlite3.Connection, delivery_id: int, *, by: str,
+                       record_ids: Sequence[int], now: Optional[str] = None) -> DeliveryProof:
+    """Accept that these lines of one delivery have no proof of delivery and may post anyway.
+
+    **One signature covering many lines, because that is the grain the decision is made at.** A
+    delivery is received as one receipt carrying one row per item line; nobody inspects line 19 of a
+    truck on its own, and asking for thirty-two signatures would produce thirty-two reflex presses.
+    The same reasoning `read_views` gives for confirming a *message* rather than a record: they are
+    looking at one spreadsheet, not at row 604 of it.
+
+    `record_ids` is passed in rather than derived. Deciding which lines are blocked on the POD gate
+    means resolving real attachment bytes, which is `spitfire_post`'s work, and reaching for it here
+    would drag the write client into the manual-create path. **The ids are still re-checked against
+    the delivery here** — a caller may only waive lines that are actually on it. That guard belongs
+    in this module and not only in the route that calls it today, for the reason
+    `mail_overrides.set_verdict` gives about unsigned verdicts.
+
+    An existing waiver is never overwritten. `waive_pod` already says why: the first name is the one
+    that took the risk. Those records come back in `unchanged` so the page can name them.
+    """
+    now = now or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    by = _clean(by)
+    if not by:
+        return DeliveryProof(ok=False, message="a waiver has to name who gave it")
+
+    rows = _delivery_lines(conn, delivery_id, record_ids)
+    if not rows:
+        return DeliveryProof(
+            ok=False,
+            message=(f"none of those lines are on delivery #{delivery_id} any more — reopen it and "
+                     f"try again, rather than signing for a list that has moved"))
+
+    changed, unchanged = [], []
+    for row in rows:
+        already = _clean(row["pod_waived_by"])
+        if already:
+            unchanged.append(f"record #{row['id']} was already accepted by {already}")
+            continue
+        _waive_one(conn, int(row["id"]), by=by, now=now)
+        changed.append(int(row["id"]))
+    conn.commit()
+
+    if not changed:
+        return DeliveryProof(ok=True, message="every one of these lines was already accepted.",
+                             unchanged=unchanged)
+    return DeliveryProof(
+        ok=True, changed=changed, unchanged=unchanged,
+        message=(f"{len(changed)} line{'s' if len(changed) != 1 else ''} of delivery "
+                 f"#{delivery_id} may now be posted with no proof of delivery attached. The "
+                 f"receipt will carry the receiver report and nothing else."))
+
+
+def choose_delivery_pod(conn: sqlite3.Connection, delivery_id: int, *, ledger_id: int,
+                        email_id: str, record_ids: Sequence[int],
+                        now: Optional[str] = None) -> DeliveryProof:
+    """Nominate one file on one message as the proof of delivery for these lines.
+
+    The better outcome than a waiver, and the reason this exists: the email that prompted this work
+    carried files nothing read as a POD, and waiving would have put a receipt into Premier's ERP
+    with nothing behind it while a usable document sat in the attachment store.  `pod_ledger_id`
+    outranks every automatic rule in `spitfire_post._pod_for`, so a nominated file is uploaded and
+    hashed exactly as a detected one would be.
+
+    **Scoped to one message.** `_chosen_pod` resolves a nomination only against the record's own
+    `source_email_id` and returns nothing when it does not match — so an unscoped choice would not
+    hang another delivery's proof on this receipt, it would silently become "this record has no POD"
+    three screens later. Refused here instead, in the words `create` already uses.
+
+    **A file whose bytes were never stored is refused**, through the same `has_bytes` the chooser
+    draws its "bytes not stored" badge from. `_chosen_pod` deliberately does not fall back to the
+    automatic rules when a choice cannot be resolved, so accepting one here would turn a person's
+    decision into a silent refusal later.
+
+    An existing `pod_waived_by` is deliberately **left standing**. `create` refuses a record that
+    both waives and names a proof, but that is about a record being *made*; here the waiver is
+    something that already happened and somebody's name is on it. Erasing it would erase the audit
+    trail of a risk that was taken. Nothing downstream is confused by both: `post_decision` writes
+    `pod_waived_by` empty on any decision that found real POD bytes, so the ledger says "posted with
+    a proof" rather than "posted on a waiver".
+    """
+    now = now or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    email_id = _clean(email_id)
+
+    prior = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        chosen = conn.execute(
+            "SELECT id, ordinal, filename, sha256, blob_sha256 FROM attachment_ledger "
+            "WHERE id = ? AND email_id = ?", (ledger_id, email_id)).fetchone()
+    finally:
+        conn.row_factory = prior
+    if chosen is None:
+        return DeliveryProof(ok=False, message="that attachment is not on this message")
+    if not has_bytes(conn, dict(chosen, email_id=email_id)):
+        return DeliveryProof(
+            ok=False,
+            message=(f"{chosen['filename'] or 'that file'} was listed on the message but its bytes "
+                     f"were never stored, so it cannot be uploaded. Choose another file, or accept "
+                     f"the delivery without a proof."))
+
+    rows = [r for r in _delivery_lines(conn, delivery_id, record_ids)
+            if _clean(r["source_email_id"]) == email_id]
+    if not rows:
+        return DeliveryProof(
+            ok=False,
+            message=(f"none of those lines are on delivery #{delivery_id} and this message — a "
+                     f"file may only be the proof for the records read out of its own mail"))
+
+    for row in rows:
+        conn.execute(
+            "UPDATE extracted_records SET pod_ledger_id = ?, pod_source = ?, updated_at = ? "
+            "WHERE id = ?", (int(ledger_id), POD_ATTACHMENT, now, int(row["id"])))
+    conn.commit()
+    return DeliveryProof(
+        ok=True, changed=[int(r["id"]) for r in rows],
+        message=(f"{chosen['filename'] or 'that file'} is now the proof of delivery for "
+                 f"{len(rows)} line{'s' if len(rows) != 1 else ''} of delivery #{delivery_id}. It "
+                 f"is uploaded to the receipt when the delivery is posted."))
+
+
+def _delivery_lines(conn: sqlite3.Connection, delivery_id: int,
+                    record_ids: Sequence[int]) -> List[sqlite3.Row]:
+    """The named records, narrowed to the ones actually on this delivery.
+
+    The narrowing is the guard. The page recomputes which lines are blocked on its own POST and
+    never round-trips the list through the browser, but a module that trusted its caller for this
+    would be one edit away from signing a waiver against somebody else's delivery.
+    """
+    wanted = {int(i) for i in record_ids}
+    if not wanted:
+        return []
+    prior = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM extracted_records WHERE delivery_id = ?",
+                            (int(delivery_id),)).fetchall()
+    finally:
+        conn.row_factory = prior
+    return [r for r in rows if int(r["id"]) in wanted]

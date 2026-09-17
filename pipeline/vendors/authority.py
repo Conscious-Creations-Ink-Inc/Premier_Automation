@@ -2,32 +2,32 @@
 
 Two notices describe every warehouse delivery, and telling them apart is the whole job:
 
-**Class A — Inbound Notification**, from `warehousing@authoritylogistics.com`. What the
+**Class A — Inbound Notification**, from `warehousing@example-logistics.test`. What the
 warehouse actually booked in. This is the receiver trigger.
 
-    [External] 239475 - Inbound Notification - 208491 - 2985 : LXR Cameo Beverly Hills (Guestrooms) - MRC Los Angeles CA
-    Received Date: 10/09/2025 | Received at: Crown Worldwide ... | Received By: Miguel C.
-    ALS Shipment #: <blank> | Carrier: Custom Companies | Tracking: 69942177 | Quantity: 1 CTN
+    [External] 939475 - Inbound Notification - 908491 - 9085 : Example Hotel Downtown (Guestrooms) - PRJ Springfield IL
+    Received Date: 10/09/2025 | Received at: Example Storage ... | Received By: Jordan T.
+    ALS Shipment #: <blank> | Carrier: Custom Companies | Tracking: 99942177 | Quantity: 1 CTN
     PO # / Line # | Supplier | Part # | Item                                   | Package        | Comments
-    208491 : 300  | Light Annex | STE-402-LT-B | 1 EA - STE-402-LT-B - BASE, ... | 1 CTN - 50.00 lb | STE-402-LT
+    908491 : 300  | Light Annex | STE-402-LT-B | 1 EA - STE-402-LT-B - BASE, ... | 1 CTN - 50.00 lb | STE-402-LT
 
-**Class B — Delivered Notification**, from `routing@authoritylogistics.com`. What the *carrier*
+**Class B — Delivered Notification**, from `routing@example-logistics.test`. What the *carrier*
 dropped at the warehouse door. Usually **not** a receiver — the Inbound for the same goods
 follows, and creating a receiver from both is the double-count that killed Premier's previous
 automation attempt.
 
-    [External] 50009 - Delivered Notification -  - 206725, 207665
-    Authority #: 50009 | Carrier: Nolan Transportation | Tracking: 8801592 | Delivered: 09/15/2025
+    [External] 90009 - Delivered Notification -  - 906725, 907665
+    Authority #: 90009 | Carrier: Example Freight | Tracking: 9801592 | Delivered: 09/15/2025
     Package | PO # | Item | Supplier
 
 The join that prevents the double count: **Class B's `Authority #` is Class A's
-`ALS Shipment #`** — verified in the corpus (Delivered 50009 and Inbound 239260 are the same
-goods: POs 206725/207665, tracking 8801592). `AuthorityNotice.shipment_number` returns that
+`ALS Shipment #`** — verified in the corpus (Delivered 90009 and Inbound 939260 are the same
+goods: POs 906725/907665, tracking 9801592). `AuthorityNotice.shipment_number` returns that
 number under either name, and Stage 2 keys on it.
 
 Everything here is positional. The generic PO regex finds nothing in these emails — no "PO"
 prefix appears anywhere near the numbers — and a bare `\\d{6}` would happily return the inbound
-number 239336 as a PO. See `parsing/tokens.py`.
+number 939336 as a PO. See `parsing/tokens.py`.
 """
 
 import re
@@ -35,13 +35,21 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
+from config import settings
 from pipeline.models import ExtractedRecord
 from pipeline.parsing import tables as tbl
 from pipeline.parsing import text as txt
 from pipeline.parsing import thread as thr
 from pipeline.parsing import tokens as tok
 
-AUTHORITY_DOMAIN = "authoritylogistics.com"
+# The warehouse partner's routing domain is operational configuration, not a source literal
+# (Ashford Standards v1.5 §12) — it moved to `settings.WAREHOUSE_SENDER_DOMAINS`, which defaults
+# to the synthetic `.test` domains the fixtures use and is overridden from `.env` in production.
+#
+# Note what is *not* configurable, deliberately: the field labels this module matches on
+# (`Received Date:`, `Authority #:`, `ALS Shipment #:`) are the vendor's email grammar, and the
+# regexes below must keep matching them verbatim. Grammar is specification; the domain is data.
+AUTHORITY_DOMAINS = tuple(settings.WAREHOUSE_SENDER_DOMAINS)
 
 INBOUND_LOCAL_PARTS = {"warehousing"}
 DELIVERED_LOCAL_PARTS = {"routing"}
@@ -141,9 +149,9 @@ def _notice_region(rendered: str, kind: NoticeKind) -> str:
 
     A forwarded notice carries Outlook's own `From:` / `To:` / `Subject:` header block, and the
     notice itself has fields with those same names — `From: Tournesol Siteworks : 1540 Leader
-    International Dr` and `To: Crown Worldwide ... Mira Loma`. Read against the whole message
+    International Dr` and `To: Example Storage ... Riverside`. Read against the whole message
     the `To:` label matches the *recipient list* first, so `delivery_location` came out as a
-    string of premierpm.com addresses. Anchoring on the notice's first field fixes that at the
+    string of example-pm.test addresses. Anchoring on the notice's first field fixes that at the
     source instead of trying to recognise a recipient list after the fact.
     """
     if not rendered:
@@ -203,7 +211,7 @@ class AuthorityNotice:
         """The B<->A join key under whichever name this notice used it.
 
         Returns None rather than a substitute when an Inbound leaves `ALS Shipment #` blank
-        (notice 239475 does). Falling back to the *inbound* number there would look like a key
+        (notice 939475 does). Falling back to the *inbound* number there would look like a key
         but join to nothing — every Delivered notice states an Authority number, never an inbound
         number — and would silently split one delivery into two accumulation buckets.
         """
@@ -237,7 +245,7 @@ def classify(sender_address: str, subject: str) -> NoticeKind:
     """
     address = (sender_address or "").lower()
     clean_subject = thr.strip_forward_prefixes(subject or "")
-    from_authority = AUTHORITY_DOMAIN in address
+    from_authority = any(domain in address for domain in AUTHORITY_DOMAINS)
 
     # The subject grammar is specific enough to stand on its own — `{digits} - Inbound
     # Notification - {POs} - {project} : {name}` is not a shape other mail takes. That matters
@@ -506,8 +514,8 @@ def records_from_notice(
 ) -> List[ExtractedRecord]:
     """One `ExtractedRecord` per line of the notice.
 
-    `only_po` filters to a single PO. Multi-PO notices are the norm here (239260 covers 206725
-    and 207665), and the orchestrator processes one `DeliveryEvent` per PO — without the filter
+    `only_po` filters to a single PO. Multi-PO notices are the norm here (939260 covers 906725
+    and 907665), and the orchestrator processes one `DeliveryEvent` per PO — without the filter
     every line would be staged once per PO on the notice, which is finding C1's duplicate
     receipts.
     """

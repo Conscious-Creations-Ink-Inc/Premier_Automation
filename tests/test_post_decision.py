@@ -13,7 +13,7 @@ import pytest
 from pipeline import post_decision, post_ledger, po_verify, state_db
 
 COMPLETE = {
-    "id": 1, "po_number": "212614", "vendor_name": "Archipelago Lighting", "po_line_number": 1,
+    "id": 1, "po_number": "912614", "vendor_name": "Archipelago Lighting", "po_line_number": 1,
     "item_description": "LT-03B Frosted Replacement", "quantity_received": 19.0,
     "unit_of_measure": "EA", "spec_code": "LT-03b", "pod_stated_date": "2026-01-20",
     "received_by": "J Smith",
@@ -31,10 +31,10 @@ def conn():
     c = state_db.get_connection(":memory:")
     c.execute("""INSERT INTO spitfire_po_index (po_number, doc_master_key, project_code,
                                                 refreshed_at)
-                 VALUES ('212614', '4b186a21', 'MRC024PB100003', 'now')""")
+                 VALUES ('912614', '4b186a21', 'PRJ001PB100003', 'now')""")
     c.execute("""INSERT INTO spitfire_po_lines (line_key, po_number, line_number, cost_code,
                                                 refreshed_at)
-                 VALUES ('k1', '212614', 1, 'MAT-FDP', 'now')""")
+                 VALUES ('k1', '912614', 1, 'MAT-FDP', 'now')""")
     c.commit()
     return c
 
@@ -47,14 +47,14 @@ def verification(*, email_qty=19.0, ordered=19.0, outstanding=None, uom="EA",
         qty_outstanding=ordered if outstanding is None else outstanding,
         record_quantity=email_qty, record_uom=uom, spec_resolved=spec_resolved,
         reviewer_chose=reviewer_chose)
-    return po_verify.RecordVerification(record_id=1, po_number="212614", po_found=po_found,
+    return po_verify.RecordVerification(record_id=1, po_number="912614", po_found=po_found,
                                         matched=check if po_found else None, error=error)
 
 
 def test_a_clean_record_may_post(conn):
     decision = post_decision.decide(conn, COMPLETE, verification(), pod_md5="A")
     assert decision.may_post
-    assert decision.project_code == "MRC024PB100003"
+    assert decision.project_code == "PRJ001PB100003"
     assert decision.cost_code == "MAT-FDP", "the receipt must post against the PO's own cost code"
 
 
@@ -123,7 +123,7 @@ def test_a_partial_delivery_posts(conn):
 
     It compared the email against `qty_ordered` and demanded equality, so 2 arriving against 19
     ordered was refused permanently with no way to accept it. Partial deliveries are ordinary —
-    PO 212559's own lines are 4/4/2/2 across separate shipments — so that rejected a large share
+    PO 912559's own lines are 4/4/2/2 across separate shipments — so that rejected a large share
     of real traffic. Receiving part of a line books what arrived and leaves the rest outstanding.
     """
     decision = post_decision.decide(conn, dict(COMPLETE, quantity_received=2.0),
@@ -202,13 +202,21 @@ def test_a_line_with_nothing_outstanding_is_refused(conn):
     assert "nothing outstanding" in decision.reason
 
 
-def test_a_po_outside_the_known_projects_is_refused_by_name(conn):
-    """Not a retry and not a spinner: the project list cannot be discovered — `POST /api/projects`
-    returns an empty list for this account — so a PO in a fourth project is terminal until Premier
-    grants the permission."""
+def test_a_po_spitfire_does_not_have_is_refused_by_name(conn):
+    """Not a retry and not a spinner: no `forProject` means no receipt can be created at all.
+
+    The refusal names *their* data, not our configuration. It used to read "not found in the
+    projects this connector can search (…)" followed by the configured project ids, which
+    described our own configuration to somebody who can do nothing about it — and, worse, said
+    it just as
+    confidently when the lookup had failed rather than answered. `po_verify` now turns a lookup
+    that could not complete into an error, so reaching this line means Spitfire answered.
+    """
     decision = post_decision.decide(conn, COMPLETE, verification(po_found=False), pod_md5="A")
     assert not decision.may_post
-    assert "not found in the projects" in decision.reason
+    assert "Spitfire has no purchase order" in decision.reason
+    assert "912614" in decision.reason, "a refusal that does not name the order is unactionable"
+    assert "connector can search" not in decision.reason
 
 
 def test_an_unknown_project_stops_the_post(conn):
@@ -222,7 +230,7 @@ def test_an_unknown_project_stops_the_post(conn):
 
 
 def test_an_already_posted_delivery_is_refused_with_its_receipt_number(conn):
-    attempt = post_ledger.claim(conn, record_id=1, po_number="212614", line_number=1,
+    attempt = post_ledger.claim(conn, record_id=1, po_number="912614", line_number=1,
                                 pod_md5="A")
     post_ledger.record_receipt(conn, attempt.idempotency_key, receipt_key="abc",
                               receipt_doc_no="0007")
@@ -263,10 +271,10 @@ def test_automation_cannot_post_a_record_with_no_pod(conn):
 
 def test_a_named_person_may_waive_the_pod_and_then_it_posts(conn):
     """The body-only path, and the only way past the gate above."""
-    row = dict(COMPLETE, pod_waived_by="M Gutierrez", pod_source="email_body")
+    row = dict(COMPLETE, pod_waived_by="M Rivera", pod_source="email_body")
     decision = post_decision.decide(conn, row, verification(), pod_md5="")
     assert decision.may_post, decision.reason
-    assert decision.pod_waived_by == "M Gutierrez"
+    assert decision.pod_waived_by == "M Rivera"
 
 
 def test_a_blank_waiver_is_not_a_waiver(conn):
@@ -280,10 +288,10 @@ def test_a_blank_waiver_is_not_a_waiver(conn):
 def test_a_waiver_does_not_excuse_anything_else(conn):
     """It is a waiver of the *proof document*, not of the delivery date, and not of the quantity
     checks. Conflating them would make it a way to post anything at all."""
-    undated = dict(COMPLETE, pod_waived_by="M Gutierrez", pod_stated_date=None)
+    undated = dict(COMPLETE, pod_waived_by="M Rivera", pod_stated_date=None)
     assert "POD date" in post_decision.decide(conn, undated, verification(), pod_md5="").reason
 
-    over = dict(COMPLETE, pod_waived_by="M Gutierrez")
+    over = dict(COMPLETE, pod_waived_by="M Rivera")
     decision = post_decision.decide(conn, over, verification(email_qty=99.0, ordered=12.0),
                                     pod_md5="")
     assert not decision.may_post and "over-receive" in decision.reason
@@ -293,7 +301,7 @@ def test_a_record_with_a_pod_never_reports_a_waiver(conn):
     """`pod_waived_by` can be left set on a record that later acquires a POD — from a reprocess, or
     from a reviewer choosing an attachment afterwards. The decision must then say the receipt
     carries proof, because it does."""
-    row = dict(COMPLETE, pod_waived_by="M Gutierrez")
+    row = dict(COMPLETE, pod_waived_by="M Rivera")
     decision = post_decision.decide(conn, row, verification(), pod_md5="ABC123")
     assert decision.may_post and decision.pod_waived_by == ""
 
@@ -352,8 +360,112 @@ def test_body_evidence_is_not_claimed_when_a_pod_exists(conn):
 def test_a_waiver_is_recorded_as_a_waiver_not_as_body_evidence(conn):
     """A person's decision and a parsed signal are different facts and must not be conflated —
     a reviewer waived this one, and the ledger has to say so even though the body would qualify."""
-    row = dict(COMPLETE, pod_waived_by="M Gutierrez")
+    row = dict(COMPLETE, pod_waived_by="M Rivera")
     decision = post_decision.decide(conn, row, verification(), pod_md5="")
 
-    assert decision.pod_waived_by == "M Gutierrez"
+    assert decision.pod_waived_by == "M Rivera"
     assert decision.body_evidence == ""
+
+
+# --- Gate 2's fourth route: a delivery document from outside Premier ------------------------------
+#
+# Added 2026-09-11. The signer and carrier tests above are a 2026-08-22 proxy for one question —
+# did somebody outside Premier say these goods arrived — and they answer it badly: 89 of 4,717
+# records in the live store name a signer, so the proxy refuses most real delivery notes for not
+# printing a name. `read_views._awaits_confirmation` has asked that question directly since
+# 2026-09-07, so `document_evidence` asks the three things that actually have to be true instead.
+#
+# Every test below is a refusal except the first. That is the shape of the thing: the route exists
+# to admit delivery documents, and each exclusion is a measured case it must keep refusing.
+
+DELIVERY_NOTE = dict(
+    {k: v for k, v in COMPLETE.items() if k != "received_by"},
+    origin_sender="dispatch@example-logistics.test",
+    extraction_source="pdf:text",
+    pod_source=None,
+)
+"""A signed-for-by-nobody delivery note: PDF, from a carrier, stating its own delivery date.
+
+Deliberately built from `NO_DELIVERY_EVIDENCE`'s fields — no signer, no carrier reference — so
+these tests prove the *new* route admits it and not one of the old two.
+"""
+
+
+def test_a_delivery_note_from_outside_premier_may_post_on_its_stated_date(conn):
+    assert post_decision.body_evidence(DELIVERY_NOTE) == "document+date"
+    decision = post_decision.decide(conn, DELIVERY_NOTE, verification(), pod_md5="")
+    assert decision.may_post
+    assert decision.body_evidence == "document+date", "the ledger has to say which route opened it"
+
+
+def test_a_date_premier_supplied_itself_is_not_evidence(conn):
+    """`ingest_orchestrator._fallback_pod_date` stamps `email_received_date` when the document gave
+    no date, and says in its own docstring that such a date "cannot smuggle anything into Spitfire
+    on its own". This is that sentence enforced.
+
+    Measured 2026-09-10: 58 of the 185 records then on the Records page carried one, including 16
+    of the 32 lines of the delivery that prompted this work.
+    """
+    row = dict(DELIVERY_NOTE, pod_source="email_received_date")
+    assert post_decision.body_evidence(row) == ""
+    assert not post_decision.decide(conn, row, verification(), pod_md5="").may_post
+
+
+def test_a_spreadsheet_worklist_is_never_a_delivery_document(conn):
+    """The case that decided the shape of this rule.
+
+    32 records on the Records page were read out of a message subject *"[External] FW: Cameo Public
+    Space- Delivery Confirmation Required"* — a worklist **asking** whether goods arrived. It is
+    forwarded, so it is externally authored and the confirmation gate lets it through; it states a
+    date, so a date-only rule would post every line of it. Only the source tells the truth about it.
+    """
+    row = dict(DELIVERY_NOTE, extraction_source="excel:Hoja1")
+    assert post_decision.body_evidence(row) == ""
+    assert not post_decision.decide(conn, row, verification(), pod_md5="").may_post
+
+
+def test_a_message_premier_wrote_itself_is_not_a_delivery_document(conn):
+    row = dict(DELIVERY_NOTE, origin_sender="expediting@example-pm.test")
+    assert post_decision.body_evidence(row) == ""
+
+
+def test_an_unresolvable_origin_fails_closed(conn):
+    """`authorship.authored_internally` calls an unknown sender external on purpose, so that a
+    message nobody can place is not silently withheld from a *queue*. That default is right there
+    and wrong here: this answer permits a write to an ERP, so unknown refuses.
+    """
+    for unknown in (None, "", "   "):
+        assert post_decision.body_evidence(dict(DELIVERY_NOTE, origin_sender=unknown)) == "", unknown
+
+
+def test_a_quantity_conflict_is_never_a_delivery_document(conn):
+    row = dict(DELIVERY_NOTE, extraction_source="pdf:text+quantity_conflict")
+    assert post_decision.body_evidence(row) == ""
+
+
+def test_the_older_routes_still_win_where_they_apply(conn):
+    """Order matters for the ledger, not for the verdict: a record that has a signer is recorded as
+    having one, rather than as a document, so `_why_postable` can name the right sentence."""
+    assert post_decision.body_evidence(dict(DELIVERY_NOTE, received_by="J Smith")) == "signer+date"
+    assert post_decision.body_evidence(
+        dict(DELIVERY_NOTE, carrier_name="XPO", tracking_number="1Z9")) == "carrier+tracking+date"
+
+
+def test_the_gate_finds_the_sender_a_projection_left_out(conn):
+    """The drift this route could most easily have introduced.
+
+    The Records page reads rows from `read_views._records_pending`, which projects `origin_sender`.
+    The grouped post reads them from `deliveries_store.lines_for` — `SELECT *` over
+    `extracted_records`, which has no such column. Had this been read off the row alone, the button
+    would have offered lines the gate then refused, for no reason a person could see.
+    """
+    conn.execute("INSERT INTO email_log (email_id, origin_sender, category, folder, processed_at) "
+                 "VALUES ('m-1', ?, 'delivery', 'Processed', 'now')",
+                 ("dispatch@example-logistics.test",))
+    conn.commit()
+    no_column = {k: v for k, v in DELIVERY_NOTE.items() if k != "origin_sender"}
+    no_column["source_email_id"] = "m-1"
+
+    assert post_decision.body_evidence(no_column) == "", "read off the row alone it cannot know"
+    assert post_decision.decide(conn, no_column, verification(), pod_md5="").may_post, \
+        "but the gate resolves it and admits the same record"

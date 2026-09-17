@@ -23,6 +23,10 @@ _COLUMNS = (
     "notification_type",
     "category", "matched_rule", "reason", "po_hints", "shipment_hint", "notification_number",
     "attachment_count", "ocr_attempted", "folder", "error_type", "processed_at",
+    # Where the message was read *from*, as against `folder`, which is where it was put afterwards.
+    "source_folder",
+    # Positively not a delivery notification, as against merely unrecognised.
+    "not_a_delivery",
 )
 
 
@@ -47,6 +51,11 @@ class EmailLogRow:
     folder: str
     error_type: Optional[str]
     processed_at: str
+    source_folder: str = ""
+    """The mailbox folder this message was read from, as against `folder`, which is where the
+    pipeline filed it afterwards. Defaulted so rows written before the column still load."""
+    not_a_delivery: int = 0
+    """1 when triage positively identified this as not a delivery notification."""
 
 
 def record(
@@ -70,6 +79,8 @@ def record(
     folder: str,
     error_type: Optional[str] = None,
     processed_at: str,
+    source_folder: str = "",
+    not_a_delivery: bool = False,
 ) -> None:
     """Write (or overwrite) this email's verdict."""
     values = (
@@ -77,6 +88,7 @@ def record(
         notification_type,
         category, matched_rule or "", reason or "", po_hints or "", shipment_hint,
         notification_number, attachment_count, ocr_attempted, folder, error_type, processed_at,
+        source_folder or "", 1 if not_a_delivery else 0,
     )
     placeholders = ", ".join(["?"] * len(_COLUMNS))
     conn.execute(
@@ -123,6 +135,18 @@ def subjects_by_email_id(conn: sqlite3.Connection) -> Dict[str, str]:
     return {r["email_id"]: r["subject"] for r in _query(
         conn, "SELECT email_id, subject FROM email_log"
     )}
+
+
+def envelope_by_email_id(conn: sqlite3.Connection) -> Dict[str, Dict[str, str]]:
+    """Sender and folder per message, for queue rows that are not themselves email rows.
+
+    `subjects_by_email_id` above already covers the subject. These two are the rest of what the
+    manual queue shows about a message, and an attachment row carries neither: 57 of the messages
+    on that queue are there *only* because of a bad attachment, so without this lookup they render
+    with no sender and no folder — the two columns that say whose problem it is and where it went.
+    """
+    return {r["email_id"]: {"sender": r["sender"] or "", "folder": r["folder"] or ""}
+            for r in _query(conn, "SELECT email_id, sender, folder FROM email_log")}
 
 
 def count(conn: sqlite3.Connection) -> int:

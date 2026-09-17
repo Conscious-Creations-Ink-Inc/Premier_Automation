@@ -62,6 +62,20 @@ def resolve(conn: sqlite3.Connection, email_id: str, ordinal: int,
             source="cache",
         )
 
+    # The cache's bytes, by hash rather than by blob. Before the ledger on purpose: a message
+    # recovered live from Graph has a cache row and may have no ledger row at all, and the ledger
+    # fallback below matches on *ordinal*, which drifts if a connector skipped a failed attachment.
+    if cached is not None and cached["content_sha256"]:
+        content = attachment_store.get(str(cached["content_sha256"]))
+        if content:
+            return ResolvedAttachment(
+                content=content,
+                filename=cached["filename"] or filename or "attachment",
+                content_type=cached["content_type"] or "",
+                kind=cached["kind"] or "",
+                source="cache_store",
+            )
+
     row = _ledger_row(conn, email_id, ordinal, filename or (cached["filename"] if cached else ""))
     if row is None:
         return None
@@ -95,7 +109,8 @@ def _ledger_row(conn: sqlite3.Connection, email_id: str, ordinal: int,
     conn.row_factory = sqlite3.Row
     try:
         return conn.execute(
-            "SELECT filename, sha256, blob_sha256, declared_content_type, sniffed_kind "
+            "SELECT filename, sha256, blob_sha256, declared_content_type, sniffed_kind, "
+            "       disposition, COALESCE(is_inline, 0) AS is_inline "
             "  FROM attachment_ledger "
             " WHERE email_id = ? AND (ordinal = ? OR (? <> '' AND filename = ?)) "
             " ORDER BY CASE WHEN ordinal = ? THEN 0 ELSE 1 END, depth, id LIMIT 1",
@@ -103,3 +118,20 @@ def _ledger_row(conn: sqlite3.Connection, email_id: str, ordinal: int,
         ).fetchone()
     finally:
         conn.row_factory = prior
+
+
+def missing_reason(conn: sqlite3.Connection, email_id: str, ordinal: int,
+                   filename: str = "") -> Optional[tuple]:
+    """`(disposition, is_inline)` for an attachment that resolved to nothing, or None.
+
+    For a caller deciding *how* to say there are no bytes. It never invents any, and it is a
+    separate function from `resolve` on purpose: resolving is the thing the POD upload does, and
+    nothing on that path should be able to reach a branch about presentation.
+
+    Reuses `_ledger_row` rather than adding a fourth copy of the ordinal-or-filename rule --
+    `routes._attachment_verdict` and `record_create` are already copies two and three.
+    """
+    row = _ledger_row(conn, email_id, ordinal, filename)
+    if row is None:
+        return None
+    return (row["disposition"] or "", bool(row["is_inline"]))

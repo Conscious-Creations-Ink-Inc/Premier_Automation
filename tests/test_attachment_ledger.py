@@ -53,7 +53,7 @@ def make_xlsx() -> bytes:
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.append(["Vendor", "PO#", "Spec#", "QTY", "Item Description", "Confirmed Received: Yes or No"])
-    sheet.append(["Daniel Stuart", "207030", "LOB-203-PI", 12, "Throw Pillow", "yes"])
+    sheet.append(["Daniel Stuart", "907030", "LOB-203-PI", 12, "Throw Pillow", "yes"])
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
@@ -65,8 +65,8 @@ def test_every_attachment_is_ledgered_even_on_a_routed_email(conn):
     photo = b"\xff\xd8\xff\xe0" + b"\x00" * (700 * 1024)
     email = RawEmail(
         email_id="msg-routed", received_at="2026-08-03T00:00:00Z",
-        sender_address="johngallo@premierpm.com", sender_domain="premierpm.com",
-        subject="Fw: Cameo Harbour Delivery",
+        sender_address="johngallo@example-pm.test", sender_domain="example-pm.test",
+        subject="Fw: Example Hotel Harbour Delivery",
         body_html=None, body_text="Attached are the BOL and Packing slips.",
         attachments=[attach("IMG_2479.jpeg", photo)],
     )
@@ -87,12 +87,12 @@ def test_a_mixed_email_accounts_for_every_attachment(conn):
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("notes.txt", "PO 208491 received, spec STE-402-LT-B, 11 EA")
+        archive.writestr("notes.txt", "PO 908491 received, spec STE-402-LT-B, 11 EA")
     bundle = buffer.getvalue()
 
-    email = fx.inbound_email(email_id="msg-mixed", po_numbers=("208491",))
+    email = fx.inbound_email(email_id="msg-mixed", po_numbers=("908491",))
     email.attachments = [
-        attach("Cameo Receivers.xlsx", tracker),
+        attach("Property Receivers.xlsx", tracker),
         attach("image001.png", logo, drop_hint="decorative:tiny"),
         attach("copy of tracker.xlsx", tracker, drop_hint="duplicate:abc123"),
         attach("bundle.zip", bundle),
@@ -103,8 +103,8 @@ def test_a_mixed_email_accounts_for_every_attachment(conn):
     rows = attachment_ledger.for_email(conn, "msg-mixed")
     by_name = {r.filename: r for r in rows}
 
-    assert by_name["Cameo Receivers.xlsx"].disposition == attachment_ledger.EXTRACTED
-    assert by_name["Cameo Receivers.xlsx"].records_extracted >= 1
+    assert by_name["Property Receivers.xlsx"].disposition == attachment_ledger.EXTRACTED
+    assert by_name["Property Receivers.xlsx"].records_extracted >= 1
     assert by_name["image001.png"].disposition == attachment_ledger.DROPPED_DECORATIVE
     assert by_name["copy of tracker.xlsx"].disposition == attachment_ledger.DROPPED_DUPLICATE
     assert by_name["bundle.zip"].disposition == attachment_ledger.CONTAINER_EXPANDED
@@ -123,7 +123,7 @@ def test_an_oversize_attachment_is_quarantined_not_dropped(conn, monkeypatch):
     monkeypatch.setattr("config.settings.MAX_ATTACHMENT_BYTES", 1024)
     big = b"\xff\xd8\xff\xe0" + b"\x00" * 5000
 
-    email = fx.inbound_email(email_id="msg-big", po_numbers=("208491",))
+    email = fx.inbound_email(email_id="msg-big", po_numbers=("908491",))
     email.attachments = [attach("huge.jpg", big)]
 
     mailbox = FakeMailbox([email])
@@ -137,7 +137,7 @@ def test_an_oversize_attachment_is_quarantined_not_dropped(conn, monkeypatch):
 
 def test_unreadable_attachments_surface_for_review(conn):
     """A corrupt workbook must reach a person, with a stated reason."""
-    email = fx.inbound_email(email_id="msg-corrupt", po_numbers=("208491",))
+    email = fx.inbound_email(email_id="msg-corrupt", po_numbers=("908491",))
     email.attachments = [attach("broken.xlsx", b"PK\x03\x04" + b"xl/" + b"\x00" * 200)]
 
     ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=conn)
@@ -165,8 +165,8 @@ def test_a_tracker_line_reaches_staging_alongside_the_notification(conn):
     staged in its own right."""
     from pipeline import extracted_records_store
 
-    email = fx.inbound_email(email_id="msg-count", po_numbers=("208491",))
-    email.attachments = [attach("Cameo Receivers.xlsx", make_xlsx_for_po("208491"))]
+    email = fx.inbound_email(email_id="msg-count", po_numbers=("908491",))
+    email.attachments = [attach("Property Receivers.xlsx", make_xlsx_for_po("908491"))]
 
     ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=conn)
 
@@ -181,16 +181,16 @@ def test_the_same_line_from_two_sources_collapses_to_one(conn):
     record is staged, not two — the attachment is still recorded as read."""
     from pipeline import extracted_records_store
 
-    email = fx.inbound_email(email_id="msg-dupline", po_numbers=("208491",))
+    email = fx.inbound_email(email_id="msg-dupline", po_numbers=("908491",))
     # The fixture's own line is STE-402-LT-B, 11 EA; the tracker restates it with the same qty.
     email.attachments = [
-        attach("Cameo Receivers.xlsx", make_xlsx_for_po("208491", "STE-402-LT-B", quantity=11))
+        attach("Property Receivers.xlsx", make_xlsx_for_po("908491", "STE-402-LT-B", quantity=11))
     ]
 
     ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=conn)
 
     row = next(r for r in attachment_ledger.for_email(conn, "msg-dupline")
-               if r.filename == "Cameo Receivers.xlsx")
+               if r.filename == "Property Receivers.xlsx")
     assert row.disposition == attachment_ledger.EXTRACTED, "the read is recorded even when the record loses"
 
     staged = extracted_records_store.get_pending(conn)
@@ -206,9 +206,9 @@ def test_disagreeing_quantities_are_flagged_never_silently_resolved(conn):
     picking one would be a guess dressed up as a receipt."""
     from pipeline import extracted_records_store
 
-    email = fx.inbound_email(email_id="msg-conflict", po_numbers=("208491",))
+    email = fx.inbound_email(email_id="msg-conflict", po_numbers=("908491",))
     email.attachments = [
-        attach("Cameo Receivers.xlsx", make_xlsx_for_po("208491", "STE-402-LT-B", quantity=12))
+        attach("Property Receivers.xlsx", make_xlsx_for_po("908491", "STE-402-LT-B", quantity=12))
     ]
 
     ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=conn)
@@ -230,25 +230,25 @@ def test_the_ledger_counts_reads_not_receipts(conn):
     """
     from pipeline import extracted_records_store
 
-    email = fx.inbound_email(email_id="msg-otherpo", po_numbers=("208491",))
-    email.attachments = [attach("Cameo Receivers.xlsx", make_xlsx_for_po("207030"))]
+    email = fx.inbound_email(email_id="msg-otherpo", po_numbers=("908491",))
+    email.attachments = [attach("Property Receivers.xlsx", make_xlsx_for_po("907030"))]
 
     ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=conn)
 
     row = next(r for r in attachment_ledger.for_email(conn, "msg-otherpo")
-               if r.filename == "Cameo Receivers.xlsx")
+               if r.filename == "Property Receivers.xlsx")
     assert row.disposition == attachment_ledger.EXTRACTED
     assert row.records_extracted == 1, "the read happened and is recorded"
 
     staged = extracted_records_store.get_pending(conn)
-    assert not any(r.record.po_number == "207030" for r in staged), \
+    assert not any(r.record.po_number == "907030" for r in staged), \
         "a line for another PO must never be staged against this delivery"
 
 
 def test_forget_message_allows_a_fixed_reader_to_retry(conn):
     """Without this the ledger is a graveyard: `is_new_message` marks mail seen permanently, so
     an attachment we could not read today would never be retried after the reader is written."""
-    email = fx.inbound_email(email_id="msg-retry", po_numbers=("208491",))
+    email = fx.inbound_email(email_id="msg-retry", po_numbers=("908491",))
     ingest_orchestrator.process_new_mail(FakeMailbox([email]), conn=conn)
     assert state_db.is_new_message(conn, "msg-retry", "2026-08-03") is False
 

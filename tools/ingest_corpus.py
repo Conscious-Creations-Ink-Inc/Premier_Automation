@@ -42,8 +42,11 @@ from connectors.mailbox import Mailbox
 from connectors.msg_file import MsgFileMailbox
 from pipeline import attachment_ledger, email_log, ingest_orchestrator, read_views, state_db
 from pipeline.parsing import sniff
+from pipeline.stage3_extract import ocr_adapter
 from pipeline.stage3_extract.ocr_adapter import (
     DocumentIntelligenceClient,
+    OcrBudgetExhausted,
+    OcrQuotaExhausted,
     OcrResult,
     build_client,
 )
@@ -71,16 +74,49 @@ class BudgetedOcrClient(DocumentIntelligenceClient):
         self.max_pages = max_pages
         self.calls = 0
         self.refused = 0
+        self.quota_exhausted = False
+        """Latched once Azure says the account is out of call volume.
+
+        A second meter beside `max_pages`, and a different kind of limit: the budget is ours and
+        is about spending, this is the provider's and is about a subscription that has nothing
+        left to spend. Neither can be recovered from inside the run.
+
+        It latches because the failure is account-wide. Without it every remaining attachment was
+        tried anyway — one HTTP round trip each, all refused identically — which is how 580 ledger
+        rows came to read `HTTP 403: Out of call volume quota` for what was one fact about the
+        subscription. Latched, the first one pays for the discovery and the rest are refused
+        locally, in microseconds, with the same reason recorded.
+        """
 
     def analyze(self, content_bytes: bytes) -> OcrResult:
+        if self.quota_exhausted:
+            self.refused += 1
+            raise OcrQuotaExhausted(
+                "OCR quota exhausted — the account has no call volume left this period, so this "
+                "page was not sent. Raise the tier, then recover the backlog with tools.reextract"
+            )
         if self.calls >= self.max_pages:
             self.refused += 1
-            raise RuntimeError(
+            raise OcrBudgetExhausted(
                 f"OCR page budget of {self.max_pages} exhausted — re-run with a higher "
                 f"--max-ocr-pages if this document is worth the spend"
             )
         self.calls += 1
-        return self.inner.analyze(content_bytes)
+        try:
+            result = self.inner.analyze(content_bytes)
+            # Charged after the fact, because how many pages a document has is not knowable until
+            # the service has read it. `calls` is pre-incremented so a document that raises still
+            # costs one — the request went out and was billed either way — and the correction below
+            # only ever adds the extra pages of a multi-page scan.
+            self.calls += max(0, getattr(result, "pages", 1) - 1)
+            return result
+        except Exception as exc:                                   # noqa: BLE001
+            # Latch and re-raise unchanged: `dispatch` still records this attempt against its own
+            # ledger row with Azure's own wording, which is the row that carries the evidence.
+            # Only what happens to the *next* page changes.
+            if ocr_adapter.is_quota_exhausted(exc):
+                self.quota_exhausted = True
+            raise
 
 
 @dataclass
@@ -92,6 +128,11 @@ class RunSummary:
     ocr_client: str = ""
     ocr_calls: int = 0
     ocr_refused: int = 0
+    ocr_quota_exhausted: bool = False
+    """Azure reported the account out of call volume during this run.
+
+    Carried up so the run records it once, as a run-level fact, instead of leaving it to be
+    inferred from a wall of identical `service_unavailable` ledger rows."""
     email_log_rows: int = 0
     orphans: int = 0
     folders: Dict[str, int] = field(default_factory=dict)

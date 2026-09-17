@@ -1,0 +1,134 @@
+# CODEOWNERS — automatic review ownership
+# ashford/ppm-receiver-automation · Risk tier: Critical · Company scope: Premier (PPM)
+#
+# Ashford GitHub Standards v1.5 §6 (required file) and §7.2 (review expectations).
+#
+# ---------------------------------------------------------------------------
+# HOW THIS FILE WORKS, AND THE ONE RULE THAT MUST NOT BE BROKEN
+# ---------------------------------------------------------------------------
+# Under §3.1, External Partner Developers may contribute and discuss but CANNOT
+# satisfy a required pull-request approval. Conscious Creations is an external
+# partner. Therefore:
+#
+#   The partner team must NEVER be the sole owner of any path.
+#
+# Every rule below routes to a Premier-side team. Adding the partner team as an
+# additional owner is optional and does not change who can approve; leaving a path
+# owned only by the partner team would silently create an unapprovable path.
+#
+# Critical tier requires TWO approvals, at least one from a technically qualified
+# Company Developer in @ashford/ppm-developers. The author cannot be one of them.
+#
+# ---------------------------------------------------------------------------
+# A RULE NAMING A PATH THAT DOES NOT EXIST PROTECTS NOTHING
+# ---------------------------------------------------------------------------
+# Until 10 September 2026 every financial-logic and security rule in this file
+# pointed at /src/receiver_automation/**, which has never existed in this
+# repository. GitHub does not warn about this: the rules simply never matched, so
+# the code they were written to protect was covered only by the catch-all `*` and
+# received no Platform Admin review at all.
+#
+# The paths below were verified to exist on 10 September 2026. If a module is
+# moved or renamed, this file moves with it in the SAME commit.
+#
+# Two rules deliberately name paths that do not exist yet — /.github/workflows/
+# and /docs/decisions/. That is correct and protective: a CODEOWNERS rule matches
+# the files in a pull request, so these bind the moment either directory is
+# created, which is exactly when review is most needed.
+#
+# ---------------------------------------------------------------------------
+# TEAM SLUGS REQUIRE PLATFORM ADMIN CONFIRMATION BEFORE MERGE
+# ---------------------------------------------------------------------------
+# The slugs below follow the naming in Standards §3.1. Confirm each one exists and
+# is spelled correctly with Ayotunde Gibbs or Henry Noel — GitHub silently ignores
+# a CODEOWNERS rule that names a team which does not exist, which would leave the
+# path with no owner at all.
+#
+#   @ashford/ppm-developers            Premier Company Developers — can approve
+#   @ashford/ppm-production-approvers  Production deployment authority
+#   @ashford/platform-admins           GitHub Platform Administrators
+#
+# The partner team slug is NOT yet confirmed. §3.1 gives "partner-fpt" only as an
+# example of the pattern. Do not guess it — confirm the real slug, then uncomment
+# the partner co-ownership lines at the bottom if desired.
+# ---------------------------------------------------------------------------
+
+
+# --- Default: everything needs Premier review --------------------------------
+*                                   @ashford/ppm-developers
+
+
+# --- Financial logic -----------------------------------------------------------
+# Line matching, quantity arithmetic and receipt posting. A bug in any of these
+# becomes a financial misstatement, so these paths get Platform Admin review in
+# addition to the two required approvals.
+#
+# Spec ID decides the line and the DocItemKey carries it, so the matching stages
+# and the posting path are one control surface and are owned together.
+/pipeline/stage4_match.py           @ashford/ppm-developers @ashford/platform-admins
+/pipeline/match_orchestrator.py     @ashford/ppm-developers @ashford/platform-admins
+/pipeline/stage5_verify.py          @ashford/ppm-developers @ashford/platform-admins
+/pipeline/po_verify.py              @ashford/ppm-developers @ashford/platform-admins
+/pipeline/completeness.py           @ashford/ppm-developers @ashford/platform-admins
+/pipeline/record_completion.py      @ashford/ppm-developers @ashford/platform-admins
+/pipeline/receipt_log.py            @ashford/ppm-developers @ashford/platform-admins
+/pipeline/post_decision.py          @ashford/ppm-developers @ashford/platform-admins
+/pipeline/post_ledger.py            @ashford/ppm-developers @ashford/platform-admins
+/pipeline/spitfire_post.py          @ashford/ppm-developers @ashford/platform-admins
+
+
+# --- The Spitfire write path ----------------------------------------------------
+# This is the only code in the repository that can change a system of record.
+# Its separation from the read module, its deny-list-before-allowlist ordering and
+# its refusal of every DELETE route are the controls that make this repo
+# defensible — none of them may be weakened without Platform Admin review.
+/connectors/spitfire_write.py       @ashford/ppm-developers @ashford/platform-admins
+/connectors/spitfire.py             @ashford/ppm-developers @ashford/platform-admins
+
+
+# --- Security controls and external integrations -------------------------------
+# §8 requires Platform Admin review for authentication, authorisation,
+# sensitive-data handling, dependencies and external integrations.
+/connectors/                        @ashford/ppm-developers @ashford/platform-admins
+/config/settings.py                 @ashford/ppm-developers @ashford/platform-admins
+/operations/killswitch.py           @ashford/ppm-developers @ashford/platform-admins
+/pipeline/attachment_view.py        @ashford/ppm-developers @ashford/platform-admins
+/api/ui/html.py                     @ashford/ppm-developers @ashford/platform-admins
+/.env.example                       @ashford/ppm-developers @ashford/platform-admins
+
+
+# --- CI, workflows and repository governance -----------------------------------
+# §8: changes to .github/workflows, deployment configuration, authentication,
+# authorisation or infrastructure require Platform Admin review.
+/.github/                           @ashford/platform-admins
+/.github/workflows/                 @ashford/platform-admins
+/.github/CODEOWNERS                 @ashford/platform-admins
+/SECURITY.md                        @ashford/platform-admins
+/CLAUDE.md                          @ashford/ppm-developers @ashford/platform-admins
+/.githooks/                         @ashford/ppm-developers @ashford/platform-admins
+/docs/decisions/                    @ashford/ppm-developers
+
+
+# --- Dependencies ---------------------------------------------------------------
+# §7.3: every new dependency needs its purpose, licence and security scan result
+# documented. §8 routes dependency changes to Platform Admin review.
+/requirements.txt                   @ashford/ppm-developers @ashford/platform-admins
+/requirements-dev.txt               @ashford/ppm-developers @ashford/platform-admins
+/pyproject.toml                     @ashford/ppm-developers @ashford/platform-admins
+
+
+# --- Operating documentation ----------------------------------------------------
+# §10 requires documented deployment, rollback, support ownership and recovery.
+# The production support owner should review changes to these.
+/docs/rollback.md                   @ashford/ppm-developers @ashford/ppm-production-approvers
+/docs/deployment.md                 @ashford/ppm-developers @ashford/ppm-production-approvers
+/docs/support-runbook.md            @ashford/ppm-developers @ashford/ppm-production-approvers
+
+
+# --- Optional partner co-ownership ----------------------------------------------
+# Adds the partner team as a notified reviewer. It does NOT let them satisfy the
+# required approval. Uncomment only after the real slug is confirmed, and only
+# alongside a Premier-side team — never alone.
+#
+# /pipeline/                         @ashford/ppm-developers @ashford/<partner-team-slug>
+# /tests/                            @ashford/ppm-developers @ashford/<partner-team-slug>

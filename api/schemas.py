@@ -71,7 +71,7 @@ class ExtractedRecordSchema(BaseModel):
     # These five exist on `ExtractedRecord` and in the `extracted_records` table but were never
     # added here, so the API and the review UI could not see them. `po_line_number` is the worst
     # of the five to lose: it is the Spitfire line number stated outright by the Authority Inbound
-    # (`208491 : 300`), and it is what turns a match from a fuzzy description search into an exact
+    # (`908491 : 300`), and it is what turns a match from a fuzzy description search into an exact
     # lookup — precisely the field a human completing a match by hand most needs shown.
     po_line_number: Optional[int] = None
     received_by: Optional[str] = None

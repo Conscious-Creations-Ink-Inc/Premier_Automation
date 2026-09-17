@@ -8,7 +8,7 @@ live store, while the corpus tool writes `state/sample_state.sqlite3`. Test data
 real mail are separated by file rather than by a column, so nothing that queries one can see the
 other.
 
-    python -m tools.ingest_mailbox --preflight        # auth + folders + Inbox count, reads no mail
+    python -m tools.ingest_mailbox --preflight        # auth + folders + per-folder counts, reads no mail
     python -m tools.ingest_mailbox --dry-run-ocr      # what a real run would bill
     python -m tools.ingest_mailbox                    # read-only shadow, mock OCR  (the default)
     python -m tools.ingest_mailbox --ocr azure --yes  # real OCR, still moves nothing
@@ -65,6 +65,11 @@ class MailboxRunSummary:
     ocr_client: str = ""
     ocr_calls: int = 0
     ocr_refused: int = 0
+    ocr_quota_exhausted: bool = False
+    """Azure reported the account out of call volume during this run.
+
+    Carried up so the run records it once, as a run-level fact, instead of leaving it to be
+    inferred from a wall of identical `service_unavailable` ledger rows."""
     email_log_rows: int = 0
     orphans: int = 0
     folders: Dict[str, int] = field(default_factory=dict)
@@ -104,13 +109,18 @@ def preflight(mailbox: Optional[GraphMailbox] = None) -> int:
                            f"(created on the first --move-mail run)" if missing
                            else "all present"))
 
-    inbox_url = f"{GRAPH_BASE_URL}/users/{mailbox.mailbox_address}/mailFolders/Inbox/messages/$count"
-    count_resp = requests.get(inbox_url, headers={**headers, "ConsistencyLevel": "eventual"}, timeout=30)
-    if count_resp.ok:
-        print(f"inbox:     {count_resp.text.strip()} message(s)")
-    else:
-        print(f"inbox:     count unavailable (HTTP {count_resp.status_code}); "
-              f"the ingest run will still page through it")
+    # One line per source folder, so a run says how much Junk it is about to read rather than
+    # leaving that to be inferred from the record count afterwards.
+    for source in mailbox.folders:
+        count_url = (f"{GRAPH_BASE_URL}/users/{mailbox.mailbox_address}"
+                     f"/mailFolders/{source}/messages/$count")
+        count_resp = requests.get(count_url, headers={**headers, "ConsistencyLevel": "eventual"},
+                                  timeout=30)
+        if count_resp.ok:
+            print(f"{source + ':':11}{count_resp.text.strip()} message(s)")
+        else:
+            print(f"{source + ':':11}count unavailable (HTTP {count_resp.status_code}); "
+                  f"the ingest run will still page through it")
 
     print("\nNothing was read and nothing was moved.")
     return 0
@@ -127,6 +137,18 @@ def run_once(
 ) -> MailboxRunSummary:
     started = time.monotonic()
     mailbox = GraphMailbox(read_only=read_only)
+    # Handed to the connector as well as to the orchestrator. The orchestrator only asks between
+    # emails, and the whole mailbox read happens before the first email — so without this a stop
+    # could not reach a run until every message and attachment had downloaded.
+    mailbox.should_stop = should_stop
+    if on_progress is not None:
+        read = {"calls": 0}
+
+        def _reading(note: str) -> None:
+            read["calls"] += 1
+            on_progress("reading", read["calls"], 0, note)
+
+        mailbox.on_activity = _reading
     summary = MailboxRunSummary(
         mailbox_address=mailbox.mailbox_address, read_only=read_only, ocr_client=ocr,
     )
@@ -146,6 +168,7 @@ def run_once(
         )
         summary.ocr_calls = client.calls
         summary.ocr_refused = client.refused
+        summary.ocr_quota_exhausted = client.quota_exhausted
         summary.email_log_rows = email_log.count(conn) - log_rows_before
         summary.orphans = len(attachment_ledger.orphans(conn))
 

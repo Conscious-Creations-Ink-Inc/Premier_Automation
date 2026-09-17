@@ -73,7 +73,7 @@ def test_what_was_filled_is_listed_back(client, a_record, monkeypatch):
 
 def test_a_refusal_is_shown_as_a_warning_and_lists_nothing_applied(client, a_record, monkeypatch):
     monkeypatch.setattr(ui_routes.record_completion, "complete", lambda conn, row, line=None: (
-        record_completion.Completion(ok=False, message="purchase order 210634 has no line 99")))
+        record_completion.Completion(ok=False, message="purchase order 910634 has no line 99")))
 
     body = client.post(f"/ui/records/{a_record}/complete?line=99").text
 

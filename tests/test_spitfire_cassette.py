@@ -46,16 +46,16 @@ def response(content: bytes = PO_BODY, status: int = 200) -> requests.Response:
 def test_query_argument_order_does_not_change_the_key(store):
     """`create_receipt` builds `?forProject=…&forBatch=…`; nothing guarantees a caller or a
     redirect preserves that order, and two keys for one call is a miss that looks like a bug."""
-    assert (store.key("POST", "/api/document/x", "forProject=P&forBatch=212559")
-            == store.key("POST", "/api/document/x", "forBatch=212559&forProject=P"))
+    assert (store.key("POST", "/api/document/x", "forProject=P&forBatch=912559")
+            == store.key("POST", "/api/document/x", "forBatch=912559&forProject=P"))
 
 
 def test_a_different_search_body_is_a_different_call(store):
     """`resolve_po` posts a QueryFilters body to one path per project. Keying on the path alone
     would make every PO in a project share one cassette — the first one recorded answering for
     all of them."""
-    assert (store.key("POST", "/api/project/X/docs", body=b'{"po":"206725"}')
-            != store.key("POST", "/api/project/X/docs", body=b'{"po":"208491"}'))
+    assert (store.key("POST", "/api/project/X/docs", body=b'{"po":"906725"}')
+            != store.key("POST", "/api/project/X/docs", body=b'{"po":"908491"}'))
 
 
 def test_a_blank_query_argument_is_not_dropped(store):
@@ -127,8 +127,8 @@ def test_replay_mounts_the_adapter(replaying):
 # --- replay through the real client ---------------------------------------------------------
 
 def test_a_read_replays_with_no_network(store, replaying):
-    store.record("GET", "/api/document/abc", response(b'{"DocNo":"206725"}'))
-    assert SpitfireReadClient()._get_json("/api/document/abc") == {"DocNo": "206725"}
+    store.record("GET", "/api/document/abc", response(b'{"DocNo":"906725"}'))
+    assert SpitfireReadClient()._get_json("/api/document/abc") == {"DocNo": "906725"}
 
 
 def test_a_miss_names_the_call_it_could_not_answer(store, replaying):
@@ -146,7 +146,7 @@ def test_the_site_prefix_is_not_part_of_the_key(store, replaying, monkeypatch):
     useless the day Premier moves us to production, which is the opposite of the point."""
     store.record("GET", "/api/document/abc", response())
     monkeypatch.setattr(settings, "SPITFIRE_BASE_URL",
-                        "https://live.remingtonhotels.com/Production")
+                        "https://live.example-hotels.test/Production")
     assert SpitfireReadClient()._get_json("/api/document/abc")
 
 
@@ -177,7 +177,7 @@ def test_a_read_back_on_the_write_client_still_replays(store, replaying):
     ("PATCH", "/api/document/abc/Title", True),
     ("POST", "/api/catalog/upload", True),
     ("GET", "/api/catalog/abc/versions", False),        # verify_upload
-    ("POST", "/api/project/MRC024PB100003/docs", False),  # a search, despite the verb
+    ("POST", "/api/project/PRJ001PB100003/docs", False),  # a search, despite the verb
     ("POST", "/api/document/00000000-0000-0000-0000-000000000000"
              "/0c9a537a-3c41-4d16-ab9f-130ef69ea6c8", True),   # create_receipt
 ])
@@ -193,13 +193,13 @@ def test_record_mode_returns_the_live_response_and_keeps_a_copy(store, monkeypat
     """Recording must not change what the caller gets — the sweep runs against the real ERP and a
     response altered on the way through would mirror altered PO lines."""
     monkeypatch.setattr(settings, "SPITFIRE_CASSETTE_MODE", "record")
-    live = response(b'{"DocNo":"212559"}')
+    live = response(b'{"DocNo":"912559"}')
     monkeypatch.setattr(requests.adapters.HTTPAdapter, "send",
                         lambda self, request, **kw: live)
 
     client = SpitfireReadClient()
-    assert client._get_json("/api/document/abc") == {"DocNo": "212559"}
-    assert store.lookup("GET", "/api/document/abc").body == b'{"DocNo":"212559"}'
+    assert client._get_json("/api/document/abc") == {"DocNo": "912559"}
+    assert store.lookup("GET", "/api/document/abc").body == b'{"DocNo":"912559"}'
 
 
 def test_recording_never_stores_a_write(store, monkeypatch):

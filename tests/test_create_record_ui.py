@@ -17,8 +17,8 @@ from config import settings
 from pipeline import email_log, mail_cache, state_db
 
 FORM = {
-    "email_id": "mail-ui", "created_by": "M Gutierrez",
-    "po_number": "208491", "spec_code": "STE-402-LT-B",
+    "email_id": "mail-ui", "created_by": "M Rivera",
+    "po_number": "908491", "spec_code": "STE-402-LT-B",
     "item_description": "BASE, Floor Lamp 2", "quantity_received": "11",
     "unit_of_measure": "", "pod_stated_date": "2025-10-01",
     "pod_ledger_id": "11", "note": "Property confirmed by phone.",
@@ -37,10 +37,10 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "PIPELINE_STATE_DB_PATH", path)
 
     conn = state_db.get_connection(path)
-    email_log.record(conn, email_id="mail-ui", subject="Delivered - 208491 - 11 EA",
-                     sender="routing@authoritylogistics.com", category="route",
+    email_log.record(conn, email_id="mail-ui", subject="Delivered - 908491 - 11 EA",
+                     sender="routing@example-logistics.test", category="route",
                      matched_rule="rule_7", reason="nothing extractable from the body",
-                     folder="Routed", processed_at="2026-08-21 09:00:00", po_hints="208491")
+                     folder="Routed", processed_at="2026-08-21 09:00:00", po_hints="908491")
     conn.execute(
         """INSERT INTO attachment_ledger
            (id, email_id, depth, ordinal, filename, sniffed_kind, disposition, is_inline,
@@ -52,9 +52,9 @@ def store(tmp_path, monkeypatch):
     # reports the message as unreadable — which is a real state, but not the one these tests are
     # about. This writes `mail_body` too, so `mail_view.resolve` finds it in the cache and stops.
     mail_cache.cache_mail(
-        conn, email_id="mail-ui", subject="Delivered - 208491 - 11 EA",
-        sender="routing@authoritylogistics.com", received_at="2026-08-21 09:00:00",
-        body_html="<p>PO 208491 &mdash; 11 EA delivered 01 Oct.</p>", body_text=None,
+        conn, email_id="mail-ui", subject="Delivered - 908491 - 11 EA",
+        sender="routing@example-logistics.test", received_at="2026-08-21 09:00:00",
+        body_html="<p>PO 908491 &mdash; 11 EA delivered 01 Oct.</p>", body_text=None,
         source="Outlook (read-only)", cached_at="2026-08-21 09:00:00",
         attachments=[{"ordinal": 0, "filename": "signed-bol.jpg", "content_type": "image/jpeg",
                       "kind": "image", "size_bytes": 12, "is_inline": 0,
@@ -93,7 +93,7 @@ def test_it_opens_pre_filled_rather_than_blank(client):
     """Making somebody retype what is already on file is slower and a fresh chance to get it
     wrong. Here the purchase order came from triage, which found it in the subject even though
     extraction produced no record at all."""
-    assert 'value="208491"' in client.get("/ui/records/new?email_id=mail-ui").text
+    assert 'value="908491"' in client.get("/ui/records/new?email_id=mail-ui").text
 
 
 def test_the_chooser_offers_the_photograph(client):
@@ -143,9 +143,16 @@ def test_the_way_out_is_in_the_header_not_only_under_the_last_field(client):
         assert 'aria-label="Back to Needs a human"' in bar.group(0), \
             f"{url}: nothing says where it goes for a reader who cannot see the tooltip"
 
-    # A real link, not history.back(): a refusal is a POST landing on this same URL, so one step
-    # back is the form again rather than the queue.
-    assert "history.back" not in html._JS
+    # A real link first. The script may take a history step *instead*, because that hands back the
+    # queue exactly as it was left — but only when it can show the entry behind this page is that
+    # queue. The hazard this rule was written for is still here: a refusal is a POST landing on this
+    # same URL, so a blind step back is the form again rather than the queue. What makes it safe is
+    # that the step is gated on `entryBefore()`, the recorded previous entry, and not on a guess.
+    assert "history.back()" in html._JS
+    step = html._JS[html._JS.index("a[data-back-to]"):]
+    step = step[:step.index("history.back()")]
+    assert "entryBefore()" in step, "the step back is not checked against the previous entry"
+    assert "data-back-to" in client.get("/ui/records/new?email_id=mail-ui").text
 
     # And it stays a per-page choice — nothing else grew one by accident.
     assert 'class="back-link"' not in client.get("/ui/manual").text
@@ -246,24 +253,32 @@ def test_the_kill_switch_stops_a_record_being_staged(client, store, monkeypatch)
 
 # --- the happy path -----------------------------------------------------------------------------
 
-def test_a_complete_form_creates_a_record_and_lands_on_records(client, store):
+def test_a_complete_form_creates_a_record_and_lands_back_on_the_message(client, store):
+    """Back on the message, not on to Records.
+
+    One notification commonly lists several lines of one delivery, and landing on Records meant
+    recording the second line began by finding the message again — on a queue the first line does
+    not remove it from. The page it returns to confirms the write and offers the ways to continue.
+    """
     created = client.post("/ui/records/new", data=FORM, follow_redirects=False)
 
-    # 303, so the browser follows with a GET: a refresh on the Records page must not re-submit the
-    # form and stage the delivery twice.
+    # 303, so the browser follows with a GET: a refresh must not re-submit the form and stage the
+    # delivery twice.
     assert created.status_code == 303
-    assert created.headers["location"].startswith("/ui/records")
+    location = created.headers["location"]
+    assert location.startswith("/ui/records/new?email_id=mail-ui")
+    assert "after=1" in location, "it names the record it just wrote"
 
     (row,) = records(store)
     assert row["origin"] == "manual"
-    assert row["created_by"] == "M Gutierrez"
+    assert row["created_by"] == "M Rivera"
     assert row["pod_ledger_id"] == 11
 
 
 def test_the_records_page_says_the_record_was_made_by_hand(client):
     client.post("/ui/records/new", data=FORM)
 
-    assert "Manual · M Gutierrez" in client.get("/ui/records").text
+    assert "Manual · M Rivera" in client.get("/ui/records").text
 
 
 def test_the_same_delivery_cannot_be_recorded_twice(client, store):
@@ -294,13 +309,16 @@ def test_the_message_itself_offers_it_too(client):
 
 
 def test_the_message_reports_back_what_was_made_from_it(client):
-    """Rather than inviting a second record for one delivery — and it is how a reviewer sees why
-    nothing else was staged from a message they marked handled."""
+    """How a reviewer sees why nothing else was staged from a message they marked handled.
+
+    It used to report this *instead of* offering a second record, on the reasoning that one
+    delivery needs one record. True of a delivery, false of a message — see the test below.
+    """
     client.post("/ui/records/new", data=FORM)
     popup = client.get("/ui/mail?id=mail-ui&src=inbox").text
 
     assert "created from this message by hand" in popup
-    assert "M Gutierrez" in popup
+    assert "M Rivera" in popup
 
 
 # --- waiving the proof of delivery --------------------------------------------------------------
@@ -348,17 +366,17 @@ def test_an_automatic_record_can_be_accepted_without_a_pod(client, store):
     that attach nothing, and `post_decision` refuses every one."""
     _an_automatically_staged_record_with_no_pod(client, store)
 
-    answer = client.post("/ui/records/1/waive-pod", data={"by": "M Gutierrez"},
+    answer = client.post("/ui/records/1/waive-pod", data={"by": "M Rivera"},
                          follow_redirects=False)
 
     assert answer.status_code == 303
-    assert records(store)[0]["pod_waived_by"] == "M Gutierrez"
+    assert records(store)[0]["pod_waived_by"] == "M Rivera"
 
 
 def test_once_accepted_the_row_offers_a_post_that_does_not_claim_a_proof(client, store):
     """"Post POD" on a record with no POD would be a lie about what reaches Spitfire."""
     _an_automatically_staged_record_with_no_pod(client, store)
-    client.post("/ui/records/1/waive-pod", data={"by": "M Gutierrez"})
+    client.post("/ui/records/1/waive-pod", data={"by": "M Rivera"})
     page = client.get("/ui/records").text
 
     assert "Post receipt" in page
@@ -368,13 +386,13 @@ def test_once_accepted_the_row_offers_a_post_that_does_not_claim_a_proof(client,
 def test_accepting_twice_does_not_change_who_accepted(client, store):
     """The first name is the one that took the risk."""
     _an_automatically_staged_record_with_no_pod(client, store)
-    client.post("/ui/records/1/waive-pod", data={"by": "M Gutierrez"})
+    client.post("/ui/records/1/waive-pod", data={"by": "M Rivera"})
 
     second = client.get("/ui/records/1/waive-pod").text
-    assert "Already accepted" in second and "M Gutierrez" in second
+    assert "Already accepted" in second and "M Rivera" in second
 
     client.post("/ui/records/1/waive-pod", data={"by": "Somebody Else"})
-    assert records(store)[0]["pod_waived_by"] == "M Gutierrez"
+    assert records(store)[0]["pod_waived_by"] == "M Rivera"
 
 
 def test_the_kill_switch_stops_a_waiver_too(client, store, monkeypatch):
@@ -383,7 +401,95 @@ def test_the_kill_switch_stops_a_waiver_too(client, store, monkeypatch):
     _an_automatically_staged_record_with_no_pod(client, store)
 
     monkeypatch.setattr(killswitch, "is_stopped", lambda: True)
-    answer = client.post("/ui/records/1/waive-pod", data={"by": "M Gutierrez"})
+    answer = client.post("/ui/records/1/waive-pod", data={"by": "M Rivera"})
 
     assert "kill switch" in answer.text
     assert records(store)[0]["pod_waived_by"] is None
+
+
+# --- the second line ----------------------------------------------------------------------------
+
+def test_the_page_confirms_the_record_it_just_wrote(client):
+    """`?created=` used to be passed to the Records page, which declares no such parameter and so
+    ignored it. Nothing anywhere confirmed the write."""
+    landing = client.post("/ui/records/new", data=FORM).text
+
+    assert "Record #1 created from this message" in landing
+
+
+def test_it_offers_another_line_of_the_same_po_and_a_different_one(client):
+    """The two shapes the work takes, as two controls. A single "create another" would have to
+    decide between them as the person typed, clearing fields under them when they edited the PO."""
+    landing = client.post("/ui/records/new", data=FORM).text
+
+    assert "Add another line to PO 908491" in landing
+    assert "same_po=1" in landing
+    assert "Record a different PO from this message" in landing
+
+
+def test_the_way_out_of_the_loop_is_on_the_page(client):
+    """Without it this page is a loop with no stated end, and someone who has finished has to reach
+    for the browser's back button to say so."""
+    landing = client.post("/ui/records/new", data=FORM).text
+
+    assert "Done — back to Needs a human" in landing
+
+
+def test_another_line_carries_the_delivery_and_blanks_the_line(client):
+    """The purchase order, the delivery date and the unit are shared by every line of one delivery.
+    The spec, the description and the quantity are the whole of what makes it a second line —
+    offering the previous line's values for those invites a duplicate of the row just written."""
+    client.post("/ui/records/new", data=FORM)
+    form = client.get("/ui/records/new?email_id=mail-ui&after=1&same_po=1").text
+
+    assert re.search(r'name="po_number"[^>]*value="908491"', form)
+    assert re.search(r'name="pod_stated_date"[^>]*value="2025-10-01"', form)
+    for blanked in ("spec_code", "item_description", "quantity_received"):
+        assert not re.search(rf'name="{blanked}"[^>]*value="[^"]+"', form), \
+            f"{blanked} must not be carried onto the next line"
+
+
+def test_a_different_po_starts_from_the_message_not_from_the_last_line(client):
+    """Without `same_po` the form is the one it always was — opened on what the pipeline worked out
+    about the message, which for a different delivery is the only honest starting point."""
+    client.post("/ui/records/new", data=FORM)
+    form = client.get("/ui/records/new?email_id=mail-ui").text
+
+    assert "Record #" not in form, "no confirmation banner without `after`"
+    assert "Recorded from this message" in form, "but it still says what has been made"
+
+
+def test_a_message_already_recorded_from_says_so_on_the_queue(client):
+    """"Create a record" on a message already carrying two of them reads as though the first two
+    did not happen."""
+    before = client.get("/ui/manual").text
+    assert "Create a record" in before
+
+    client.post("/ui/records/new", data=FORM)
+    after = client.get("/ui/manual").text
+
+    assert "Create another record" in after
+
+
+def test_the_message_popup_offers_the_second_line_too(client):
+    """Where somebody works out that a notification listed more than one line: reading it."""
+    client.post("/ui/records/new", data=FORM)
+    popup = client.get("/ui/mail?id=mail-ui&src=inbox").text
+
+    assert "Add another line to PO 908491" in popup
+    assert "Different PO" in popup
+
+
+def test_a_second_line_of_the_same_delivery_is_accepted(client, store):
+    """The whole point. Same PO, same delivery date, a different item on it — and the duplicate
+    guard must not mistake that for the same delivery recorded twice."""
+    client.post("/ui/records/new", data=FORM)
+    second = client.post("/ui/records/new", data=dict(
+        FORM, spec_code="STE-402-LT-C", item_description="SHADE, Floor Lamp 2",
+        quantity_received="4"))
+
+    assert "already recorded" not in second.text
+    rows = records(store)
+    assert len(rows) == 2
+    assert {r["spec_code"] for r in rows} == {"STE-402-LT-B", "STE-402-LT-C"}
+    assert {r["po_number"] for r in rows} == {"908491"}, "both lines are the same purchase order"

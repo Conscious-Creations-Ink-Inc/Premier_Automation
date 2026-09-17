@@ -14,13 +14,48 @@ from fastapi.testclient import TestClient
 
 from api.main import app
 from api.ui import html, routes
-from pipeline import delivery_status, read_views
+from config import settings
+from pipeline import attachment_ledger, delivery_status, read_views, state_db
 
 HOSTILE = 'OS&E <script>alert("x")</script> "quoted" \'single\''
 
 # Captured at import, before the autouse fixture below can substitute a corpus-carrying tuple.
 # This is what Premier actually runs with.
 PRODUCTION_MAIL_SOURCES = read_views.MAIL_SOURCES
+
+
+def _a_corpus_po() -> str:
+    """A purchase-order number that actually exists in the corpus store.
+
+    Read from the store rather than written here, for two reasons. The store holds Premier's real
+    mail, so its PO numbers are production data and may not sit in a committed file (Ashford
+    Standards v1.5 §12). And a hardcoded number silently rots the day the store is rebuilt — the
+    page 404s and the failure reads as a renderer bug rather than a stale fixture.
+
+    Returns "" when the store is absent; every test that needs it is skipped in that case.
+    """
+    if not settings.SAMPLE_STATE_DB_PATH.exists():
+        return ""
+    conn = state_db.get_connection(settings.SAMPLE_STATE_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT po_number FROM extracted_records "
+            "WHERE po_number IS NOT NULL AND po_number != '' "
+            "GROUP BY po_number ORDER BY COUNT(*) DESC LIMIT 1"
+        ).fetchone()
+        return str(row[0]) if row else ""
+    finally:
+        conn.close()
+
+
+CORPUS_PO = _a_corpus_po()
+
+# These pages render the `.msg` corpus store, which is gitignored real client mail and is absent
+# from a fresh clone. Skipping is the honest outcome there — the alternative is a CI failure that
+# says "renderer broken" when the truth is "no data". The renderer's own safety tests do not use
+# the corpus and keep running.
+needs_corpus = pytest.mark.skipif(
+    not CORPUS_PO, reason="corpus store not available; see tests/local_corpus/README.md")
 
 
 def column_labels(markup: str):
@@ -74,8 +109,18 @@ def _corpus_as_a_test_fixture(monkeypatch):
     monkeypatch.setattr(
         inbox_reader, "load",
         lambda *a, **k: inbox_reader.InboxView(
-            configured=True, mailbox="receiver@premierpm.com", messages=[]),
+            configured=True, mailbox="receiver@example-pm.test", messages=[]),
     )
+    # `/ui/po` shows only purchase orders with a final receipt, and the corpus has never posted
+    # one — the page would be empty and its renderer untested. Every corpus PO counts as posted
+    # here; `test_delivery_status_shows_only_final_receipts` tests the filter itself.
+    from pipeline import post_ledger
+
+    class _Everything:
+        def __contains__(self, _):
+            return True
+
+    monkeypatch.setattr(post_ledger, "posted_po_numbers", lambda conn: _Everything())
     yield
     app.dependency_overrides.pop(deps.get_pipeline_conn, None)
 
@@ -204,11 +249,12 @@ def test_every_nav_entry_appears_in_the_rendered_sidebar():
         assert label in body, label
 
 
+@needs_corpus
 def test_the_active_nav_entry_is_marked_on_every_page():
     """A sidebar that never highlights leaves a reader with no idea where they are. Detail pages
-    light their parent — `/ui/po/208491` marks `/ui/po`."""
+    light their parent — a `/ui/po/<number>` page marks `/ui/po`."""
     client = TestClient(app)
-    for path, active in [(href, href) for href, _ in html.nav_links()] + [("/ui/po/208491", "/ui/po")]:
+    for path, active in [(href, href) for href, _ in html.nav_links()] + [(f"/ui/po/{CORPUS_PO}", "/ui/po")]:
         body = client.get(path).text
         assert f'href="{active}" class="on"' in body, path
         assert body.count('class="on"') == 1, f"{path} lights more than one nav entry"
@@ -235,11 +281,11 @@ def test_quantities_line_up_on_their_last_digit():
     """`175.04` above `6`, both left-aligned, cannot be compared by eye — and a right-aligned column
     under a left-aligned heading reads as two columns that happen to overlap, so the heading turns
     with it."""
-    out = str(html.table(["PO", "Received"], [["208491", "175.04"]], table_id="t",
+    out = str(html.table(["PO", "Received"], [["908491", "175.04"]], table_id="t",
                          num_columns=("Received",)))
     assert '<td class="num">175.04</td>' in out
     assert 'class="num"' in out.split("<tbody>")[0], "the heading did not turn with its column"
-    assert '<td>208491</td>' in out, "a column nobody named is left alone"
+    assert '<td>908491</td>' in out, "a column nobody named is left alone"
     assert ".scroll th.num, th.num { text-align:right; }" in html._CSS
 
 
@@ -296,18 +342,20 @@ def test_the_stepper_needs_no_javascript():
     assert "<script" not in out and "onclick" not in out
 
 
+@needs_corpus
 def test_a_po_detail_page_renders_and_unknown_pos_404():
     client = TestClient(app)
-    assert client.get("/ui/po/208491").status_code == 200
+    assert client.get(f"/ui/po/{CORPUS_PO}").status_code == 200
     missing = client.get("/ui/po/000000")
     assert missing.status_code == 404
     assert "000000" in missing.json()["detail"]
 
 
+@needs_corpus
 def test_the_detail_page_does_not_match_a_partial_po_number():
-    """`2084` must not resolve to 208491 — a PO page showing another order's mail is worse than
-    one showing none."""
-    assert TestClient(app).get("/ui/po/2084").status_code == 404
+    """A truncated number must not resolve to a real PO — a page showing another order's mail
+    is worse than one showing none."""
+    assert TestClient(app).get(f"/ui/po/{CORPUS_PO[:4]}").status_code == 404
 
 
 def test_the_receiver_report_downloads_as_a_workbook():
@@ -361,8 +409,11 @@ def test_the_mail_page_shows_both_stores_and_marks_each_row():
     assert 'class="badge badge-inbox"' in body, "no live rows are marked"
     rows = re.findall(r'<tr class="clickable"[^>]*>(.*?)</tr>', body, re.S)
     assert rows, "no mail rows at all"
+    # `junk` is the third answer this cell can give, and it displaces the store badge rather than
+    # sitting beside it: a message Exchange filed as spam is the rarer and more urgent fact about
+    # where it came from, and the store is the same one either way.
     for row in rows:
-        assert "badge-sample" in row or "badge-inbox" in row, "a row rendered with no source"
+        assert ("badge-sample" in row or "badge-inbox" in row or "badge-junk" in row),             "a row rendered with no source"
 
 
 def test_the_subject_and_its_sender_are_one_cell():
@@ -385,7 +436,7 @@ def test_a_shortened_address_keeps_the_domain_and_the_whole_one_on_hover():
     assert short.endswith("@outlook.com")
     assert short.startswith("Rahul")
     assert len(short) < len("Rahulconsciouscreations@outlook.com")
-    assert routes._short_address("ap@premierpm.com") == "ap@premierpm.com", "short ones are left"
+    assert routes._short_address("ap@example-pm.test") == "ap@example-pm.test", "short ones are left"
     cell = str(routes._subject_cell("Delivered", "Rahulconsciouscreations@outlook.com"))
     assert 'title="Rahulconsciouscreations@outlook.com"' in cell
 
@@ -393,14 +444,22 @@ def test_a_shortened_address_keeps_the_domain_and_the_whole_one_on_hover():
 def test_the_mail_export_carries_every_row_and_no_formulas():
     """An export that silently stopped at the page on screen would be worse than none, because
     nothing about the file would say it was partial. And every cell in it is a string a mail server
-    chose — a spreadsheet runs one that opens with `=`."""
+    chose — a spreadsheet runs one that opens with `=`.
+
+    This is also what holds Mail out of `routes.ROW_CAP`. Every other list page ships its newest
+    500 and says so; Mail ships all of it, because this is the page people search for a message
+    from a month ago and a newest-first cap would answer "no mail matches" for mail that is in the
+    very file this test compares against.
+    """
     client = TestClient(app)
     response = client.get("/ui/mails.csv")
     assert response.status_code == 200
     assert "attachment" in response.headers["content-disposition"]
     lines = [line for line in response.text.splitlines() if line.strip()]
-    page_rows = client.get("/ui/mails").text.count('<tr class="clickable"')
+    body = client.get("/ui/mails").text
+    page_rows = body.count('<tr class="clickable"')
     assert len(lines) - 1 == page_rows, "the file and the page disagree about how much mail there is"
+    assert "cap-note" not in body, "Mail must not cap — see the docstring"
     assert routes._csv_safe(["=cmd|' /c calc'!A0"])[0].startswith("'=")
     assert routes._csv_safe(["plain"])[0] == "plain"
 
@@ -457,32 +516,64 @@ def test_the_mail_page_does_not_reach_graph_while_rendering(monkeypatch):
 
 
 def test_an_explicit_mailbox_check_survives_a_mailbox_that_cannot_be_read(monkeypatch):
-    """`?refresh=1` is the one path left that talks to Graph, and someone has to press it. A Graph
-    outage must cost the count, never the table — which is the part that works without a network."""
-    from operations import inbox as inbox_reader
+    """`POST /ui/mails/check` is the one path that talks to Graph, and someone has to press it. An
+    outage must cost the count, never the table — which is the part that works without a network.
+
+    The check now does its work *before* redirecting, so the failure is carried back in the query
+    string rather than raised part-way down a render. `poll_once` never raises, so the route is
+    exercised through it.
+    """
+    from operations import arrivals
 
     def boom(*args, **kwargs):
         raise RuntimeError("Graph is unreachable")
 
-    monkeypatch.setattr(inbox_reader, "load", boom)
-    body = TestClient(app).get("/ui/mails?refresh=1").text
+    monkeypatch.setattr(arrivals, "_poll_locked", boom)
+    client = TestClient(app)
+    redirect = client.post("/ui/mails/check", follow_redirects=False)
+    assert redirect.status_code == 303
+    assert "checked=error" in redirect.headers["location"]
+
+    body = client.get(redirect.headers["location"]).text
     assert "Could not read the mailbox" in body
+    assert 'class="err"' in body, "a mailbox we cannot read is not a muted aside"
     assert 'class="badge badge-sample"' in body, "the table must still render"
 
 
+def test_a_mailbox_check_does_not_reach_graph_from_a_render(monkeypatch):
+    """The bug this whole route exists to fix: the read used to happen part-way down `mails_page`,
+    *after* the table had been built, so what it found was written to the database and then not
+    shown. Any GET of this page must now be pure database."""
+    from operations import arrivals, inbox as inbox_reader
+
+    def boom(*args, **kwargs):
+        raise AssertionError("a page render must never talk to the mailbox")
+
+    monkeypatch.setattr(inbox_reader, "load", boom)
+    monkeypatch.setattr(arrivals, "poll_once", boom)
+    client = TestClient(app)
+    assert client.get("/ui/mails").status_code == 200
+    # The old spelling is still accepted, and must stay inert: it lived in bookmarks and in the
+    # address bar of every tab that had ever pressed the button, and each automatic reload of one
+    # of those paid for another full mailbox walk.
+    assert client.get("/ui/mails?refresh=1").status_code == 200
+
+
+@needs_corpus
 def test_a_purchase_order_page_leads_with_where_the_goods_are():
     """The question being asked. The bar underneath shows how it got there and what has not
     happened; neither answers "where is it now" without being read across."""
-    body = TestClient(app).get("/ui/po/206725").text
+    body = TestClient(app).get(f"/ui/po/{CORPUS_PO}").text
     assert 'class="where"' in body
-    assert "since 2025-" in body, "the headline must say since when, with a real date"
-    assert "Received by Miguel C. at" in body, "and where, and who signed"
+    assert re.search(r"since \d{4}-\d{2}-\d{2}", body),         "the headline must say since when, with a real date"
+    assert "Received by" in body, "and where, and who signed"
 
 
+@needs_corpus
 def test_the_bar_no_longer_shows_one_date_on_every_node():
     """The reported symptom: every stage read 2026-06-06, the day Premier forwarded the corpus.
     Asserted on the rendered page because that is where it was seen."""
-    body = TestClient(app).get("/ui/po/206725").text
+    body = TestClient(app).get(f"/ui/po/{CORPUS_PO}").text
     assert body.count("2026-06-06") == 0, "the forward date must not appear as an event date"
     dates = set(re.findall(r"<span[^>]*>(\d{4}-\d{2}-\d{2})</span>", body))
     assert len(dates) > 1, f"every node still shares one date: {dates}"
@@ -510,13 +601,14 @@ def test_a_reached_node_with_no_date_is_distinguished_from_one_that_never_happen
     assert "not yet" not in out
 
 
+@needs_corpus
 def test_the_delivery_bar_fragment_carries_the_stages_and_the_receipt_address():
-    fragment = TestClient(app).get("/ui/po/208491/bar").text
+    fragment = TestClient(app).get(f"/ui/po/{CORPUS_PO}/bar").text
     assert 'class="stepper"' in fragment
     assert delivery_status.STATUS_LABELS[delivery_status.DELIVERED] in fragment
     # The address is what lets a reader judge whether that was the final destination.
-    assert "Received by Miguel C. at Crown Worldwide" in fragment
-    assert "/ui/po/208491" in fragment, "a way through to the full purchase order"
+    assert "Received by" in fragment, "who signed for the goods"
+    assert f"/ui/po/{CORPUS_PO}" in fragment, "a way through to the full purchase order"
 
 
 def test_the_receiver_sheet_lives_on_one_page_now():
@@ -592,9 +684,14 @@ def test_the_verify_controls_are_where_someone_can_actually_find_them():
     # Straight after the selection box and "#". Read through the wrapper: a sortable heading is a
     # `<button>` inside its `<th>`, while Verify is in `no_sort` and stays a bare cell — so
     # matching a `<th>` literally sees only half the columns.
+    #
+    # Edit joined them on the same argument and is pinned by the same line. The three write
+    # controls sit together deliberately: "what may I do to this row" is one question, and
+    # answering it in three separate places on a twenty-one column table that scrolls sideways is
+    # how the first two came to be unfindable.
     table = body[body.index('id="records-table"'):]
-    assert column_labels(table)[:4] == ["", "#", "Verify", "Post"], \
-        f"the controls are not where they were pinned: {column_labels(table)[:5]}"
+    assert column_labels(table)[:5] == ["", "#", "Verify", "Post", "Edit"], \
+        f"the controls are not where they were pinned: {column_labels(table)[:6]}"
 
 
 def test_verify_all_narrows_to_the_ticked_rows():
@@ -645,22 +742,50 @@ def test_a_row_can_be_in_two_states_at_once():
     both "Real files only" and "Inline images only" and were reachable from neither."""
     marker = html._JS.split("var own = row.getAttribute('data-choice-value')")[1][:420]
     assert "split(" in marker and "choices.some" in marker,         "the match must be an intersection of words, not an equality"
+    # The two views are now chosen on the server — `?view=file` and `?view=inline` load different
+    # rows rather than hiding rows already rendered — so the arithmetic the bug broke is checked
+    # where it now lives: the counts printed on the two links must add up to the whole table, which
+    # is exactly the "reachable from neither" failure stated as a sum.
     body = markup_of("/ui/attachments")
-    assert '<option value="inline">Inline images only</option>' in body
-    # Every listed row falls under one of the two file/inline views, so neither hides a row from
-    # both. That is the arithmetic the bug broke.
-    states = re.findall(r'data-choice-value="([^"]*)"', body)
-    assert states, "no row carries its state"
-    assert all("inline" in w.split() or "file" in w.split() for w in states)
+    assert 'href="/ui/attachments?view=inline"' in body
+    assert 'href="/ui/attachments?view=all"' in body
+
+    def counted(view):
+        shown = re.search(rf'view={view}"[^>]*>[^(]*\(([\d,]+)\)', body)
+        if shown:
+            return int(shown.group(1).replace(",", ""))
+        current = re.search(rf'aria-current="true"[^>]*>[^(]*\(([\d,]+)\)', body)
+        return int(current.group(1).replace(",", ""))
+
+    assert counted("file") + counted("inline") == counted("all"),         "a row reachable from neither view, or counted by both"
 
 
-def test_the_records_page_can_be_narrowed_to_what_needs_a_person():
-    """The Complete cell holds a badge, a Fill button and a tooltip, so its rendered text is
-    "3 gaps Fill" — nothing a dropdown could name. The row carries the state instead."""
+def test_the_records_page_no_longer_offers_a_gaps_view():
+    """It used to narrow to "My triage queue" — the rows with something missing.
+
+    There are none to narrow to any more: a record with a gap is on `/ui/manual`, because the page
+    that means "postable" cannot list rows the Post button refuses. The option is built from the
+    rows actually present (`routes.records_page`), so it stops being offered on its own rather than
+    having to be removed by hand — and if one ever appears there again, it comes back, which is the
+    signal that something has gone wrong with the partition.
+
+    The row-level machinery stays: `data-choice-value` is still stamped, and the queue is where
+    narrowing by reason now happens.
+    """
     body = markup_of("/ui/records")
-    assert 'data-choice-value="gaps"' in body or 'data-choice-value="complete"' in body
-    assert '<option value="gaps">My triage queue</option>' in body
+    assert 'data-choice-value="complete"' in body
+    assert 'data-choice-value="gaps"' not in body, "a gapped record reached the Records page"
+    assert '<option value="gaps">My triage queue</option>' not in body
     assert "row.getAttribute('data-choice-value')" in html._JS
+
+
+def test_a_queue_record_row_can_close_its_own_gaps():
+    """Record rows in the queue carried a dash where the action should be — 44 of 62 rows with
+    nothing to do — on the reasoning that the fix lived on the Records page. Once a record with
+    gaps stopped appearing there, that dash was the whole story."""
+    body = markup_of("/ui/manual")
+    assert re.search(r'data-verify="/ui/records/\d+/complete"', body), "no Fill on a queue record"
+    assert re.search(r'data-verify="/ui/records/\d+/verify"', body), "no Verify on a queue record"
 
 
 def test_something_listens_for_data_verify_and_posts_it():
@@ -943,12 +1068,13 @@ def test_a_container_child_is_not_offered_a_download_that_would_404():
     assert "Back to message" in out
 
 
+@needs_corpus
 def test_the_records_page_shows_delivery_status_per_row():
     body = TestClient(app).get("/ui/records").text
     # Named "Status" since 2026-08-22 — the same word the Delivery status page uses for the same
     # badge, rather than two names for one fact.
     assert ">Status<" in body
-    assert 'href="/ui/po/208491"' in body
+    assert f'href="/ui/po/{CORPUS_PO}"' in body
     # Delivered, not "At partnered warehouse": the Authority notice states the goods were received
     # and signed for, and that is the event that creates a receiver.
     assert delivery_status.STATUS_LABELS[delivery_status.DELIVERED] in body
@@ -973,10 +1099,11 @@ def test_the_records_page_says_how_each_record_was_made():
     assert "Automated" in body
 
 
-UI_PAGES = ("/ui/mails", "/ui/records", "/ui/manual", "/ui/po", "/ui/po/208491",
+UI_PAGES = ("/ui/mails", "/ui/records", "/ui/manual", "/ui/po", f"/ui/po/{CORPUS_PO}",
             "/ui/attachments")
 
 
+@needs_corpus
 def test_pages_carry_exactly_one_first_party_script_and_nothing_else():
     """These pages were script-free until the message popup needed `fetch` and `showModal`.
 
@@ -1015,6 +1142,18 @@ def test_a_hostile_subject_cannot_reach_the_script_or_a_row_attribute():
 # in the page, so a `?q=` round trip would be slower than typing and could disagree with what is
 # on screen. These tests pin the contract the script depends on.
 
+# The one table in the app the browser is never sent in full, and so the one whose search, sort,
+# paging and date range are done in SQL. Signature logos are 27,393 of 29,766 rows on Premier's
+# live store: sending them all so the browser could hide all but 25 cost 25 MB of HTML and 4.2
+# seconds. Every other table ships every row it stands for, which is what makes a filter in the
+# browser honest there and dishonest here.
+#
+# Named in one place so the sweeps below stay sweeps. A second page moving server-side is one entry
+# here, not four more branches.
+SERVER_SIDE_PAGES = {"/ui/attachments"}
+SERVER_SIDE_TABLES = {"attachments-table"}
+
+
 SEARCHABLE_PAGES = {"/ui/mails": "mail-table", "/ui/records": "records-table",
                     "/ui/attachments": "attachments-table"}
 
@@ -1024,8 +1163,13 @@ def test_the_searchable_pages_carry_a_filter_pointed_at_their_table(path, table_
     """The input names a table id, and that id must actually exist on the page — a filter pointing
     at nothing fails silently, which is the one failure mode a user would read as "no results"."""
     body = TestClient(app).get(path).text
-    assert f'data-filter="{table_id}"' in body, path
     assert f'id="{table_id}"' in body, path
+    if f'data-server-filter="{table_id}"' in body:
+        # Searched by the database. There is no live count to bind, because the number of matches
+        # is whatever the next query returns -- the pager says it instead. See `SERVER_SIDE_TABLES`.
+        assert f'data-server-pager-for="{table_id}"' in body, path
+        return
+    assert f'data-filter="{table_id}"' in body, path
     assert f'data-count-for="{table_id}"' in body, path
 
 
@@ -1122,6 +1266,12 @@ PAGED_TABLES = {
 @pytest.mark.parametrize("path,table_id", sorted(PAGED_TABLES.items()))
 def test_a_paged_table_carries_a_pager_bound_to_it(path, table_id):
     body = TestClient(app).get(path).text
+    if table_id in SERVER_SIDE_TABLES:
+        # A server-paged table's controls are links, not buttons the script drives: every page of
+        # it has its own URL, which is what makes one linkable and openable in a new tab.
+        assert f'data-server-pager-for="{table_id}"' in body, path
+        assert 'class="pager-num' in body, path
+        return
     assert f'data-pager-for="{table_id}"' in body, path
     assert 'data-page="prev"' in body and 'data-page="next"' in body, path
 
@@ -1230,7 +1380,11 @@ def test_every_table_on_every_page_is_paged():
     unpaged = []
     for path in ALL_UI_PAGES:
         body = markup_of(path)
-        paged = set(re.findall(r'data-pager-for="([^"]+)"', body))
+        # Either mechanism counts. Most tables ship every row and page in the browser
+        # (`data-pager-for`); /ui/attachments is paged by the database (`data-server-pager-for`)
+        # because 29,766 rows cannot be sent. The rule being asserted is about the reader — a table
+        # that hides rows must offer a way through them — not about which half does the work.
+        paged = set(re.findall(r'data-(?:server-)?pager-for="([^"]+)"', body))
         for table_id in re.findall(r'<div class="scroll(?: plain)?" id="([^"]+)"', body):
             if table_id not in paged:
                 unpaged.append(f"{path}:{table_id}")
@@ -1245,20 +1399,26 @@ def test_every_paged_table_is_also_searchable():
     for path in ALL_UI_PAGES:
         body = markup_of(path)
         searched = set()
-        for targets in re.findall(r'<input type="search"[^>]*data-filter="([^"]+)"', body):
+        for targets in re.findall(
+                r'<input type="search"[^>]*data-(?:server-)?filter="([^"]+)"', body):
             searched.update(targets.split())
-        for table_id in re.findall(r'data-pager-for="([^"]+)"', body):
+        for table_id in re.findall(r'data-(?:server-)?pager-for="([^"]+)"', body):
             assert table_id in searched, f"{path}: {table_id} is paged but not searchable"
 
 
-def test_the_filtered_chatter_table_is_paged_and_searchable(tmp_path, monkeypatch):
-    """Neither store holds chatter-filtered mail today, so the sweeps above never reach this table
-    — it renders as an empty `<p>`. Seeding one row is what proves the branch works, rather than
-    proving only that it is currently unreachable.
+def test_the_not_a_delivery_page_is_paged_and_searchable(tmp_path, monkeypatch):
+    """Neither store holds set-aside mail today, so the sweeps above never reach this table — it
+    renders as an empty `<p>` with no headers at all, which is also why `/ui/not-deliveries` is
+    deliberately absent from `UI_PAGES`, `ALL_UI_PAGES`, the date-column map and `MAIL_OPENING_PAGES`
+    above. Seeding a row is what proves the branch works, rather than proving only that it is
+    currently unreachable.
 
-    It joins the page's search box on purpose: "did a real delivery get filed as chatter?" is the
-    question that brings someone here, and this is the last table they would think to search
-    separately.
+    The table used to sit at the bottom of `/ui/manual` and share that page's search box. It has its
+    own page and its own box now, and this asserts against the new one; `tests/test_mail_verdict_ui`
+    covers the rest of that page, including the controls that move a message on or off it.
+
+    Seeded with `not_a_delivery=True`, which is what the view selects on — the rule name alone no
+    longer qualifies a row, because the set of rules that mean this has grown past internal chatter.
     """
     import sqlite3
 
@@ -1270,10 +1430,10 @@ def test_the_filtered_chatter_table_is_paged_and_searchable(tmp_path, monkeypatc
     try:
         for n in range(3):
             email_log.record(setup, email_id=f"<chatter-{n}@premier>",
-                             subject=f"All-associates announcement {n}", sender="hr@premierpm.com",
+                             subject=f"All-associates announcement {n}", sender="hr@example-pm.test",
                              category="hide", matched_rule=read_views.NOISE_RULE,
                              reason="internal chatter", folder="Hidden",
-                             processed_at="2026-08-13 09:00:00")
+                             processed_at="2026-08-13 09:00:00", not_a_delivery=True)
     finally:
         setup.close()
 
@@ -1287,14 +1447,21 @@ def test_the_filtered_chatter_table_is_paged_and_searchable(tmp_path, monkeypatc
 
     app.dependency_overrides[deps.get_pipeline_conn] = live
     try:
-        body = re.sub(r"<script>.*?</script>", "", TestClient(app).get("/ui/manual").text, flags=re.S)
+        client = TestClient(app)
+        body = re.sub(r"<script>.*?</script>", "",
+                      client.get("/ui/not-deliveries").text, flags=re.S)
+        queue = client.get("/ui/manual").text
     finally:
         app.dependency_overrides.pop(deps.get_pipeline_conn, None)
 
-    assert 'id="manual-filtered"' in body, "the chatter table did not render"
-    assert 'data-pager-for="manual-filtered"' in body, "it rendered unpaged"
+    assert 'id="not-deliveries-table"' in body, "the not-a-delivery table did not render"
+    assert 'data-pager-for="not-deliveries-table"' in body, "it rendered unpaged"
     targets = re.findall(r'<input type="search"[^>]*data-filter="([^"]+)"', body)
-    assert targets and "manual-filtered" in targets[0].split(), "it is not covered by the search box"
+    assert targets and "not-deliveries-table" in targets[0].split(), "no search box covers it"
+
+    # And it is no longer on the queue page, which now carries only a line pointing here.
+    assert 'id="manual-filtered"' not in queue
+    assert 'href="/ui/not-deliveries"' in queue
 
 
 def test_the_attachment_pager_matches_the_shared_one():
@@ -1384,6 +1551,13 @@ DATE_COLUMNS = {
 @pytest.mark.parametrize("path,column", sorted(DATE_COLUMNS.items()))
 def test_each_page_has_a_date_range_bound_to_its_date_column(path, column):
     body = markup_of(path)
+    if path in SERVER_SIDE_PAGES:
+        # Same four choices -- Today, 7d, 30d, All -- but as links that narrow the query rather
+        # than inputs that hide rows the browser is holding. A client-side range on a table the
+        # browser only ever sees 25 rows of would narrow those 25 and say nothing about the rest.
+        for preset in ("days=0", "days=7", "days=30"):
+            assert preset in body, f"{path}: no {preset} link"
+        return
     assert 'class="date-from"' in body, path
     assert 'class="date-to"' in body, path
     assert 'data-date="1"' in body, f"{path}: no column is marked as the date column"
@@ -1471,14 +1645,22 @@ def test_the_count_speaks_for_the_date_range_too():
     assert "if (!narrowed(input)) readout.textContent = '';" in html._JS
 
 
-def test_the_manual_queue_searches_all_three_of_its_tables_at_once():
-    """Someone chasing a PO number wants it found in whichever queue it landed in, not in the one
-    they happened to point at."""
+def test_the_manual_queue_is_one_queue_searched_at_once():
+    """Someone chasing a PO number wants it found wherever it landed, not in the one table they
+    happened to point at.
+
+    It used to be three tables — emails, attachments, records — and the box covered all three. They
+    were merged into one queue on 2026-08-24, in arrival order, so there is one table to cover
+    here; the chatter table at the foot of the page joins it whenever there is chatter, which
+    `test_the_filtered_chatter_table_is_paged_and_searchable` is what proves.
+    """
     body = markup_of("/ui/manual")
     targets = re.findall(r'<input type="search"[^>]*data-filter="([^"]+)"', body)
     assert targets, "the manual queue has no search box"
-    assert len(targets[0].split()) > 1, "the box covers only one table"
+    assert "manual-table" in targets[0].split(), "the queue itself is not covered"
     assert 'data-filter~=' in html._JS, "the script must match one id inside a list"
+    # One table, not three. Three ids here would mean the merge had been undone.
+    assert 'id="manual-email"' not in body and 'id="manual-record"' not in body
 
 
 def test_every_delivery_status_has_a_badge_style():
@@ -1549,15 +1731,25 @@ def test_a_table_pane_sizes_itself_by_flex_not_by_arithmetic():
     the right one and none is wrong.
     """
     pane = html._CSS.split(".scroll.pane {")[1].split("}")[0]
-    assert "100vh" not in pane, "the pane is counting pixels against the viewport again"
+    # A cap in `vh` is fine — that is a share of the window, not a number tuned to one. What must
+    # never come back is arithmetic that subtracts the chrome it happens to sit under today.
+    assert "calc(" not in pane, "the pane is counting pixels against the viewport again"
+    assert "100vh" not in pane
     # Basis 0, not auto: from `auto` the pane starts at the height of every row it holds and has to
-    # be shrunk back down, which lets one long table decide the layout for the whole column.
-    assert "flex:1 1 0" in pane
+    # be shrunk back down, which lets one long table decide the layout for the whole column. It is
+    # set on the single-section override rather than on the base rule, because a page with sections
+    # below the table takes the `max-height` share instead of flexing.
+    assert "main:has(> section:only-child .scroll.pane) .scroll.pane { flex:1 1 0;" in html._CSS
+    assert "max-height:62vh" in pane, "a pane on a page with more below it needs a ceiling"
     # And a definite height to grow inside — `min-height:100vh` let the column grow past the
     # window instead, which is the bug this pair was written after.
-    assert ".shell:has(.scroll.pane) { height:100vh; }" in html._CSS
-    for rule in (".content:has(.scroll.pane)", "main:has(.scroll.pane)",
-                 "main:has(.scroll.pane) > section"):
+    assert ".shell:has(main > section:only-child .scroll.pane) { height:100vh; }" in html._CSS
+    # And only when the table is the only thing on the page. Needs a human has five sections; with
+    # the chain matching on the pane alone they shared the viewport and the queue was two rows tall.
+    assert "main:has(> section:only-child .scroll.pane) .scroll.pane" in html._CSS
+    for rule in (".content:has(main > section:only-child .scroll.pane)",
+                 "main:has(> section:only-child .scroll.pane)",
+                 "main:has(> section:only-child .scroll.pane) > section"):
         assert rule in html._CSS, f"{rule} is missing — the pane has no flex parent to grow into"
     # Both floors, or the table pushes the column past the viewport instead of scrolling inside it.
     assert html._CSS.count("min-height:0") >= 2
@@ -1580,6 +1772,7 @@ def test_the_last_run_line_is_in_the_rail_not_under_the_table():
     assert ".rail .side-foot .last-run" in html._CSS
 
 
+@needs_corpus
 def test_every_page_stamps_a_version_for_the_poller_to_compare():
     client = TestClient(app)
     for path in UI_PAGES:
@@ -1690,6 +1883,7 @@ def test_the_po_control_is_a_button_not_a_link():
 # by the readout beside the search box.
 
 
+@needs_corpus
 def test_the_queue_alert_is_on_every_page_and_never_lights_the_nav():
     """The rail must look the same everywhere.
 
@@ -1729,8 +1923,32 @@ def test_check_now_left_the_note_but_the_watch_state_did_not():
     """Moving the button up must not take the sentence with it. Whether the arrival watch is on is
     real state, and a page that only says "Check now" cannot explain why it looks stale."""
     body = TestClient(app).get("/ui/mails").text
-    assert 'href="/ui/mails?refresh=1"' in body
+    # A POST, not a link: it reaches Microsoft and writes what it finds, and a link would let a
+    # prefetch press it. See `routes._check_now`.
+    assert 'action="/ui/mails/check"' in body
+    assert 'href="/ui/mails?refresh=1"' not in body, "the GET spelling must not be offered again"
     assert "the new-mail watch is off" in body.lower() or "last checked" in body.lower()
+
+
+def test_check_now_says_it_is_working():
+    """Twenty seconds of a page that looks untouched is what made people press this repeatedly, and
+    every press was another mailbox walk."""
+    body = TestClient(app).get("/ui/mails").text
+    assert 'data-busy-label="Checking the mailbox' in body
+    assert "data-busy-label" in html._JS, "nothing acts on the attribute"
+
+
+def test_a_second_check_while_one_is_running_is_refused_not_queued(monkeypatch):
+    """Two mailbox walks at once against the same tables. The old path took no lock at all."""
+    from operations import arrivals
+
+    assert arrivals._lock.acquire(blocking=False)
+    try:
+        redirect = TestClient(app).post("/ui/mails/check", follow_redirects=False)
+    finally:
+        arrivals._lock.release()
+    assert redirect.status_code == 303
+    assert "checked=busy" in redirect.headers["location"]
 
 
 def test_date_presets_fill_the_range_rather_than_replacing_it():
@@ -1833,3 +2051,277 @@ def test_a_section_with_no_title_emits_no_heading():
     is worse — a screen reader announces a heading with nothing in it."""
     assert "<h2>" not in str(html.section("", html.tag("p", "body")))
     assert "<h2>Titled</h2>" in str(html.section("Titled", html.tag("p", "body")))
+
+
+# --- A bare number in the search box means a purchase order ------------------------------------
+#
+# One email's subject can name seven POs at once — the property delivery confirmation names 907505,
+# 907514, 912559, 907249, 908705, 912560 and 912614. Searching the queue for `912614` returned 46
+# rows and **not one of them was that PO**: they were 907514's and 907249's, matched on a subject
+# they happened to share. Every row displayed its true PO in its own column, so the page was
+# honest and the search was not.
+
+def test_a_row_declares_its_purchase_order_for_the_search_to_match():
+    markup = html.table(["What", "PO"], [["a subject naming 912614", "907514"]],
+                        po_values=["907514"])
+    assert 'data-po="907514"' in markup
+
+
+def test_a_table_without_po_values_declares_no_po():
+    """Attachments and messages have no PO of their own; a number must still find them by text."""
+    markup = html.table(["What", "PO"], [["something", "—"]])
+    assert "data-po=" not in markup
+
+
+def test_the_search_matches_a_bare_number_against_the_po_not_the_row_text():
+    """The whole fix, asserted on the script that ships.
+
+    `termMatches` is what stops a row belonging to 907514 answering a search for 912614 because the
+    two share an email subject. Behaviour verified under node; this pins the shape so the guard
+    cannot be removed without a test failing.
+    """
+    js = html._JS
+    assert "function termMatches(row, hay, term)" in js
+    body = js.split("function termMatches(row, hay, term)")[1].split("\n}")[0]
+    assert "data-po" in body, "the PO cell is what a bare number must be matched against"
+    assert "hay.indexOf(term)" in body, "anything that is not a bare number still matches text"
+
+
+def test_a_row_with_no_declared_po_still_falls_back_to_text_search():
+    """Otherwise a tracking number, which lives only in the row's text, would stop being findable."""
+    body = html._JS.split("function termMatches(row, hay, term)")[1].split("\n}")[0]
+    assert "if (po)" in body, "an absent data-po must fall through to the text haystack"
+
+
+def test_the_manual_queue_hands_the_search_its_purchase_orders():
+    """The page has to pass `po_values`, or every row falls back to text and nothing changes."""
+    import inspect
+    from api.ui import routes
+    source = inspect.getsource(routes.manual_page)
+    assert "po_values=" in source
+
+
+# --- A purchase order alone does not identify a delivery ---------------------------------------
+
+def test_the_po_cell_carries_the_line_once_it_is_known():
+    """PO 907514 has 29 lines all reading `LOB-900-SI`, so "907514" alone was true of all 23 of its
+    queued rows and told a reader nothing. The line is what says which item — and what Spitfire
+    needs to post against the right budget line."""
+    from api.ui.routes import _po_cell
+    from pipeline.read_views import ManualItem
+
+    item = ManualItem(kind="record", ref="record #1", ref_id=1, email_id="m", subject="s",
+                      when="2026-08-26T00:00", reason="why", po_number="907514",
+                      po_line_number=13)
+    assert "907514 : 13" in str(_po_cell(item))
+
+
+def test_the_po_cell_shows_the_bare_po_when_no_line_is_resolved():
+    """One of PO 907514's 23 matches no line at all. It must still say which order it is on."""
+    from api.ui.routes import _po_cell
+    from pipeline.read_views import ManualItem
+
+    item = ManualItem(kind="record", ref="record #1", ref_id=1, email_id="m", subject="s",
+                      when="2026-08-26T00:00", reason="why", po_number="907514")
+    rendered = str(_po_cell(item))
+    assert "907514" in rendered and ":" not in rendered.split(">")[-2]
+
+
+def test_the_queue_gives_the_item_a_column_of_its_own():
+    """Measured on PO 907514's 23 rows: seven of the eight fields were identical and only the item
+    varied — and it was truncated behind a repeated spec prefix and a repeated `via` suffix."""
+    import inspect
+    from api.ui import routes
+    source = inspect.getsource(routes.manual_page)
+    assert '"Item"' in source, "the item needs a column, not a share of the subject line"
+    assert "i.item" in source
+
+
+# --- No table is capped, anywhere ------------------------------------------------------------------
+#
+# On 2026-09-15 a search on Needs a human for a message with 299 rows answered "No rows match — 500
+# hidden": the page had sent only the newest 500, and the search box can only see what was sent.
+# Mail and this page were exempted; on 2026-09-16 the cap was removed outright, so the four tests
+# that described its machinery — the note, its `data-cap-for` marker, the "Load all" link and the
+# readout's capped wording — went with the thing they described. What replaces them is stronger and
+# covers every page rather than the two that were exempt.
+
+
+@pytest.mark.parametrize("path", ALL_UI_PAGES)
+def test_no_page_admits_to_hiding_rows(path):
+    """No page may ship a slice and say so.
+
+    `data-cap-for` was the marker the note carried, "most recent of" its opening words and "Load
+    all" its link. If any of the three comes back, some table is answering a search about part of
+    itself again — which is the failure this whole change exists to remove.
+    """
+    body = markup_of(path)
+    assert "data-cap-for" not in body, f"{path} is capped, so its search cannot see every row"
+    assert "most recent of" not in body, path
+    assert "Load all" not in body, path
+
+
+def test_the_renderer_has_no_cap_left_to_apply():
+    """Not just unused by the pages — gone from `table()`, so it cannot be passed by a new one."""
+    import inspect
+
+    assert "cap" not in inspect.signature(html.table).parameters
+    assert not hasattr(html, "_cap_note")
+    assert not hasattr(routes, "ROW_CAP")
+    assert not hasattr(routes, "_cap")
+
+
+def test_a_table_ships_every_row_it_stands_for():
+    """`data-row-total` and the rows present must agree. They could not while a cap existed."""
+    rows = [[f"r{n}"] for n in range(400)]
+    out = str(html.table(["A"], rows, table_id="t1", page_size=25))
+    assert 'data-row-total="400"' in out
+    assert out.count("<tr") == 401                        # 400 rows plus the heading row
+
+
+def test_the_search_readout_speaks_about_every_row():
+    """With no cap there is no "of the N loaded" to qualify — the count is about the whole table."""
+    script = html._JS
+    assert "function writeCount(" in script
+    assert "'No ' + noun + 's match — ' + total + ' hidden'" in script
+    # The three pieces of the capped wording, by the literal each was built from. Named exactly
+    # rather than searching for the word "loaded", which also appears in the comment explaining
+    # why they went.
+    assert "of the ' + total + ' loaded" not in script
+    assert "No match in the ' + total + ' loaded" not in script
+    assert "data-cap-for" not in script
+
+
+# --- keeping your place across a navigation -------------------------------------------------------
+# Every action that leaves a page — Not a delivery, Waive, Create, Back — used to drop the search
+# text, the table page, the sort and the scroll position, because none of it was written down
+# anywhere. These hold the three halves of the fix: the page remembers, Back is a history step when
+# it can be, and a form says where it came from.
+
+
+def test_the_script_writes_the_page_state_down_and_reads_it_back():
+    script = html._JS
+    assert "premier-place:" in script, "no key to store a page's state under"
+    for piece in ("function savePlace", "function restorePlace", "sessionStorage"):
+        assert piece in script, piece
+
+
+def test_the_state_is_restored_in_an_order_that_leaves_the_rows_where_they_were():
+    """Filters first, then paging, then one repaint, and the scroll last. Scrolling before the rows
+    are filtered lands on an offset that no longer exists once the table shrinks."""
+    body = html._JS[html._JS.index("function restorePlace"):]
+    body = body[:body.index("\nfunction ", 1)]
+    steps = [body.index("restoreFilters"), body.index("restorePaging"),
+             body.index("refreshEveryView()"), body.index("window.scrollTo")]
+    assert steps == sorted(steps), "restore runs out of order"
+
+
+def test_storage_being_unavailable_never_breaks_a_page():
+    """Private mode and blocked site data both throw on the first `sessionStorage` touch. The rail
+    toggle has always been wrapped; these must be too."""
+    script = html._JS
+    for at in [m.start() for m in re.finditer(r"sessionStorage\.", script)]:
+        window = script[max(0, at - 400):at]
+        assert "try {" in window, f"unguarded sessionStorage near: {script[at - 80:at + 60]!r}"
+
+
+def test_a_remembered_filter_offers_a_way_to_clear_it():
+    """A search restored from a previous visit hides rows the person did not just hide. It has to
+    say so, and be one press from gone."""
+    assert "place-clear" in html._JS
+    assert "Clear filters" in html._JS
+
+
+def test_the_back_link_names_where_it_goes_so_the_script_can_step_back_instead():
+    """`history.back()` restores the page the browser already has, filters and scroll included —
+    but only when the previous entry really is that page. The href stays as the fallback."""
+    rendered = html.page("Not a delivery", "/ui/manual", back="/ui/manual",
+                         back_label="Needs a human")
+    assert 'data-back-to="/ui/manual"' in rendered
+    assert "data-back-to" in html._JS, "nothing listens for it"
+    assert 'href="/ui/manual"' in rendered, "the plain link must survive for no-JavaScript"
+
+
+def test_a_form_carries_where_to_return_to_and_a_steppable_cancel():
+    rendered = str(html.form("/ui/mail/verdict", submit="Set aside", cancel="/ui/manual",
+                             cancel_label="Back to Needs a human"))
+    assert 'name="return_to"' in rendered, "the server has nowhere to send them back to"
+    assert 'data-back-to="/ui/manual"' in rendered
+    assert "return_to" in html._JS, "nothing fills the field in"
+
+
+def test_a_confirmation_survives_the_redirect_that_carries_it():
+    """The message is written before the submission leaves and shown once on arrival, so landing
+    back on the queue still says what happened."""
+    assert "premier-toast" in html._JS
+
+
+# --- deciding in place, without the queue going anywhere ------------------------------------------
+
+
+def test_a_row_says_which_message_it_came_from():
+    """So the script can take away every row of a message that was just set aside — the email row,
+    its attachments and its records — instead of reloading the page to find out."""
+    rendered = str(html.table(
+        ["PO", "Why"], [["900101", "no POD"]], email_ids=["<msg-1@example.test>"]))
+
+    assert 'data-mail-id="&lt;msg-1@example.test&gt;"' in rendered
+
+
+def test_a_row_without_one_carries_no_empty_attribute():
+    rendered = str(html.table(["PO"], [["900101"]]))
+
+    assert "data-mail-id" not in rendered
+
+
+def test_the_script_takes_the_rows_away_and_offers_the_way_back():
+    script = html._JS
+    assert "data-mail-id" in script, "nothing removes the rows"
+    assert "application/json" in script, "the decision is not asked for as an answer"
+    assert "Undo" in script, "a decision that empties rows off a page must be reversible in place"
+
+
+# --- a released logo is a blank pixel, everything else is still a refusal -------------------------
+#
+# `mail_view._resolve_inline_images` points every `cid:` in a stored body at /ui/mail/attachment,
+# and the frame's CSP is `img-src 'self' data:` with no remote fallback. So once a signature logo's
+# bytes are deliberately released, a 404 there is a broken-image icon in the middle of somebody's
+# signature block on a message where nothing is wrong. That one case gets a transparent pixel. The
+# refusal is kept everywhere else, because the popup prints the ledger's verdict beside each
+# attachment and this must not contradict it.
+
+
+def test_the_placeholder_is_a_real_transparent_png():
+    assert len(routes._BLANK_PNG) == 68
+    assert routes._BLANK_PNG[:4] == b"\x89PNG"
+
+
+@pytest.mark.parametrize("why,download,status", [
+    ((attachment_ledger.DROPPED_DECORATIVE, True), 0, 200),   # the one case
+    ((attachment_ledger.DROPPED_DECORATIVE, True), 1, 404),   # a person asked for the file
+    ((attachment_ledger.DROPPED_DECORATIVE, False), 0, 404),  # not something a body drew
+    (("corrupt", True), 0, 404),                              # a verdict a reader needs
+    (("service_unavailable", True), 0, 404),
+    ((attachment_ledger.DROPPED_OVERSIZE, True), 0, 404),
+    (None, 0, 404),                                           # no ledger row at all
+])
+def test_only_an_inline_logo_being_viewed_gets_a_placeholder(why, download, status):
+    assert routes._no_bytes_response(why, download).status_code == status
+
+
+def test_the_placeholder_says_it_is_one():
+    """So an operator, a log and a test can tell a blank pixel from real bytes without parsing the
+    body — and so widening this later is a visible change rather than a quiet one."""
+    response = routes._no_bytes_response((attachment_ledger.DROPPED_DECORATIVE, True), 0)
+    assert response.headers["X-Attachment-Placeholder"] == attachment_ledger.DROPPED_DECORATIVE
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["Cache-Control"] == "no-store", \
+        "restoring the blob must take effect on the next load, not when a cache expires"
+    assert 'filename="placeholder.png"' in response.headers["Content-Disposition"], \
+        "it must not be named after the sender's document"
+
+
+def test_a_download_is_still_told_the_truth():
+    response = routes._no_bytes_response((attachment_ledger.DROPPED_DECORATIVE, True), 1)
+    assert b"not retained" in response.body
+    assert "X-Attachment-Placeholder" not in response.headers

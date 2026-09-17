@@ -8,7 +8,7 @@ calls that reset.
 """
 import pytest
 
-from pipeline import email_log, state_db
+from pipeline import email_log, mail_overrides, state_db
 
 
 @pytest.fixture
@@ -70,11 +70,11 @@ def count(conn, table: str, column: str, email_id: str) -> int:
 
 def test_only_the_named_emails_are_forgotten(conn):
     """The whole point: re-running the corpus must leave live-mailbox mail alone."""
-    for email_id in ("corpus-1", "<live@premierpm.com>"):
+    for email_id in ("corpus-1", "<live@example-pm.test>"):
         record_email(conn, email_id)
         ledger_row(conn, email_id)
         extracted_row(conn, email_id)
-        accumulate(conn, email_id, "208491", "50052 : 1")
+        accumulate(conn, email_id, "908491", "90052 : 1")
 
     state_db.forget_emails(conn, ["corpus-1"])
 
@@ -84,11 +84,11 @@ def test_only_the_named_emails_are_forgotten(conn):
     assert count(conn, "extracted_records", "source_email_id", "corpus-1") == 0
     assert count(conn, "accumulation", "email_id", "corpus-1") == 0
 
-    assert state_db.has_seen(conn, "<live@premierpm.com>")
-    assert count(conn, "email_log", "email_id", "<live@premierpm.com>") == 1
-    assert count(conn, "attachment_ledger", "email_id", "<live@premierpm.com>") == 1
-    assert count(conn, "extracted_records", "source_email_id", "<live@premierpm.com>") == 1
-    assert count(conn, "accumulation", "email_id", "<live@premierpm.com>") == 1
+    assert state_db.has_seen(conn, "<live@example-pm.test>")
+    assert count(conn, "email_log", "email_id", "<live@example-pm.test>") == 1
+    assert count(conn, "attachment_ledger", "email_id", "<live@example-pm.test>") == 1
+    assert count(conn, "extracted_records", "source_email_id", "<live@example-pm.test>") == 1
+    assert count(conn, "accumulation", "email_id", "<live@example-pm.test>") == 1
 
 
 def test_released_events_is_cleared_so_the_delivery_can_fire_again(conn):
@@ -96,8 +96,8 @@ def test_released_events_is_cleared_so_the_delivery_can_fire_again(conn):
     Leave the row behind and the re-run looks like it worked — Stage 2 just logs "duplicate notice
     for an already-released delivery" and stages nothing."""
     record_email(conn, "corpus-1")
-    accumulate(conn, "corpus-1", "208491", "50052 : 1")
-    release(conn, "208491", "50052 : 1")
+    accumulate(conn, "corpus-1", "908491", "90052 : 1")
+    release(conn, "908491", "90052 : 1")
 
     state_db.forget_emails(conn, ["corpus-1"])
 
@@ -109,8 +109,8 @@ def test_a_release_another_email_still_claims_is_left_alone(conn):
     others still account for."""
     for email_id in ("corpus-1", "corpus-2"):
         record_email(conn, email_id)
-        accumulate(conn, email_id, "208491", "50052 : 1")
-    release(conn, "208491", "50052 : 1")
+        accumulate(conn, email_id, "908491", "90052 : 1")
+    release(conn, "908491", "90052 : 1")
 
     state_db.forget_emails(conn, ["corpus-1"])
 
@@ -121,8 +121,8 @@ def test_a_null_shipment_number_still_matches(conn):
     """Shipment number is nullable, and `= NULL` matches nothing in SQL — the delete has to use
     `IS`, or every PO-only delivery silently keeps its release row."""
     record_email(conn, "corpus-1")
-    accumulate(conn, "corpus-1", "208491", None)
-    release(conn, "208491", None)
+    accumulate(conn, "corpus-1", "908491", None)
+    release(conn, "908491", None)
 
     state_db.forget_emails(conn, ["corpus-1"])
 
@@ -139,6 +139,26 @@ def test_it_reports_what_it_deleted(conn):
     assert deleted["attachment_ledger"] == 1
     assert deleted["seen_message_ids"] == 1
     assert deleted["extracted_records"] == 0
+
+
+def test_a_human_verdict_goes_with_the_mail_it_was_about(conn):
+    """The `_EMAIL_KEYED_TABLES` decision, asserted where it was made.
+
+    A person flags a message "not a delivery" because a triage rule got it wrong. Fixing that rule
+    and reprocessing is exactly the case where the flag must not survive: it would go on hiding a
+    real delivery for ever, silently, after the thing that caused it had been fixed.
+    """
+    record_email(conn, "corpus-1")
+    record_email(conn, "<live@example-pm.test>")
+    for email_id in ("corpus-1", "<live@example-pm.test>"):
+        mail_overrides.set_verdict(conn, email_id=email_id, verdict=mail_overrides.NOT_DELIVERY,
+                                   decided_by="Reviewer", at="2026-08-05T00:00:00Z")
+
+    deleted = state_db.forget_emails(conn, ["corpus-1"])
+
+    assert deleted["mail_overrides"] == 1
+    assert mail_overrides.get(conn, "corpus-1") is None
+    assert mail_overrides.get(conn, "<live@example-pm.test>") is not None
 
 
 def test_forgetting_nothing_is_a_no_op(conn):

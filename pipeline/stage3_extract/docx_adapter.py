@@ -10,13 +10,13 @@ from pipeline.stage3_extract.base import (
     ExtractionAdapter,
     ExtractionSource,
     build_record_from_row,
+    is_item_row,
     map_headers,
 )
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 from pipeline.stage3_extract.ocr_adapter import (
     DocumentIntelligenceClient,
     MockDocumentIntelligenceClient,
-    _empty_ocr_failure_record,
     analyze_with_retry,
     records_from_ocr_result,
 )
@@ -65,17 +65,17 @@ class DocxAdapter(ExtractionAdapter):
             column_map = map_headers(cells_grid[0])
             if not column_map:
                 continue
-            records.extend(build_record_from_row(source, row, column_map, "docx") for row in cells_grid[1:])
+            records.extend(build_record_from_row(source, row, column_map, "docx")
+                           for row in cells_grid[1:] if is_item_row(row))
         if records:
             return records
 
         for image_bytes in _extract_embedded_images(source.content_bytes):
+            # `analyze_with_retry` raises `OcrServiceUnavailable` when the service will not answer,
+            # and that is deliberately allowed to propagate: `dispatch` records it against this
+            # attachment so the outage is re-runnable. It used to be caught here and turned into a
+            # placeholder record, which made the ledger claim a successful extraction.
             result = analyze_with_retry(self.ocr_client, image_bytes, source.source_email_id)
-            if result is None:
-                record = _empty_ocr_failure_record(source)
-                record.extraction_source = "docx"
-                records.append(record)
-                continue
             records.extend(records_from_ocr_result(source, result, extraction_source="docx"))
         if records:
             return records
@@ -84,6 +84,7 @@ class DocxAdapter(ExtractionAdapter):
         text_source = ExtractionSource(
             source_email_id=source.source_email_id, email_date=source.email_date,
             source_type="body", body_text=text,
+            ledger_id=source.ledger_id, known_po_numbers=source.known_po_numbers,
         )
         records = FreetextAdapter().extract(text_source)
         for r in records:

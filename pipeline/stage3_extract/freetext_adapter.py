@@ -2,6 +2,7 @@ from typing import List
 
 from config import settings
 from pipeline.models import ExtractedRecord
+from pipeline.parsing import tokens
 from pipeline.stage3_extract import ai_fallback
 from pipeline.stage3_extract.base import (
     ExtractionAdapter,
@@ -11,6 +12,41 @@ from pipeline.stage3_extract.base import (
     regex_extract_fields,
     split_sub_spec,
 )
+
+
+def states_a_delivery(fields: PartialFields) -> bool:
+    """Whether a pass over running text found enough to claim goods were delivered.
+
+    **Two of the three**: the purchase order the goods were ordered on, the item, and how many of
+    it arrived. Any one of them alone is a mention, not a delivery.
+
+    Each single-field case was a real population in the live store, and none of them could ever be
+    completed by the person they were queued for:
+
+    - **a spec alone** — this pass read pages 2-5 of a receiving report and returned the report's
+      own number, `WRR-17`, as the spec of four separate deliveries. 102 records are a spec and
+      nothing else.
+    - **a purchase order alone** — 151 records carry a PO number and no item, no quantity and no
+      description. Every one sits at confidence 0.0, because `apply_confidence_floor` already knew
+      they said nothing; they were staged anyway. A body that names a PO is a body that mentions a
+      PO.
+    - **a quantity alone** — a number with no item against it names nothing that can be received.
+
+    The whole class is unambiguous: **529 records came from a text-only pass and not one has ever
+    been complete.** Only 13 name a purchase order in their own text; the rest were handed the
+    delivery event's PO afterwards, which made a passing mention look like an attributable receipt.
+
+    Evidence the pass did find — a purchase order mentioned, a date, a carrier — is not lost by
+    returning nothing here. It is already stored whole against the attachment in
+    `parsed_documents`, and the message still reaches a person through its own queue row rather
+    than through a line item that claims goods arrived.
+    """
+    stated = (
+        tokens.is_po_number(fields.po_number or ""),
+        bool(fields.spec_code),
+        fields.quantity_received is not None,
+    )
+    return sum(stated) >= 2
 
 # Kept as a public alias — this is the name other modules/tests import for the regex-only pass.
 extract_fields_from_text = regex_extract_fields
@@ -41,6 +77,9 @@ class FreetextAdapter(ExtractionAdapter):
             )
             extraction_source = "freetext+ai"
 
+        if not states_a_delivery(fields):
+            return []
+
         parent_spec, sub_spec = split_sub_spec(fields.spec_code)
         confidence = 0.3 if fields.po_number else 0.0
         if extraction_source == "freetext+ai":
@@ -66,5 +105,6 @@ class FreetextAdapter(ExtractionAdapter):
             extraction_source=extraction_source,
             extraction_confidence=confidence,
             raw_snippet=text[:500],
+            source_ledger_id=source.ledger_id,
         )
         return [apply_confidence_floor(record)]

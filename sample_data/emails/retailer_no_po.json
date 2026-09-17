@@ -1,8 +1,8 @@
 {
-  "email_id": "wayfair_no_po",
+  "email_id": "retailer_no_po",
   "received_at": "2025-10-01T18:00:00Z",
-  "sender_address": "marketing@wayfair.com",
-  "sender_domain": "wayfair.com",
+  "sender_address": "marketing@example-retail.test",
+  "sender_domain": "example-retail.test",
   "subject": "It's delivery day!",
   "body_html": null,
   "body_text": "Great news - your order is arriving today.",

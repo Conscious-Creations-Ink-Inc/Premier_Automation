@@ -19,7 +19,7 @@ Blast radius is controlled three ways:
    gate that Premier's own receipts route through.
 3. DELETE is allowed only against keys this run created, tracked in `self.mine`.
 
-    python tools/spitfire_write_probe.py --i-understand-this-writes [--po 207030]
+    python tools/spitfire_write_probe.py --i-understand-this-writes [--po 907030]
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ class WriteProbe:
         (out / "bodies").mkdir(parents=True, exist_ok=True)
         self.s = requests.Session()
         self.s.cookies.set("sfPMSAuth", env["SPITFIRE_SESSION_COOKIE"].strip(),
-                           domain="training.remingtonhotels.com", path="/")
+                           domain="training.example-hotels.test", path="/")
         self.receipt_type = env["SPITFIRE_RECEIPT_DOC_TYPE_KEY"].strip()
         self.po_type = env["SPITFIRE_PO_DOC_TYPE_KEY"].strip()
         self.records: List[Dict[str, Any]] = []
@@ -326,9 +326,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--i-understand-this-writes", action="store_true", required=True,
                     help="required acknowledgement; this creates documents on training")
-    ap.add_argument("--po", default="207030")
+    ap.add_argument("--po", default="907030")
     ap.add_argument("--po-key", default="e2448751-9201-4cb9-8cf5-1000f3c303c7")
-    ap.add_argument("--project", default="MRC024PB100003")
+    ap.add_argument("--project", default="PRJ001PB100003")
     ap.add_argument("--timeout", type=float, default=45.0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

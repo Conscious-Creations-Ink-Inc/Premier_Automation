@@ -130,19 +130,29 @@ def resolve(email_id: str, *, db_path=None) -> Mail:
 def _from_accumulation(email_id: str, db_path) -> Optional[Mail]:
     conn = _pipeline_conn(db_path)
     try:
+        # Both homes for the payload. It lives once per message in `accumulation_payload`; rows
+        # written before that table existed still carry it inline on the accumulation row. Reading
+        # only one of the two would blank the body for exactly half the mailbox, depending on
+        # whether the de-duplication migration had been run.
         row = conn.execute(
-            "SELECT payload_json FROM accumulation WHERE email_id = ? LIMIT 1", (email_id,)
+            "SELECT COALESCE(NULLIF(a.payload_json, ''), p.payload_json) AS payload_json "
+            "  FROM accumulation a "
+            "  LEFT JOIN accumulation_payload p ON p.email_id = a.email_id "
+            " WHERE a.email_id = ? LIMIT 1", (email_id,)
         ).fetchone()
     finally:
         conn.close()
-    if row is None:
+    if row is None or not row["payload_json"]:
         return None
 
     payload = json.loads(row["payload_json"])
     email = payload.get("email") or payload
     attachments = []
     for i, a in enumerate(email.get("attachments") or []):
-        raw = a.get("content_bytes")
+        # `content_b64` is what `stage2_accumulate._serialize_triaged_email` writes (:85). This
+        # read `content_bytes`, a key no payload has ever carried, so the viewer could not see the
+        # 2,690 inline copies that are in there and fell through to the store every time.
+        raw = a.get("content_b64") or a.get("content_bytes")
         content = base64.b64decode(raw) if isinstance(raw, str) and raw else None
         attachments.append(Attachment(
             ordinal=i, filename=a.get("filename") or f"attachment-{i}",
@@ -186,10 +196,19 @@ def _from_corpus(email_id: str, db_path=None) -> Optional[Mail]:
 
 
 def _from_graph(email_id: str, db_path=None) -> Optional[Mail]:
-    """Fetch one message by its internetMessageId. Read-only: two GETs and nothing else."""
+    """Fetch one message by its internetMessageId. Read-only: two GETs and nothing else.
+
+    **A truncated id is matched with `startswith`.** Rows on the Mail page that have not been
+    through the pipeline yet carry the id the metadata-only arrival watch recorded, and Graph cuts
+    that at 255 characters unless `$select` asks for the body — see `mail_arrivals.ID_MATCH_LEN`.
+    An `eq` on a cut id matches nothing, so every such row answered "this message could not be
+    found in any source we can still read" while sitting in the Inbox. 26 of them, at the time this
+    was written.
+    """
     import requests
 
     from operations.inbox import GRAPH_BASE_URL, _token
+    from pipeline.mail_arrivals import ID_MATCH_LEN
 
     mailbox = settings.GRAPH_MAILBOX_ADDRESS
     if not mailbox or not settings.GRAPH_CLIENT_ID:
@@ -197,23 +216,37 @@ def _from_graph(email_id: str, db_path=None) -> Optional[Mail]:
 
     headers = {"Authorization": f"Bearer {_token()}"}
     quoted = email_id.replace("'", "''")
+    truncated = len(email_id) == ID_MATCH_LEN and not email_id.endswith(">")
+    where = (f"startswith(internetMessageId, '{quoted}')" if truncated
+             else f"internetMessageId eq '{quoted}'")
     listing = requests.get(
         f"{GRAPH_BASE_URL}/users/{mailbox}/messages",
         headers=headers,
-        params={"$filter": f"internetMessageId eq '{quoted}'",
-                "$select": "id,subject,from,receivedDateTime,body,hasAttachments", "$top": 1},
+        # `internetMessageId` is selected so the id Graph knows this message by can be adopted
+        # below; `$top=2` so an ambiguous prefix is detected rather than silently resolved to
+        # whichever message the server happened to list first.
+        params={"$filter": where,
+                "$select": "id,internetMessageId,subject,from,receivedDateTime,body,hasAttachments",
+                "$top": 2},
         timeout=30,
     )
     listing.raise_for_status()
     items = listing.json().get("value") or []
-    if not items:
+    if not items or len(items) > 1:
+        # More than one is as unusable as none: opening the wrong message is worse than saying the
+        # message could not be opened. `resolve()` reports what it tried either way.
         return None
     item = items[0]
 
     body = item.get("body") or {}
     is_html = (body.get("contentType") or "").lower() == "html"
     mail = Mail(
-        email_id=email_id,
+        # The id **Graph returned**, not the one we asked with. Everything downstream keys on this —
+        # `_cache` writes `mail_body` and `mail_attachment` under it, `_attach_verdicts` and
+        # `attachment_bytes` look up `attachment_ledger` by it — and the pipeline stores those rows
+        # under the full id. Keying them on a truncated id would build a second, orphaned cache
+        # entry per message and show no attachment verdicts for any of them.
+        email_id=item.get("internetMessageId") or email_id,
         subject=item.get("subject") or "",
         sender=(((item.get("from") or {}).get("emailAddress") or {}).get("address") or ""),
         received_at=str(item.get("receivedDateTime") or "")[:19].replace("T", " "),
@@ -396,6 +429,24 @@ def _body_frame(mail: Mail, remote_images: bool = False,
             f'srcdoc="{srcdoc}" title="Message body"></iframe>')
 
 
+def _url(base: str, **params) -> str:
+    """Add query parameters to a URL that may already have some.
+
+    `?` or `&` depending on what `base` already carries. Both callers of this used to write `?`
+    unconditionally, and `api/ui/routes.py:4673` hands them `/ui/mail/attachment?src=inbox` — so
+    every inline image in every message asked for `…/attachment?src=inbox?id=<…>&n=3`. A URL has
+    one query string: the server read that as `src="inbox?id=<…>"` with **no `id` at all**, and
+    `_store_for` maps an unrecognised `src` to the sample corpus, so it 404'd. Every `cid:` image
+    in every stored message body has been a broken icon, and the Download link and thumbnail
+    alongside it had the same defect.
+
+    Values are escaped here so no caller has to remember to; a message id is
+    `<DM4PR14MB4831…@…>`, which is angle brackets and an `@` in a query string.
+    """
+    joiner = "&" if "?" in base else "?"
+    return base + joiner + "&".join(f"{key}={_q(str(value))}" for key, value in params.items())
+
+
 def _resolve_inline_images(mail: Mail, attachment_url: str) -> str:
     """Point every `cid:` reference at the attachment route so the message's own images render.
 
@@ -413,14 +464,13 @@ def _resolve_inline_images(mail: Mail, attachment_url: str) -> str:
         if a.content_id:
             by_cid[a.content_id.strip("<>").lower()] = a.ordinal
 
-    email_id = _q(mail.email_id)
 
     def replace(match: "re.Match") -> str:
         prefix, cid = match.group(1), match.group(2).strip("<>").lower()
         ordinal = by_cid.get(cid)
         if ordinal is None:
             return match.group(0)   # the .msg genuinely does not carry this image
-        return f"{prefix}{attachment_url}?id={email_id}&n={ordinal}"
+        return prefix + _url(attachment_url, id=mail.email_id, n=ordinal)
 
     return _CID_RE.sub(replace, mail.body_html or "")
 
@@ -449,7 +499,7 @@ def _attachments(mail: Mail, attachment_url: str, view_url: str = "", db_path=No
             if a.verdict_detail:
                 verdict += f' <span class="muted">{e(a.verdict_detail)}</span>'
 
-        href = f"{attachment_url}?id={_q(mail.email_id)}&n={a.ordinal}"
+        href = _url(attachment_url, id=mail.email_id, n=a.ordinal)
         open_at = f"{view_url}&n={a.ordinal}" if view_url else ""
         name = (f'<button type="button" class="link-btn att-open" data-frag="{e(open_at)}">'
                 f'{e(a.filename)}</button>') if open_at else f"<b>{e(a.filename)}</b>"

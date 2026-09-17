@@ -19,7 +19,7 @@ Premier's own export (`dev_reports/SampleReceiverFiles/_Spitfire-LIVE_General_Re
   after Order Qty arrives.
 
 The group row above each PO is Spitfire's **project code** in Premier's export
-(`MRC-024-PB-1-00002 : ...`). We do not have it — it comes from the PO — so that row carries the
+(`PRJ-001-PB-1-00002 : ...`). We do not have it — it comes from the PO — so that row carries the
 PO's own title until `pipeline/spitfire_mirror.py` can supply the real one.
 
 The grouping — PO, then line, then the receipts underneath — is a first pass that lives here

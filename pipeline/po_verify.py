@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Sequence
 from api.services import reconcile
 from api.stores.po_lines_store import POLineRow
 from config import settings
-from connectors.spitfire import PODocument, SpitfireReadClient
+from connectors.spitfire import PO_UNREACHABLE, PODocument, SpitfireReadClient
 from pipeline import spitfire_mirror
 from pipeline.models import POLine
 
@@ -204,6 +204,16 @@ class RecordVerification:
     """Every receivable line on the PO. Populated always, shown only where the screen decides it
     helps — the module states facts and leaves presentation to the caller."""
     line_count: int = 0
+    ambiguous: bool = False
+    """True when *nothing* chose the matched line — several tied, neither the unit nor the
+    description separated them, and the head of the list was taken.
+
+    Narrower than "more than one line matched", which on a signage PO is true of nearly every
+    record: all 29 lines of PO 907514 carry one spec in one unit, so the description is the only
+    thing that ever identifies a line, and it usually does. The note beside it says all this in
+    prose; this says it in a form a caller can act on, because anything deciding on the back of
+    `matched` needs to know whether the line was resolved or merely picked.
+    """
     notes: List[str] = field(default_factory=list)
     source: str = SOURCE_LIVE
     read_at: Optional[str] = None
@@ -312,7 +322,7 @@ def verify_record(facts: RecordFacts, doc: Optional[PODocument],
     # the top candidate would otherwise be an arbitrary line whenever the mail gave no spec and no
     # usable description — and the screen would show quantities from a line nobody identified.
     candidates = [c for c in candidates if c.spec_signal or c.desc_signal]
-    best, tied = _pick_line(facts, candidates)
+    best, tied, decided_by = _pick_line(facts, candidates)
 
     if best is None:
         result.notes.extend(_no_line_notes(facts, result))
@@ -321,7 +331,8 @@ def verify_record(facts: RecordFacts, doc: Optional[PODocument],
 
     line = best.po_line.line
     if tied:
-        result.notes.append(_ambiguity_note(facts, best, tied))
+        result.ambiguous = decided_by is None
+        result.notes.append(_ambiguity_note(facts, best, tied, decided_by))
     result.matched = _line_check(facts, line, spec_resolved=best.spec_signal)
     result.notes.extend(_line_notes(facts, result.matched, best))
     _append_package_note(facts, result)
@@ -367,10 +378,10 @@ def _line_check(facts: RecordFacts, line: POLine, *, spec_resolved: bool,
 
 
 def _pick_line(facts: RecordFacts, candidates: Sequence):
-    """Choose between lines that score identically. Returns `(best, others_it_beat)`.
+    """Choose between lines that score identically.
 
     The scorer ranks on signals then description similarity, and that is not enough on a real PO.
-    Live example, 210635: spec `GR-350c-WTF` appears on **two** lines — 0001 is 84 YD of sheer
+    Live example, 910635: spec `GR-350c-WTF` appears on **two** lines — 0001 is 84 YD of sheer
     fabric, 0003 is a 1 EA tariff surcharge on it. Both match the spec exactly, so both score two
     signals, and the surcharge's shorter description won on similarity. The screen then reported
     "84 YD is 83 more than the 1 EA ordered", which is not a discrepancy in Premier's data at all —
@@ -384,9 +395,15 @@ def _pick_line(facts: RecordFacts, candidates: Sequence):
     make this screen worthless.
 
     Anything the tie-break does not settle is reported rather than silently resolved.
+
+    Returns `(best, others_it_beat, decided_by)`. `decided_by` is `"signals"`, `"unit"` or
+    `"description"` when something actually chose, and **None** when nothing did and the top of the
+    list was taken. That distinction is not cosmetic: a caller acting on the match — clearing a
+    quantity-conflict marker, say — needs to know whether the line was resolved or merely picked,
+    and the note below needs it to state the real reason rather than guess one afterwards.
     """
     if not candidates:
-        return None, []
+        return None, [], None
 
     # An exact spec match outranks any number of fuzzy ones. `rank_candidates` sorts on signal
     # count then description similarity, which treats the spec as one vote of three — and on real
@@ -407,23 +424,47 @@ def _pick_line(facts: RecordFacts, candidates: Sequence):
     top = candidates[0].signals_matched
     tied = [c for c in candidates if c.signals_matched == top]
     if len(tied) == 1:
-        return tied[0], []
+        return tied[0], [], "signals"
 
     ours = uom_key(facts.unit_of_measure)
     if ours:
         by_unit = [c for c in tied if uom_key(c.po_line.line.unit_of_measure) == ours]
         if len(by_unit) == 1:
-            return by_unit[0], [c for c in tied if c is not by_unit[0]]
+            return by_unit[0], [c for c in tied if c is not by_unit[0]], "unit"
         if by_unit:
             tied = by_unit
 
-    return tied[0], tied[1:]
+    # `rank_candidates` has already sorted these by description score, so the head beat the rest on
+    # description whenever the scores differ at all — that is a decision, and a real one: on
+    # PO 907514 every one of 29 lines carries spec `LOB-900-SI` in `EA`, so signals and unit
+    # separate nothing and the description is the only thing that ever identifies the line.
+    # Only an outright draw is undecided, and that is the one case reported as such.
+    if len(tied) > 1 and tied[0].desc_score > tied[1].desc_score:
+        return tied[0], tied[1:], "description"
+
+    return tied[0], tied[1:], None
 
 
-def _ambiguity_note(facts: RecordFacts, best, others: Sequence) -> str:
-    """Name the lines that were not chosen. A reader who cannot see the alternatives cannot tell a
-    confident match from a coin toss, and on a PO with a surcharge line the difference is the whole
-    answer."""
+_WHY_CHOSEN = {
+    "unit": "its unit matches the email's",
+    "description": "it scored highest on description",
+    None: "nothing separated it from the others and it was first in the list",
+}
+
+
+def _ambiguity_note(facts: RecordFacts, best, others: Sequence,
+                    decided_by: Optional[str]) -> str:
+    """Name the lines that were not chosen, and say what actually chose. A reader who cannot see the
+    alternatives cannot tell a confident match from a coin toss, and on a PO with a surcharge line
+    the difference is the whole answer.
+
+    `decided_by` comes from `_pick_line` rather than being re-derived here. Re-deriving it got the
+    answer wrong in exactly the case that matters: it re-tested the unit, so when *several* tied
+    lines shared the email's unit — all 29 `LOB-900-SI` lines on PO 907514 are `EA` — the unit
+    branch had not fired, the choice had fallen through to the head of the list, and the note still
+    announced "because its unit matches the email's". It claimed to have identified a line at the
+    exact moment it had given up trying.
+    """
     def describe(candidate) -> str:
         line = candidate.po_line.line
         number = f"line {line.line_number:04d}" if line.line_number is not None else "an unnumbered line"
@@ -432,12 +473,9 @@ def _ambiguity_note(facts: RecordFacts, best, others: Sequence) -> str:
     chosen = describe(best)
     rest = ", ".join(describe(c) for c in others)
     spec = facts.stated_spec or "this description"
-    reason = ("its unit matches the email's" if uom_key(facts.unit_of_measure)
-              == uom_key(best.po_line.line.unit_of_measure)
-              else "it scored highest on description")
     return (f"More than one line on this purchase order matches {spec}: {chosen} and {rest}. "
-            f"{chosen[0].upper() + chosen[1:]} was used because {reason} — check it is the right "
-            f"one.")
+            f"{chosen[0].upper() + chosen[1:]} was used because {_WHY_CHOSEN[decided_by]} — check "
+            f"it is the right one.")
 
 
 def _no_line_notes(facts: RecordFacts, result: RecordVerification) -> List[str]:
@@ -551,7 +589,9 @@ def _append_package_note(facts: RecordFacts, result: RecordVerification) -> None
 def verify_records(conn: sqlite3.Connection, rows: Sequence,
                    *, workers: int = DEFAULT_WORKERS,
                    client_factory=None,
-                   chosen_line: Optional[int] = None) -> List[RecordVerification]:
+                   chosen_line: Optional[int] = None,
+                   chosen_lines: Optional[Sequence[Optional[int]]] = None
+                   ) -> List[RecordVerification]:
     """Verify every record in `rows`, reading each distinct PO from Spitfire once.
 
     Threads do the reading; the sqlite connection stays on the calling thread. Mirror refreshes and
@@ -561,12 +601,32 @@ def verify_records(conn: sqlite3.Connection, rows: Sequence,
     `chosen_line` is a reviewer's override from the popup and only makes sense for one record, so
     it is applied only when `rows` holds one. "Verify all" passes none, and a line number chosen
     against one PO would be meaningless against another anyway.
+
+    `chosen_lines` is the same override for **many** rows at once — one entry per row, positionally,
+    `None` where that record has no choice. It exists for posting a whole delivery: those rows are
+    all on one purchase order and each may carry its own reviewer-chosen line, which the singular
+    form has no way to express and would silently drop. Posting twenty records by calling this
+    twenty times would read the same order twenty times on a request a person is watching; passing
+    them together reads it once and still honours every choice.
+
+    The two are mutually exclusive rather than merged, because a caller that passed both would have
+    no way to say which it meant.
     """
+    if chosen_lines is not None and chosen_line is not None:
+        raise ValueError("pass chosen_line or chosen_lines, not both")
+
     facts = [facts_from_row(row) for row in rows]
-    pick = chosen_line if len(facts) == 1 else None
+    if chosen_lines is not None:
+        picks: List[Optional[int]] = list(chosen_lines)
+        if len(picks) != len(facts):
+            raise ValueError(
+                f"chosen_lines has {len(picks)} entries for {len(facts)} rows — they are matched "
+                f"positionally, so a short list would apply one record's line to another")
+    else:
+        picks = [chosen_line if len(facts) == 1 else None] * len(facts)
     po_numbers = sorted({f.po_number for f in facts if f.po_number})
     if not po_numbers:
-        return [verify_record(f, None, [], pick) for f in facts]
+        return [verify_record(f, None, [], picks[i]) for i, f in enumerate(facts)]
 
     factory = client_factory or (lambda: SpitfireReadClient(timeout=UI_TIMEOUT))
     keys = {po: spitfire_mirror.doc_key_for(conn, po) for po in po_numbers}
@@ -576,9 +636,25 @@ def verify_records(conn: sqlite3.Connection, rows: Sequence,
         # and sharing one `requests.Session` across threads is the bug this avoids.
         client = factory()
         try:
-            key = keys.get(po_number) or client.resolve_po(po_number)
+            key = keys.get(po_number)
             if not key:
-                return po_number, None, None
+                # The outcome-aware form, so "Spitfire has no such purchase order" is only ever
+                # said when Spitfire actually answered. Every strategy inside `resolve_po`
+                # swallows its own HTTP failure, so the plain call cannot tell an absent PO from
+                # an unreachable one — and reporting an outage as absence would quietly close the
+                # whole backlog as nothing anyone can act on.
+                with_outcome = getattr(client, "resolve_po_with_outcome", None)
+                if with_outcome is None:
+                    # A client that predates the outcome-aware form — the recorded cassettes and
+                    # the test doubles. It can still answer the only question that mattered
+                    # before, so it keeps working; it simply cannot distinguish the two empties.
+                    key, outcome = client.resolve_po(po_number), None
+                else:
+                    key, outcome = with_outcome(po_number)
+                if not key:
+                    if outcome == PO_UNREACHABLE:
+                        return po_number, None, "the purchase order could not be looked up"
+                    return po_number, None, None
             return po_number, client.read_po(key), None
         except Exception as exc:                   # noqa: BLE001
             _logger.warning("live read of PO %s failed: %s", po_number, exc)
@@ -602,7 +678,7 @@ def verify_records(conn: sqlite3.Connection, rows: Sequence,
                 _logger.warning("could not mirror PO %s: %s", po_number, exc)
 
     results = []
-    for f in facts:
+    for index, f in enumerate(facts):
         doc = docs.get(f.po_number)
         error = errors.get(f.po_number)
         header = None
@@ -615,7 +691,7 @@ def verify_records(conn: sqlite3.Connection, rows: Sequence,
             source = SOURCE_MIRROR if lines else SOURCE_LIVE
             read_at = spitfire_mirror.refreshed_at(conn, f.po_number)
             header = spitfire_mirror.header_for(conn, f.po_number)
-        result = verify_record(f, doc, lines, pick)
+        result = verify_record(f, doc, lines, picks[index])
         if header:
             # The mirror knows the vendor and the status too. Without this the fallback shows
             # quantities under a blank header, which reads as data we do not have rather than as

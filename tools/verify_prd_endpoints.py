@@ -44,7 +44,7 @@ from config import settings  # noqa: E402
 
 # A PO that exists, is in the first configured project, and has receivable lines. Used for the
 # resolution walk-through the PRD prints verbatim.
-SAMPLE_PO = "212559"
+SAMPLE_PO = "912559"
 SAMPLE_PO_KEY = "1023ab34-f62c-4a2f-9d73-4c73446d3473"
 
 PO_FILTER = {
@@ -224,14 +224,16 @@ def main() -> int:
                         help="also re-prove the write shapes; CREATES a CC-TEST receipt")
     args = parser.parse_args()
 
-    cookie = settings.SPITFIRE_SESSION_COOKIE
+    from connectors import spitfire_auth
+    cookie = spitfire_auth.auth_ticket_value(settings.SPITFIRE_BASE_URL)
     if not cookie:
-        print("SPITFIRE_SESSION_COOKIE is not set — nothing can be probed.")
+        print("No Spitfire credentials: set SPITFIRE_UID and SPITFIRE_PW in .env.")
         return 1
 
     session = requests.Session()
     session.cookies.set("sfPMSAuth", cookie,
-                        domain="training.remingtonhotels.com", path="/")
+                        domain=requests.utils.urlparse(settings.SPITFIRE_BASE_URL).hostname,
+                        path="/")
     base = settings.SPITFIRE_BASE_URL
     print(f"probing {base}")
 

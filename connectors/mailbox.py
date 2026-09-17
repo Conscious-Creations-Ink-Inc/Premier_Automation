@@ -3,13 +3,15 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Optional, Set
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Set
 
 import msal
 import requests
 
 from config import settings
-from pipeline import attachment_store
+from pipeline import attachment_ledger, attachment_store
+from pipeline.mail_arrivals import ID_MATCH_LEN
 from pipeline.models import Attachment, RawEmail
 
 _logger = logging.getLogger(__name__)
@@ -17,6 +19,35 @@ _logger = logging.getLogger(__name__)
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 MAX_PAGES_PER_POLL = 20   # 20 x $top=50 = 1000 messages; a guard, not a real ceiling
 GRAPH_WELL_KNOWN_FOLDERS = {"inbox", "drafts", "sentitems", "deleteditems", "archive", "junkemail", "outbox"}
+
+
+def _capped_retry_class():
+    """`urllib3.Retry` with `Retry-After` bounded by `settings.GRAPH_RETRY_AFTER_CAP_SECONDS`.
+
+    Built lazily, like the session below, so importing this module costs no urllib3 import. The
+    stock class obeys whatever the server says: one throttle response reading `Retry-After: 3600`
+    held a run inside a single call for an hour, where no stop and no ceiling could reach it and
+    the console showed a spinner with nothing to say.
+    """
+    from urllib3.util.retry import Retry
+
+    class CappedRetry(Retry):
+        def get_retry_after(self, response):
+            wait = super().get_retry_after(response)
+            if wait is None:
+                return None
+            return min(wait, float(settings.GRAPH_RETRY_AFTER_CAP_SECONDS))
+
+    return CappedRetry
+
+
+class StopRequested(Exception):
+    """Raised inside a Graph read when the run it belongs to has been asked to stop.
+
+    Carries nothing and is caught by `GraphMailbox.fetch_new`, which ends the listing and returns
+    what it has already built. Nothing is marked seen during a read, so the mail it did not reach is
+    simply read next time.
+    """
 
 
 def _graph_session() -> requests.Session:
@@ -31,10 +62,9 @@ def _graph_session() -> requests.Session:
     poll makes one call per page plus one per message with attachments.
     """
     from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
 
     session = requests.Session()
-    retry = Retry(
+    retry = _capped_retry_class()(
         total=3,
         backoff_factor=1,
         status_forcelist=(429, 500, 502, 503, 504),
@@ -47,8 +77,54 @@ def _graph_session() -> requests.Session:
     return session
 
 
+class _TimeboxedHttp:
+    """A `requests` session for MSAL that always carries a timeout.
+
+    MSAL builds its own session when it is not handed one, and calls it with no `timeout` — so a
+    token request against an unresponsive `login.microsoftonline.com` blocks the calling thread
+    indefinitely. Every Graph data call below has had `timeout=` since the connector was written;
+    this is the one call that did not, and it is the one that ran the automation into the ground:
+    two runs held the runner's lock for twelve and thirty-six hours respectively, blocked here,
+    while the console reported them as still running.
+
+    MSAL only needs `get` and `post`, so this stays a two-method shim over the pooled, retrying
+    session rather than a session subclass. `timeout` is `setdefault`, not forced, so MSAL may
+    still ask for something shorter.
+    """
+
+    def __init__(self, timeout: int):
+        self._timeout = timeout
+
+    def get(self, *args, **kwargs):
+        kwargs.setdefault("timeout", self._timeout)
+        return _SESSION.get(*args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        kwargs.setdefault("timeout", self._timeout)
+        return _SESSION.post(*args, **kwargs)
+
+
 _SESSION = _graph_session()
 
+
+@dataclass
+class RecoveredMail:
+    """What a by-id recovery found, and what it proved was not there.
+
+    Two lists rather than one, because "we did not get it" has two meanings that must never be
+    conflated. `absent` is only for a message the server *answered about* and did not have; a
+    request that failed — auth, throttling, a dropped connection — leaves the id out of **both**
+    lists, so the caller retries it next run.
+
+    This started as a bare `List[RawEmail]`, and the caller inferred absence from whatever was
+    missing out of what it asked for. That is wrong in the one direction that matters: a transient
+    failure would have been recorded as "gone from the mailbox" and the message suppressed for
+    good. On a mailbox where the point of the exercise is that a purchase-order email must not be
+    lost, silence has to mean "ask again", never "it is gone".
+    """
+
+    emails: List[RawEmail] = field(default_factory=list)
+    absent: List[str] = field(default_factory=list)
 
 class Mailbox(ABC):
     @abstractmethod
@@ -61,6 +137,25 @@ class Mailbox(ABC):
         ISO-8601 UTC instant a connector may use to narrow its listing server-side. Both default to
         None, so a connector reading a fixed local folder need do nothing with either.
         """
+
+    def fetch_by_ids(self, email_ids: Sequence[str]) -> "RecoveredMail":
+        """Specific messages by `internetMessageId`, ignoring any time window.
+
+        The escape hatch from `fetch_new`'s watermark. That listing asks the server only for mail
+        newer than the last clean run, which is a cost optimisation that quietly became a
+        correctness hole: a message the pipeline never settled but whose `receivedDateTime` now
+        sits behind the window can never appear in a listing again. On 2026-09-03 that was 24
+        messages reaching back to 2026-08-31, one of them an urgent purchase-order email, all of
+        them recorded in `mail_arrivals` and none in `email_log`.
+
+        A window cannot fix that, whatever it is widened to — the miss is by id, so the recovery
+        has to be by id.
+
+        Concrete, not abstract, and returning nothing by default: a connector reading a fixed
+        local folder has no such window and therefore no such gap, and must not be forced to
+        implement a method it cannot need. Nothing found and nothing proved absent.
+        """
+        return RecoveredMail()
 
     @abstractmethod
     def mark_processed(self, email_id: str, folder: str) -> None: ...
@@ -131,11 +226,16 @@ class GraphMailbox(Mailbox):
         client_secret: Optional[str] = None,
         mailbox_address: Optional[str] = None,
         read_only: bool = False,
+        folders: Optional[Sequence[str]] = None,
     ):
         self.tenant_id = tenant_id or settings.GRAPH_TENANT_ID
         self.client_id = client_id or settings.GRAPH_CLIENT_ID
         self.client_secret = client_secret or settings.GRAPH_CLIENT_SECRET
         self.mailbox_address = mailbox_address or settings.GRAPH_MAILBOX_ADDRESS
+        self.folders = tuple(folders or settings.MAILBOX_SOURCE_FOLDERS)
+        """Which folders `fetch_new` lists, as Graph well-known names. Injectable so a test can
+        pin one folder without reaching into settings, and so a mailbox with a different shape can
+        be read without a code change."""
         self.read_only = read_only
         """When set, `mark_processed` records the folder it *would* have moved to and touches
         nothing — no move, and no folder created either, since `_resolve_folder_id` creates the
@@ -156,8 +256,23 @@ class GraphMailbox(Mailbox):
             self.client_id,
             authority=settings.GRAPH_AUTHORITY_TEMPLATE.format(tenant_id=self.tenant_id),
             client_credential=self.client_secret,
+            http_client=_TimeboxedHttp(settings.GRAPH_AUTH_TIMEOUT_SECONDS),
         )
         self._folder_id_cache: dict = {}  # display name -> resolved folder id, so repeated moves don't re-lookup
+
+        # Set by the run that owns this mailbox, never by the connector itself. Both default to
+        # None so the arrival watch, the tools and the tests behave exactly as before.
+        #
+        # `should_stop` is asked before every Graph call made while reading. Reading used to be one
+        # uninterruptible stretch — every page listed and every body and attachment downloaded
+        # into a list before the run's own stop check was ever reached — so a run sat on "Reading
+        # the mailbox" for as long as that took, with Stop, the kill switch and the ceiling all
+        # unable to reach it. Asked here, a stop lands within one call.
+        #
+        # `on_activity` is told after every call that returned, which is what the console's stall
+        # watchdog measures. A read that is slow keeps it moving; a read that is hung does not.
+        self.should_stop = None
+        self.on_activity = None
 
     def _access_token(self) -> str:
         result = self._app.acquire_token_silent(settings.GRAPH_SCOPE, account=None)
@@ -172,9 +287,32 @@ class GraphMailbox(Mailbox):
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._access_token()}"}
 
+    def _checkpoint(self, note: str = "") -> None:
+        """Report activity, then honour a stop. Called around every Graph call made while reading.
+
+        Activity first: a call that just came back *is* progress, even if the next thing that
+        happens is stopping, and the watchdog should not read the gap before a stop as a stall.
+        """
+        if self.on_activity is not None:
+            try:
+                self.on_activity(note)
+            except Exception:                                    # noqa: BLE001
+                _logger.debug("activity callback failed; continuing", exc_info=True)
+        if self.should_stop is not None and self.should_stop():
+            raise StopRequested()
+
     def fetch_new(self, skip_ids: Optional[Set[str]] = None,
                   since: Optional[str] = None) -> List[RawEmail]:
-        """Every message in the Inbox we have not already settled, following pagination, oldest first.
+        """Every message in the source folders we have not already settled, oldest first per folder.
+
+        **Folders, plural.** This read `/mailFolders/Inbox/messages` until 2026-08-24, when
+        Exchange junked an Authority Inbound Notification for PO 912614 and the pipeline was
+        structurally incapable of noticing: no row in `mail_arrivals`, none in `email_log`, none
+        anywhere. `settings.MAILBOX_SOURCE_FOLDERS` names what to read instead.
+
+        Merging folders is safe without any extra bookkeeping because `skip_ids` matches on
+        `internetMessageId`, which is stable across folders — unlike Graph's own `id`, which is
+        folder-scoped. A message somehow listed from two folders costs one set lookup.
 
         Five things this gets right, four of them fixes over the original single-page call:
 
@@ -203,46 +341,171 @@ class GraphMailbox(Mailbox):
         """
         skip = skip_ids or frozenset()
         headers = self._headers()
-        url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/mailFolders/Inbox/messages"
-        params = {
-            "$top": 50,
-            "$orderby": "receivedDateTime asc",
-            "$select": "id,internetMessageId,receivedDateTime,subject,from,body,hasAttachments",
-        }
-        if since:
-            # `ge`, not `gt`: the caller already backdates this by an overlap window, and the
-            # seen-set is what actually prevents re-processing. Erring towards listing a message
-            # twice costs one skipped row; erring the other way loses it for good.
-            params["$filter"] = f"receivedDateTime ge {since}"
-
         emails: List[RawEmail] = []
-        pages = 0
+        try:
+            self._list_folders(skip, since, headers, emails)
+        except StopRequested:
+            # Not an error and not a partial failure: the run was asked to stop. What was already
+            # built is returned so the caller's own stop check ends the run cleanly, and nothing
+            # was marked seen, so the mail this never reached is read next time.
+            _logger.info("read stopped on request after %s message(s)", len(emails))
+            return emails
+        return emails
+
+    def _list_folders(self, skip, since, headers, emails: List[RawEmail]) -> None:
+        """The body of `fetch_new`, split out so a stop can unwind every nested loop in one raise."""
         skipped = 0
-        while url and pages < MAX_PAGES_PER_POLL:
-            resp = _SESSION.get(url, headers=headers, params=params if pages == 0 else None, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            for msg in payload.get("value", []):
-                # Before the try: a message we have already settled costs one set lookup, not a
-                # body and a round of attachment downloads.
-                if msg.get("internetMessageId") in skip:
-                    skipped += 1
-                    continue
-                try:
-                    emails.append(self._to_raw_email(msg, headers))
-                except Exception as e:
-                    _logger.warning("skipping message %s: %s: %s",
-                                    msg.get("id"), type(e).__name__, e, exc_info=True)
-            url = payload.get("@odata.nextLink")
-            pages += 1
+        for folder in self.folders:
+            url = f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/mailFolders/{folder}/messages"
+            params = {
+                "$top": 50,
+                "$orderby": "receivedDateTime asc",
+                "$select": "id,internetMessageId,receivedDateTime,subject,from,body,hasAttachments",
+            }
+            if since:
+                # `ge`, not `gt`: the caller already backdates this by an overlap window, and the
+                # seen-set is what actually prevents re-processing. Erring towards listing a message
+                # twice costs one skipped row; erring the other way loses it for good.
+                params["$filter"] = f"receivedDateTime ge {since}"
+
+            # Per folder, not shared across them. `MAX_PAGES_PER_POLL` is "a guard, not a real
+            # ceiling", and one budget spent by a busy Inbox would starve every folder after it —
+            # which for Junk means never reading it at all on exactly the mailboxes where the
+            # guard matters.
+            pages = 0
+            while url and pages < MAX_PAGES_PER_POLL:
+                self._checkpoint(f"listing {folder}")
+                resp = _SESSION.get(url, headers=headers, params=params if pages == 0 else None, timeout=30)
+                resp.raise_for_status()
+                payload = resp.json()
+                for msg in payload.get("value", []):
+                    # Before the try: a message we have already settled costs one set lookup, not a
+                    # body and a round of attachment downloads.
+                    if msg.get("internetMessageId") in skip:
+                        skipped += 1
+                        continue
+                    self._checkpoint((msg.get("subject") or "")[:60])
+                    try:
+                        emails.append(self._to_raw_email(msg, headers, source_folder=folder))
+                    except StopRequested:
+                        # Ahead of the catch-all below, which exists so one malformed message
+                        # cannot abort a poll. A stop is not a malformed message, and swallowed
+                        # there it would be logged as a skip and the read would carry straight on.
+                        raise
+                    except Exception as e:
+                        _logger.warning("skipping message %s: %s: %s",
+                                        msg.get("id"), type(e).__name__, e, exc_info=True)
+                url = payload.get("@odata.nextLink")
+                pages += 1
+
+            if url:
+                _logger.warning("poll truncated after %s pages; more mail remains in '%s'",
+                                pages, folder)
 
         if skipped:
             _logger.info("skipped %s already-processed message(s) without fetching them", skipped)
-        if url:
-            _logger.warning("poll truncated after %s pages; more mail remains in the Inbox", pages)
-        return emails
 
-    def _to_raw_email(self, msg: dict, headers: dict) -> RawEmail:
+    def fetch_by_ids(self, email_ids: Sequence[str]) -> List[RawEmail]:
+        """Fetch these messages by `internetMessageId`, whatever the watermark says.
+
+        One `$filter` request per id rather than a wider listing. That looks wasteful and is the
+        cheaper option: the ids come from `mail_arrivals`, so the count is the size of the actual
+        gap — usually nothing, occasionally a couple of dozen — whereas re-listing far enough back
+        to cover them means paging the whole Inbox on every run for ever.
+
+        `internetMessageId` is the id used throughout the pipeline because it is stable across
+        folders, unlike Graph's own message id. It is not folder-scoped, so this searches the
+        mailbox rather than the configured source folders: a message that has since been moved is
+        still the message we failed to read, and refusing to find it would leave exactly the
+        permanent gap this method exists to close.
+
+        Failures are per message and logged, never raised. A run must not die because one id of
+        twenty-four has been deleted from the mailbox since the watch saw it.
+
+        **A truncated id is matched with `startswith`, not `eq`.** The ids here come from
+        `mail_arrivals`, which the metadata-only watch fills — and Graph cuts `internetMessageId` at
+        255 characters unless `$select` asks for the body (see `mail_arrivals.ID_MATCH_LEN`). An
+        `eq` on a cut id matches nothing, so this method reported 26 messages sitting in the Inbox
+        as absent, and `mark_missing` recorded them as deleted. Verified against the live mailbox:
+        `eq` on such an id returns 0 results and `startswith` returns exactly 1.
+        """
+        if not email_ids:
+            return RecoveredMail()
+
+        headers = self._headers()
+        found = RecoveredMail()
+
+        for email_id in email_ids:
+            try:
+                self._checkpoint("recovering missed mail")
+            except StopRequested:
+                _logger.info("recovery stopped on request after %s message(s)", len(found.emails))
+                break
+            # Graph string literals escape a single quote by doubling it. An unescaped apostrophe
+            # in a Message-ID would otherwise make a malformed filter and a 400 for that message.
+            quoted = str(email_id).replace("'", "''")
+            # A complete Message-ID is `<…@…>`; one cut at exactly the truncation length has lost
+            # its closing bracket. Both conditions are required — a genuine id that happens to be
+            # 255 characters long is still complete, and `eq` is the right, indexed query for it.
+            truncated = len(str(email_id)) == ID_MATCH_LEN and not str(email_id).endswith(">")
+            where = (f"startswith(internetMessageId, '{quoted}')" if truncated
+                     else f"internetMessageId eq '{quoted}'")
+            try:
+                resp = _SESSION.get(
+                    f"{GRAPH_BASE_URL}/users/{self.mailbox_address}/messages",
+                    headers=headers,
+                    params={
+                        "$filter": where,
+                        "$select": ("id,internetMessageId,receivedDateTime,subject,from,body,"
+                                    "hasAttachments"),
+                        # Two, not one, so an ambiguous prefix can be *detected*. With `$top=1` a
+                        # prefix matching several messages would silently return whichever the
+                        # server listed first.
+                        "$top": 2,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                items = resp.json().get("value") or []
+                if not items:
+                    # A 2xx with an empty result set: the server looked and does not have it.
+                    # **Only this counts as absent.** The id goes on `absent` so the caller can
+                    # stop asking for ever.
+                    found.absent.append(str(email_id))
+                    continue
+                if len(items) > 1:
+                    # Neither list. Not `emails`, because we cannot tell which of them was meant;
+                    # and emphatically not `absent`, because the message is plainly there — calling
+                    # a present message gone is the exact fault this whole change exists to undo.
+                    # Left on the work list, so it is asked about again rather than condemned.
+                    _logger.warning(
+                        "ambiguous truncated id, %s messages share this prefix, will retry: %s",
+                        len(items), email_id)
+                    continue
+                found.emails.append(
+                    self._to_raw_email(items[0], headers, source_folder="recovered"))
+            except StopRequested:
+                # Asked mid-message, while its attachments were downloading. The message is not
+                # half-added — `append` never ran — so ending here loses nothing.
+                _logger.info("recovery stopped on request after %s message(s)", len(found.emails))
+                break
+            except Exception as e:                                 # noqa: BLE001
+                # Deliberately NOT recorded as absent. Auth failures, throttling and dropped
+                # connections all land here, and treating them as "gone from the mailbox" would
+                # permanently suppress a message that is sitting in the Inbox. Left out of both
+                # lists, so the next run asks again.
+                _logger.warning("could not recover message %s, will retry: %s: %s",
+                                email_id, type(e).__name__, e)
+
+        if found.absent:
+            _logger.info("%s of %s message(s) to recover are no longer in the mailbox",
+                         len(found.absent), len(email_ids))
+        if found.emails:
+            _logger.info("recovered %s message(s) the listing window could not reach",
+                         len(found.emails))
+        return found
+
+    def _to_raw_email(self, msg: dict, headers: dict, source_folder: str = "") -> RawEmail:
         sender_address = msg.get("from", {}).get("emailAddress", {}).get("address", "") or ""
         body = msg.get("body", {})
         body_content = body.get("content")
@@ -265,6 +528,7 @@ class GraphMailbox(Mailbox):
             subject=msg.get("subject", ""),
             body_html=body_content if is_html else None,
             body_text=body_content if not is_html else None,
+            source_folder=source_folder,
             attachments=attachments,
             provider_message_id=msg["id"],
         )
@@ -289,10 +553,11 @@ class GraphMailbox(Mailbox):
         url = base
         cids = sniff.referenced_cids(body_content)
         attachments: List[Attachment] = []
-        seen_digests: set = set()
+        seen_digests: dict = {}
         pages = 0
 
         while url and pages < MAX_PAGES_PER_POLL:
+            self._checkpoint("attachments")
             resp = _SESSION.get(url, headers=headers, timeout=30)
             resp.raise_for_status()
             payload = resp.json()
@@ -301,6 +566,8 @@ class GraphMailbox(Mailbox):
                     parsed = self._to_attachment(att, base, headers, cids, seen_digests)
                     if parsed is not None:
                         attachments.append(parsed)
+                except StopRequested:
+                    raise                       # not a bad attachment — see `_list_folders`
                 except Exception as e:
                     _logger.warning("skipping attachment %s on %s: %s: %s",
                                     att.get("name"), message_id, type(e).__name__, e, exc_info=True)
@@ -309,7 +576,7 @@ class GraphMailbox(Mailbox):
         return attachments
 
     def _to_attachment(
-        self, att: dict, base_url: str, headers: dict, cids: set, seen_digests: Optional[set] = None
+        self, att: dict, base_url: str, headers: dict, cids: set, seen_digests: Optional[dict] = None
     ) -> Optional[Attachment]:
         from pipeline.parsing import sniff
 
@@ -322,6 +589,7 @@ class GraphMailbox(Mailbox):
             data = base64.b64decode(att["contentBytes"])
         elif odata_type == "#microsoft.graph.itemAttachment":
             # The item's raw bytes; `$value` returns the .msg/.eml stream itself.
+            self._checkpoint(name[:60])
             resp = _SESSION.get(f"{base_url}/{att['id']}/$value", headers=headers, timeout=60)
             resp.raise_for_status()
             data = resp.content
@@ -371,17 +639,27 @@ class GraphMailbox(Mailbox):
         # brought it in. Premier really does send byte-identical PODs under different filenames.
         if seen_digests is not None:
             if attachment.drop_hint is None and result.sha256 in seen_digests:
-                attachment.drop_hint = f"duplicate:{result.sha256[:12]}"
+                # Compared by name before it is dropped. The drop is right either way; the
+                # question is whether anyone hears about it. See
+                # `attachment_ledger.duplicate_drop_hint`.
+                attachment.drop_hint = attachment_ledger.duplicate_drop_hint(
+                    name, seen_digests[result.sha256], result.sha256)
             if attachment.drop_hint is None:
-                seen_digests.add(result.sha256)
+                seen_digests[result.sha256] = name
 
         if attachment.drop_hint is not None:
-            # Stored *before* the bytes go, and deliberately even for a drop. Thirty of the
-            # forty-six rows in Premier's ledger are `dropped_decorative`, and `mail_view` says in
-            # as many words that "a pasted photograph is often the proof of delivery itself" — so a
-            # misclassified logo was destroying evidence, silently and for ever. Keeping it costs
-            # one content-addressed file, which a duplicate shares.
-            attachment_store.put(attachment.content_bytes)
+            # Stored *before* the bytes go, and deliberately so for most drops. `mail_view` says in
+            # as many words that "a pasted photograph is often the proof of delivery itself", so a
+            # misclassified attachment whose bytes were released is evidence destroyed silently and
+            # for ever. Keeping it costs one content-addressed file, which a duplicate shares.
+            #
+            # `keeps_bytes` is the exception, and the only one: a signature logo. That used to be
+            # decided in `attachment_ledger._insert`, one call *later* than this line — so
+            # `PREMIER_STORE_DECORATIVE=0` saved nothing and the store grew by every logo Premier
+            # was ever sent. Setting it to 1 restores the old unconditional keep, here and there
+            # together.
+            if attachment_ledger.keeps_bytes(attachment.drop_hint):
+                attachment_store.put(attachment.content_bytes)
             attachment.content_bytes = b""   # metadata is enough for a dropped attachment
         return attachment
 

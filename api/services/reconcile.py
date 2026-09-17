@@ -36,7 +36,7 @@ CONFIDENCE_BY_SIGNALS = {3: "high", 2: "medium", 1: "low", 0: "none"}
 
 # Lines that exist on a PO but can never receive goods. `connectors.spitfire.is_tax_line` screens
 # these by `AccountCategory` on the live read, but the mirror and the demo store keep only the
-# description, so the same lines must be screened again by what they say. PO 207249 line 0002 is
+# description, so the same lines must be screened again by what they say. PO 907249 line 0002 is
 # "Delivery & Installation" carrying `AccountCategory: SUB-FDP` — it passes the account screen and
 # would otherwise be offered as a candidate for a treadmill.
 NON_RECEIVABLE_DESCRIPTION = re.compile(
@@ -105,7 +105,7 @@ def score_candidate(record: ExtractedRecord, po_line: POLineRow) -> Candidate:
     # set-ratio resolves 84%, sort-ratio 75%.
     #
     # The cost of set-ratio is that it discounts tokens the record does not mention, so items that
-    # differ only by a size score within a point or two of each other: PO 207249's four medicine
+    # differ only by a size score within a point or two of each other: PO 907249's four medicine
     # balls scored 100 on the right line and 94.1 on the wrong one, a gap of 5.9 that no threshold
     # can safely split. `_by_numbers` below separates them, and must run before scoring, not after.
     desc_score = 0.0
@@ -135,7 +135,7 @@ class Resolution:
     """Which PO line the record is receiving against, and how that was decided.
 
     `chosen` is None when the record is genuinely ambiguous. That is a real answer, not a failure:
-    23 signs on PO 207514 all carry spec `LOB-900-SI`, and an email saying only "Exit" does not
+    23 signs on PO 907514 all carry spec `LOB-900-SI`, and an email saying only "Exit" does not
     identify one of them. `tied` carries what it could not choose between so a reviewer sees the
     same shortlist the matcher did.
     """
@@ -149,7 +149,7 @@ def _receivable(record: ExtractedRecord, po_lines: Sequence[POLineRow]) -> List[
 
     Offering "Delivery & Installation" as a candidate for a treadmill invites a wrong match on a
     PO whose specs repeat, which is why these are screened out at all. But Premier does receive
-    against them: PO 206993 line 0003 *is* `Installation`, its spec is `FIT-902b-EQ`, and the
+    against them: PO 906993 line 0003 *is* `Installation`, its spec is `FIT-902b-EQ`, and the
     corpus holds a record for exactly that spec reading "Installation of Water Dispenser".
 
     So the screen protects against a wrong match, never against a right one. An exact spec match
@@ -175,7 +175,7 @@ def _by_spec(record: ExtractedRecord, rows: Sequence[POLineRow]) -> List[POLineR
 def _by_vendor_code(record: ExtractedRecord, rows: Sequence[POLineRow]) -> List[POLineRow]:
     """The vendor's code out of the record's description, matched into the PO line's.
 
-    This is what identifies an item when the spec cannot. Every one of PO 207249's 21 fitness
+    This is what identifies an item when the spec cannot. Every one of PO 907249's 21 fitness
     items carries spec `FIT-900-FIT`; they are told apart by `CODE: DGY100LBNRNR20` and its
     siblings, which the PO line descriptions also carry.
     """
@@ -205,7 +205,7 @@ def _by_numbers(record: ExtractedRecord, rows: Sequence[POLineRow]) -> List[POLi
 def _by_uom(record: ExtractedRecord, rows: Sequence[POLineRow]) -> List[POLineRow]:
     """Units must agree where both sides state one. Silence on either side is not disagreement.
 
-    PO 210635 carries two `GR-350c-WTF` lines — 84 YD and 1 EA — with descriptions that score
+    PO 910635 carries two `GR-350c-WTF` lines — 84 YD and 1 EA — with descriptions that score
     identically. The unit is the only thing that separates them.
     """
     # Imported here, not at module scope: `po_verify` imports this module for `score_candidate`,

@@ -121,7 +121,7 @@ def test_request_info_renders_the_chase_template(client):
     body = client.post(f"/api/reconciliation/{row['match']['id']}/request-info").json()
 
     assert body["status"] == "mock_sent"
-    assert "212547" in body["subject"] or "212547" in body["rendered_body"]
+    assert "912547" in body["subject"] or "912547" in body["rendered_body"]
     assert "Quantity received" in body["rendered_body"]
 
 

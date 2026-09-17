@@ -14,11 +14,28 @@ from typing import Dict, List, Optional, Sequence
 from pipeline.extracted_records_store import _COLUMNS as RECORD_COLUMNS
 from pipeline.models import ExtractedRecord, ExtractedRecordRow
 
-# What a reviewer is allowed to correct in the review drawer before approving. Provenance
-# fields (extraction_source, raw_snippet, confidence) are deliberately not editable — they
-# record what the machine actually saw.
+# What a reviewer is allowed to correct. Provenance fields (extraction_source, raw_snippet,
+# confidence) are deliberately not editable — they record what the machine actually saw.
+#
+# Two fields are absent on purpose, and both absences are load-bearing:
+#
+# `po_number` — changing which purchase order a delivery is against would silently move a receipt
+# onto another budget line. That is a different act from correcting a spec code, not a larger one.
+#
+# `po_line_number` — a text box here would be worse than useless. `post_decision` gate 5 refuses a
+# line matched on description alone *unless a person chose it*, and `po_verify` treats a record's
+# stored line number as exactly that choice (`chosen_line`, `reviewer_chose=True`). So a typo in
+# this box would not be caught by the gate that exists to catch it — it would satisfy it. The
+# sanctioned route is the alternatives table in the Verify popup, which shows the reviewer each
+# line's description and outstanding quantity before they pick one.
 EDITABLE_FIELDS = (
-    "spec_code", "quantity_received", "pod_stated_date", "item_description", "unit_of_measure",
+    # What arrived.
+    "spec_code", "item_description", "quantity_received", "unit_of_measure",
+    "package_quantity", "package_uom",
+    # How and when it arrived.
+    "pod_stated_date", "carrier_name", "tracking_number", "received_by",
+    # Who it came from, and under what reference.
+    "vendor_name", "notification_number",
 )
 
 

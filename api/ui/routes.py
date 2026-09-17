@@ -18,30 +18,38 @@ nothing.
 Read-only except the four `POST /ui/automation/*` controls, all of which redirect so a refresh never
 re-submits. There are no filters, no sorting controls and no per-row actions.
 """
+import base64
 import csv
 import io
 import os
+import posixpath
 import sqlite3
-from collections import OrderedDict
-from datetime import datetime
+from collections import Counter, OrderedDict
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from html import escape as _escape
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import parse_qs, quote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from api import deps
+from api import auth, deps
+from api.forms import form_list as _form_list, form_values as _form_values
+from api.stores import extracted_store
 from api.ui import html
 from config import settings
 from connectors import spitfire_cassette
 from operations import inbox as inbox_reader
-from operations import killswitch, runner, scheduler
+from operations import arrivals, killswitch, runner, scheduler
 from operations import store as ops_store
-from pipeline import (attachment_bytes, attachment_view, completeness, delivery_status,
-                      mail_arrivals, mail_cache, mail_view, po_verify, post_ledger, read_views,
-                      receipt_log, record_completion, record_create, spitfire_post,
-                      state_db)
+from pipeline import (attachment_bytes, attachment_ledger, attachment_view, completeness,
+                      deliveries_store,
+                      delivery_status, email_log, mail_arrivals, mail_cache, mail_overrides,
+                      mail_view, po_verify,
+                      post_decision, post_ledger, read_views, receipt_log, record_completion,
+                      record_create,
+                      record_edit, spitfire_post, state_db)
 
 router = APIRouter(prefix="/ui", tags=["ui"], include_in_schema=False)
 
@@ -87,21 +95,45 @@ def _chrome(conn: sqlite3.Connection) -> dict:
               for category in order if s.by_category.get(category)]
     pairs += [
         ("records", s.records_total, ""),
-        ("ready", s.records_ready, "good"),
+        # `records_postable`, not `records_ready`. "Ready" is read as "work that can be done now",
+        # and `records_ready` only means "no missing field" — 169 of those against 45 that could
+        # actually post. The complete-but-unprovable ones stay visible on the Records page with
+        # their blocker; they are simply not counted as ready any more.
+        ("ready to post", s.records_postable, "good"),
+        ("complete", s.records_ready, ""),
+        # Records read from Premier's own mail that nobody has confirmed. In records, not queue
+        # rows — the queue shows one row per message and those rows stand for thousands of records,
+        # so "need a human" cannot answer "where did the other records go".
+        ("awaiting confirmation", s.records_awaiting_confirmation, ""),
         ("need a human", s.needs_human, "alert" if s.needs_human else ""),
         ("OCR pages", s.ocr_pages, ""),
     ]
     return {
         "header": html.stats(pairs),
+        # Who is looking, for the rail's sign-out control. Read from the request's context rather
+        # than passed in, so that none of the ten page handlers calling `_chrome` has to take a
+        # `request` it makes no other use of. See `auth.signed_in_user`.
+        "user": auth.signed_in_user(),
         # Clipped to the minute, and the `T` dropped. It reads in the sidebar now (see
         # `html.page`), where `2026-08-17T17:41:18.142282+00:00` would wrap to three lines to
         # deliver six digits of precision nobody has ever wanted from it.
         "footer": (f"Last run {s.last_run[:16].replace('T', ' ')}" if s.last_run else "Never run."),
-        **_sidebar_counts(),
+        **_sidebar_counts(s),
     }
 
 
-def _sidebar_counts() -> dict:
+# The 500-row render cap that used to live here is gone, along with `_cap()` and the `?all=1`
+# parameter that went with it. It capped what was *sent*, never what existed, and paid for that with
+# a note under every long table reading "The 500 most recent of 2,373 are loaded — the search and
+# filters cover these 500" — an admission, printed on the page, that the search box above it was
+# answering about a slice. Every table now ships every row it stands for.
+#
+# What the cap was really guarding against is handled properly now: the response is gzipped
+# (`api/main.py`), and the one table too large to send at all is paged in SQL instead
+# (`read_views.attachments`, which has taken `q`/`limit`/`offset` since it was written).
+
+
+def _sidebar_counts(summary=None) -> dict:
     """Just the sidebar's queue figure, for a page that builds its own header.
 
     Automation and Report show four figures of their own rather than the eight-chip strip, so they
@@ -109,8 +141,19 @@ def _sidebar_counts() -> dict:
     with no queue badge and no alert card at all. A rail that changes shape depending on which page
     you are on reads as a bug in the rail, so the count is separable from the header it used to
     arrive with.
+
+    `summary` is the one `_chrome()` already holds. **It must be passed when there is one.** This
+    was called bare from inside `_chrome()`, so every page that took the eight-chip header ran the
+    whole cross-store scan *twice* to render one screen — measured at 696ms and then 572ms against
+    the live store, for a single integer the first scan had already computed. That is more than half
+    the render time of every page in the app, spent on nothing, and it is exactly the duplication
+    `_chrome`'s own docstring says it exists to prevent.
+
+    The parameter stays optional because Automation and Report genuinely have no summary to pass;
+    they are the two callers this function was written for.
     """
-    return {"counts": {"/ui/manual": read_views.summary_across_sources().needs_human}}
+    s = summary if summary is not None else read_views.summary_across_sources()
+    return {"counts": {"/ui/manual": s.needs_human}}
 
 
 @router.get("", response_class=HTMLResponse)
@@ -120,7 +163,7 @@ def index():
 
 
 @router.get("/mails", response_class=HTMLResponse)
-def mails_page(refresh: int = 0,
+def mails_page(refresh: int = 0, checked: str = "",
                conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
     """Every processed email, in one table, read from Premier's mailbox.
 
@@ -140,12 +183,33 @@ def mails_page(refresh: int = 0,
     # nobody has read would be the one dishonest thing this page could do.
     pending = mail_arrivals.pending(conn)
     for a in pending:
+        # Two kinds of unread, and they are not the same news. One is waiting for the next run; the
+        # other has left the mailbox, so no run will ever read it and the row saying "waiting for
+        # the next run" is a promise nothing can keep. `recovery_missing_at` is what tells them
+        # apart — a by-id lookup went looking on that date and the mailbox did not have it.
+        #
+        # Worded as what that lookup actually established rather than as a flat "gone": the
+        # evidence is one probe on one day, which is exactly how `mark_missing` describes itself.
+        if a.recovery_missing_at:
+            verdict = html.badge("not in the mailbox", "error")
+            # The way this row ends. Without it the queue cannot reach zero: no run can read a
+            # message the mailbox does not have, so nothing but a person can close it out.
+            why = html.tag(
+                "span",
+                html.muted(f"looked for on {(a.recovery_missing_at or '')[:10]} "
+                           f"and not found — no run can read it now. "),
+                html.button_form("/ui/mails/acknowledge", "Accept it is lost",
+                                 cls="btn ghost small", hidden_fields={"email_id": a.email_id}),
+            )
+        else:
+            verdict = html.badge("not read yet", "hold")
+            why = html.muted("waiting for the next run")
         rows.append([
-            html.badge("inbox", "inbox"),
+            _source_cell("inbox", "Inbox", a.source_folder),
             _stamp((a.received_at or "")[:16].replace("T", " ")),
             _subject_cell(a.subject, a.sender),
-            html.badge("not read yet", "hold"), html.muted("—"),
-            html.muted("waiting for the next run"), html.muted("—"),
+            verdict, html.muted("—"),
+            why, html.muted("—"),
             "yes" if a.has_attachments else html.muted("0"),
             html.muted("—"), html.muted("0"), html.muted("—"),
         ])
@@ -155,7 +219,7 @@ def mails_page(refresh: int = 0,
         if m.attachments_flagged:
             attachments = html.Raw(f"{m.attachment_count} " + str(html.muted(f"({m.attachments_flagged} flagged)")))
         rows.append([
-            html.badge(m.source_label, m.source),
+            _source_cell(m.source, m.source_label, m.source_folder),
             _stamp(m.email_date[:16]),
             # Truncated, with the whole thing on hover. Subject and Why are the only free-text
             # columns — left full they wrap to seven lines and every row stands 140px tall, which
@@ -169,19 +233,28 @@ def mails_page(refresh: int = 0,
     # choice whose only possible outcome is an empty table, and `hide` is absent far more often
     # than it is present.
     verdicts = [(v, v) for v in sorted({m.category for m in mails_list if m.category})]
-    if pending:
-        # The arrivals' own cell reads "not read yet" rather than a category, so it needs its own
-        # entry — and it is the one people will reach for most, being the only actionable state.
+    # The arrivals' own cells read "not read yet" or "not in the mailbox" rather than a category,
+    # so each needs its own entry — and only when a row actually carries it. Offering "not read
+    # yet" while every unread row had in fact left the mailbox gave a filter whose only possible
+    # result was an empty table.
+    if any(not a.recovery_missing_at for a in pending):
         verdicts.append(("not read yet", "not read yet"))
+    if any(a.recovery_missing_at for a in pending):
+        verdicts.append(("not in the mailbox", "not in the mailbox"))
     # One entry above the verdicts standing for all of them that mean a person still has to look.
     # Asking "what is waiting on me" is the question this page gets asked most, and answering it
     # by picking each verdict in turn and adding up is not answering it.
+    #
+    # "not in the mailbox" is deliberately NOT in the triage queue: nobody can action it — the
+    # message is gone — and a queue that contains work that cannot be done is one people abandon.
     waiting = [v for v, _ in verdicts if v in ("hold", "error", "not read yet")]
     views = ([("|".join(waiting), "My triage queue")] if waiting else []) + verdicts
 
     body = html.section(
         "",
-        _unprocessed_note(refresh=bool(refresh), pending=len(pending)),
+        _unprocessed_note(pending=len(pending),
+                          gone=sum(1 for a in pending if a.recovery_missing_at),
+                          checked=checked),
         html.tag(
             "div",
             html.search_box("mail-table",
@@ -197,6 +270,11 @@ def mails_page(refresh: int = 0,
              "Attachments", "Records", "OCR", "Filed to"],
             rows, empty=_EMPTY_HINT, table_id="mail-table", page_size=25, pane=True,
             date_column="Received", choice_column="Verdict",
+            # **Not capped, deliberately** — the one list page that ships every row.
+            # `_cap` orders newest-first, and this is the page people come to when they are
+            # looking for a message from a while ago; a cap here answers "no mail matches"
+            # for mail that is sitting in the table's own CSV. It is also the cheapest of the
+            # heavy pages to render, so it is the one where the cap would buy least.
             # `src` is what reopens a message from the store it actually lives in. Without it every
             # row would be looked up in the corpus and live mail would report itself missing.
             #
@@ -221,8 +299,86 @@ def mails_page(refresh: int = 0,
         **_chrome(conn))
 
 
-_MAIL_CSV_COLUMNS = ("Source", "Received", "Subject", "From", "Origin", "Verdict", "Rule", "Why",
-                     "POs", "Attachments", "Flagged", "Records", "OCR", "Filed to", "Email id")
+_MAIL_CSV_COLUMNS = ("Source", "Read from", "Received", "Subject", "From", "Origin", "Verdict",
+                     "Rule", "Why", "POs", "Attachments", "Flagged", "Records", "OCR", "Filed to",
+                     "Email id")
+"""`Read from` is the mailbox folder, `Filed to` is where the pipeline put it afterwards. Both,
+because "this arrived in Junk and we filed it as Processed" is one row's whole story and either
+column alone tells half of it."""
+
+
+@router.post("/mails/check")
+def mails_check():
+    """Read the mailbox now, then send the browser back to a page built from the result.
+
+    **The redirect is the fix, not a nicety.** `mails_page` assembles its table before it evaluates
+    anything below it, so the previous design — a GET that read Graph part-way down the render —
+    wrote what it found into the database and then drew a table that had already been built. The
+    press appeared to do nothing; a second press showed the mail the first one had fetched. Doing
+    the work first and redirecting means the GET that follows starts from a database that already
+    has the rows.
+
+    Routed through `arrivals.poll_once(deep=True)` rather than reading the mailbox here, so a press
+    takes the same lock as the fifteen-second watch. Two presses, or a press landing on a tick, are
+    now refused rather than run concurrently — the old path took no lock at all and could walk the
+    mailbox twice at once. It also advances the same watermark and is recorded as the same kind of
+    event, so pressing this leaves the watch ahead instead of invisible to it.
+
+    Never raises: `poll_once` returns its failure, and the outcome rides back in the query string
+    because a 303 cannot carry a body.
+    """
+    # Waits for the lock rather than bouncing off it. The background watch ticks every fifteen
+    # seconds and holds this for a few, so without the wait a large share of presses came back
+    # "already running, this press did nothing" — a button that refuses the person who pressed it
+    # because a timer got there first is the same dead button, differently worded.
+    outcome = arrivals.poll_once(deep=True, wait_seconds=25)
+
+    if outcome.skipped:
+        result = "busy"
+    elif not outcome.ok:
+        result = f"error:{outcome.error or 'unknown'}"
+    else:
+        result = f"ok:{outcome.listed}/{outcome.new}"
+
+    # Recorded exactly as `scheduler._tick_arrivals` records a scheduled poll. Without this the
+    # "Last checked …" line on both pages ignored the button that had just checked, so pressing it
+    # left the screen still saying the mailbox had not been looked at for four minutes.
+    try:
+        conn = ops_store.get_connection()
+        try:
+            ops_store.record_arrival_poll(
+                conn, at=_now(), new=outcome.new,
+                error=None if outcome.ok else (outcome.error or "unknown"))
+        finally:
+            conn.close()
+    except Exception:                                              # noqa: BLE001
+        pass                      # the check itself succeeded; failing to log it must not 500
+
+    return RedirectResponse(f"/ui/mails?checked={quote(result)}", status_code=303)
+
+
+@router.post("/mails/acknowledge")
+async def mails_acknowledge(request: Request):
+    """Accept that one lost message is lost, so it stops being counted and shown.
+
+    The id travels in the form body rather than the path: a Message-ID is up to 255 characters of
+    angle brackets and `@`, and putting that in a URL segment means escaping it at both ends for no
+    gain.
+
+    `mail_arrivals.acknowledge` refuses anything not already marked missing, so this cannot be used
+    to dismiss mail that is merely waiting — that clears itself on the next run, and hiding it would
+    turn a self-clearing row into an invisible one.
+    """
+    form = await _form_values(request)
+    email_id = str(form.get("email_id") or "")
+    if email_id:
+        conn = _live_conn()
+        try:
+            mail_arrivals.acknowledge(conn, email_id, _now())
+        finally:
+            conn.close()
+    return RedirectResponse(_safe_return(str(form.get("return_to") or ""), "/ui/mails"),
+                            status_code=303)
 
 
 @router.get("/mails.csv")
@@ -242,13 +398,15 @@ def mails_csv(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> Res
     writer.writerow(_MAIL_CSV_COLUMNS)
     for a in mail_arrivals.pending(conn):
         writer.writerow(_csv_safe([
-            "inbox", (a.received_at or "")[:16].replace("T", " "), a.subject, a.sender, "",
+            "inbox", a.source_folder, (a.received_at or "")[:16].replace("T", " "),
+            a.subject, a.sender, "",
             "not read yet", "", "waiting for the next run", "",
             "yes" if a.has_attachments else "0", "", "", "0", "", a.email_id,
         ]))
     for m in read_views.mails_across_sources():
         writer.writerow(_csv_safe([
-            m.source_label, m.email_date[:16], m.subject, m.sender, m.origin_sender or "",
+            m.source_label, m.source_folder, m.email_date[:16], m.subject, m.sender,
+            m.origin_sender or "",
             m.category, m.matched_rule, m.reason, m.po_hints, m.attachment_count,
             m.attachments_flagged, m.records, m.ocr_attempted, m.folder, m.email_id,
         ]))
@@ -340,6 +498,21 @@ def _stamp(value) -> html.Raw:
     return html.tag("span", html.when(value), class_="mono")
 
 
+def _source_cell(source: str, source_label: str, source_folder: str = "") -> html.Raw:
+    """Where this message came from: which store, and — when it is not the Inbox — which folder.
+
+    The two are different questions and the column answers whichever one is informative. `source`
+    names the SQLite store, which is what a message link needs; `source_folder` names the mailbox
+    folder, which is what tells somebody Exchange is filing warehouse mail as spam.
+
+    Junk wins the cell when it applies, because it is the rarer and more urgent fact. Inbox mail
+    keeps the store badge exactly as before, so the common row is unchanged.
+    """
+    if (source_folder or "").lower() == "junkemail":
+        return html.badge("junk", "junk")
+    return html.badge(source_label, source)
+
+
 def _short_address(address: str, limit: int = 20) -> str:
     """`Rahulconsciouscreations@outlook.com` → `Rahul…@outlook.com`.
 
@@ -368,7 +541,7 @@ def _subject_cell(subject, sender, via: str = "") -> html.Raw:
     still there to be read.
 
     `via` is the recovered origin of a forward: every corpus message is a `Fw:` from an internal
-    expeditor, so the envelope sender is premierpm.com on all of them and the origin is the one
+    expeditor, so the envelope sender is example-pm.test on all of them and the origin is the one
     that means anything.
     """
     subject_text = (subject or "").strip() or "(no subject)"
@@ -396,7 +569,30 @@ def _export_mail() -> html.Raw:
                     title="Download every row of this table as CSV")
 
 
-def _unprocessed_note(refresh: bool = False, pending: int = 0) -> html.Raw:
+def _unread_arrivals() -> int:
+    """How many messages the watch has seen that the pipeline has recorded no verdict for.
+
+    Its own helper because the automation page needs the same number the Mail page shows, and a
+    run's health cannot be judged without it: `emails == 0` means "idle inbox" or "the run could
+    not reach the mail", and only this distinguishes them.
+
+    Never raises and answers 0 when it cannot tell. A status card must degrade to saying less, not
+    to failing — but note 0 therefore means "no evidence of a problem", not "no problem".
+    """
+    try:
+        conn = _live_conn()
+        try:
+            # `recoverable_count`, not `pending_count`: a message the mailbox no longer has
+            # is unread and always will be, and counting it here would light this warning for
+            # ever. Health is about what is still actionable.
+            return mail_arrivals.recoverable_count(conn)
+        finally:
+            conn.close()
+    except Exception:                                              # noqa: BLE001
+        return 0
+
+
+def _unprocessed_note(pending: int = 0, gone: int = 0, checked: str = "") -> html.Raw:
     """Mail sitting in the mailbox that nothing has read yet.
 
     The one thing the table of verdicts cannot show: it lists what was *processed*, so a message
@@ -410,24 +606,39 @@ def _unprocessed_note(refresh: bool = False, pending: int = 0) -> html.Raw:
     restart made every first visit pay it. The count now comes from `mail_arrivals`, which the
     arrival watch keeps current in the background; it is a SQLite read of an indexed column.
 
-    `?refresh=1` is kept and is now the only path that talks to Graph from this page: an explicit,
-    user-pressed deep re-read for when someone wants to know *right now* rather than within the
-    watch's interval.
+    **Nothing on this page talks to Graph any more, in any render.** The explicit re-read is
+    `POST /ui/mails/check`, which does the work and redirects — see `_check_now`. `?refresh=1` is
+    accepted and ignored: it was the old spelling, it is in browser history and bookmarks, and
+    every automatic reload of a tab that still carried it paid for another full mailbox walk.
     """
-    if refresh:
-        return _deep_refresh_note()
-
     # The count comes first on every branch, including the ones that go on to explain that the
     # watch is off or broken. It was originally reported only when the watch was healthy, which
     # meant the page fell silent about mail it was already showing at exactly the moment something
     # was wrong — the moment that number matters most.
-    if pending:
-        text = f"{pending} message{_s(pending)} arrived and not yet read by the pipeline. "
+    # **The headline counts only what is still waiting to be read**, which is what "unprocessed"
+    # has always meant here: work the automation has yet to do. A message that has left the mailbox
+    # is not waiting for anything — we looked for it by id, the mailbox did not have it, and no run
+    # can ever read it. Counting it as unprocessed made the figure unclearable, and a number that
+    # can never reach zero is one people stop reading, which is the whole reason `recoverable_count`
+    # draws this distinction for the Automation page.
+    #
+    # It is still *said*, in its own clause, because it is a loss and one of them was an urgent
+    # purchase-order email. Silently dropping it to make a zero would be the dishonest half of this
+    # change; the honest half is only that a loss is not a queue.
+    waiting_count = pending - gone
+    if waiting_count:
+        text = (f"{waiting_count} message{_s(waiting_count)} arrived and not yet read by the "
+                f"pipeline. ")
     else:
-        text = "Nothing unprocessed. "
+        text = "Nothing waiting to be read. "
 
+    # A press just happened, and it *is* the last check — so it replaces the standing "Last checked
+    # N ago" rather than being announced beside it.
+    checked_clause = _checked_clause(checked) if checked else None
     watch = _arrival_watch()
-    if not watch.enabled:
+    if checked_clause is not None:
+        state = checked_clause
+    elif not watch.enabled:
         state = html.muted("The new-mail watch is off, so this only updates when a run happens. ")
     elif watch.last_error:
         state = html.tag("span", f"The watch could not read the mailbox: {watch.last_error} ",
@@ -437,7 +648,15 @@ def _unprocessed_note(refresh: bool = False, pending: int = 0) -> html.Raw:
     else:
         state = html.muted("Not checked yet. ")
 
-    return html.tag("p", text, state,
+    # After the state, not before: "nothing waiting" is the answer to the question this line is
+    # asked, and the loss is the footnote to it rather than the headline.
+    lost = (html.muted(f"{gone} message{_s(gone)} "
+                       f"{'was' if gone == 1 else 'were'} lost before anything read "
+                       f"{'it' if gone == 1 else 'them'} — filter to "
+                       f"“not in the mailbox” to see which. ")
+            if gone else html.Raw(""))
+
+    return html.tag("p", text, state, lost,
                     # "Check now" is no longer here — it acts on the page, so it lives beside the
                     # page title (`_check_now`). "Turn the watch on" stays, because it only makes
                     # sense next to the sentence saying the watch is off.
@@ -450,55 +669,57 @@ def _unprocessed_note(refresh: bool = False, pending: int = 0) -> html.Raw:
 def _check_now() -> html.Raw:
     """The deep re-read, as a page-level action rather than a link inside a paragraph.
 
-    It is a plain `<a>` and not a form because it changes nothing of ours by being pressed — it is
-    `GET /ui/mails?refresh=1`, the same page asking to be built from a live mailbox read. Kept as
-    the page's one filled button: it is the only thing on Mail that reaches outside the database.
+    **A POST, not a link, and the reason is a bug rather than etiquette.** It was
+    `GET /ui/mails?refresh=1`: the same page, rendered from a live mailbox read. But `mails_page`
+    builds its table *before* it evaluates the note that performs that read, so anything the read
+    discovered was written to the database and then rendered into a table assembled a moment
+    earlier. Press it, wait half a minute, see nothing new; press it again and the mail appears.
+
+    A POST that redirects fixes it by construction — the GET that follows starts from a database
+    that already has the rows — and it takes the URL with it. `?refresh=1` used to stay in the
+    address bar, so every later reload of that tab, including the automatic ones, paid for another
+    full mailbox walk.
+
+    `data-busy-label` is read by `_JS`: the button disables itself and says what it is doing, for
+    what can be twenty seconds of otherwise unexplained silence.
     """
-    return html.tag("a", "Check now", href="/ui/mails?refresh=1", class_="btn primary small",
-                    title="Read the mailbox now instead of waiting for the next run")
+    return html.button_form("/ui/mails/check", "Check now", cls="btn primary small",
+                            busy_label="Checking the mailbox…")
 
 
-def _deep_refresh_note() -> html.Raw:
-    """The one Graph call left on this page, and only when someone asks for it by pressing a link.
+def _checked_clause(outcome: str):
+    """What the last press of "Check now" did — **a clause, not a paragraph.**
 
-    Lists the mailbox directly rather than trusting the watch, and records anything it finds — so
-    pressing this is also how you populate the arrivals table without waiting for, or enabling, the
-    background watch.
+    It replaces the "Last checked …" half of `_unprocessed_note`, because that is exactly what it
+    is: the most recent check, reported by the thing that performed it. Rendered as its own line it
+    sat directly above a sentence ending "Last checked just now", so the page said the same thing
+    twice in two different voices.
+
+    Describes the *mailbox read* only — how much was listed and how much was new here. It does not
+    claim anything was processed: a metadata check records that a message exists, and the run is
+    what reads it.
     """
-    try:
-        result = inbox_reader.load(force=True)
-    except Exception as exc:                                       # noqa: BLE001
-        return html.tag("p", f"Could not read the mailbox to check for unprocessed mail: {exc}",
-                        class_="note")
-    if result.error or not result.configured:
-        return html.tag("p", f"Could not read the mailbox: {result.error or 'not configured'}",
-                        class_="note")
+    kind, _, detail = outcome.partition(":")
+    if kind == "busy":
+        return html.muted("A check was already running, so this press did nothing. ")
+    if kind == "error":
+        # `err`, not the muted grey a failure used to share with every ordinary note. A mailbox we
+        # cannot read is the one thing on this page someone has to act on.
+        return html.tag("span", f"Could not read the mailbox: {detail} ", class_="err")
+    if kind == "ok":
+        listed, _, new = detail.partition("/")
+        if new == "0":
+            return html.muted(f"Checked just now: {listed} listed, nothing new. ")
+        return html.muted(f"Checked just now: {new} new of {listed} listed, "
+                          f"read by the next run. ")
+    return None
 
-    conn = _live_conn()
-    try:
-        seen = {r[0] for r in conn.execute("SELECT email_id FROM email_log")}
-        now = _now()
-        mail_arrivals.record(conn, [
-            mail_arrivals.Arrival(
-                email_id=m.internet_message_id, received_at=m.received, sender=m.sender,
-                subject=m.subject, has_attachments=m.has_attachments, first_seen_at=now,
-                enriched_at=now if (m.internet_message_id or "") in seen else None,
-            )
-            for m in result.messages if m.internet_message_id
-        ], now=now)
-    finally:
-        conn.close()
 
-    pending = [m for m in result.messages if (m.internet_message_id or "") not in seen]
-    if not pending:
-        text = f"Nothing unprocessed in {result.mailbox}. "
-    else:
-        text = (f"{len(pending)} message{_s(len(pending))} in {result.mailbox} "
-                f"not yet processed. ")
-    return html.tag("p", text,
-                    html.tag("a", "Refresh", href="/ui/mails?refresh=1",
-                             class_="btn ghost small", style="margin-left:4px"),
-                    class_="note")
+def _int(value: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _arrival_watch():
@@ -515,8 +736,55 @@ def _arrival_watch():
                                       interval_seconds=ops_store.DEFAULT_ARRIVAL_SECONDS)
 
 
+def _delivery_marker(row, seen: set, shown: dict) -> html.Raw:
+    """A count of the items on this delivery, once per delivery rather than once per line.
+
+    Six rows of PO 906725 are one truck. Before deliveries existed there was nothing on the page
+    that said so, and the six read as six separate things to receive — which is exactly how they
+    were posted, as six Spitfire receipts.
+
+    **It counts the rows on this page, not the rows on the delivery**, and says so when the two
+    differ. The first version counted the delivery and produced `22 items` above a single visible
+    line: PO 907249 carries 22, but 21 of them are quantity conflicts that `_READY_CLAUSE` holds
+    back, so the badge described a block the reader could not see and made the page look broken.
+    `1 of 22 items` is the honest form, and it is also the more useful one — it is the only place
+    on this page that says the rest of the delivery is waiting somewhere else.
+
+    Drawn only on the first row of each block, which works because `records_ready` orders by
+    delivery. Silent for a one-line delivery with nothing held back: `1 item` is noise. Silent too
+    for a row with no delivery, where an unqualified badge would claim a grouping never made.
+    """
+    delivery_id = row["delivery_id"]
+    if not delivery_id or delivery_id in seen:
+        return html.Raw("")
+    seen.add(delivery_id)
+
+    here = int(shown.get(delivery_id, 0))
+    total = int(row["delivery_lines"] or 0)
+    held = max(total - here, 0)
+    if here < 2 and not held:
+        return html.Raw("")
+
+    rung = str(row["delivery_rung"] or "")
+    how = {"shipment": "shipment number", "notice": "notification number",
+           "pod": "the proof of delivery", "date": "the delivery date"}.get(
+               rung, "the message it arrived on")
+    if held:
+        label = f"{here} of {total} items"
+        why = (f"One delivery of {total} item lines, identified by {how}. "
+               f"{held} of them are not on this page — held back as a quantity conflict, "
+               f"already posted, or failed. Look on Needs a human.")
+    else:
+        label = f"{here} items"
+        why = f"One delivery of {total} item lines, identified by {how}"
+    return html.tag("span", label, class_="delivery-tag", title=why)
+
+
 @router.get("/records", response_class=HTMLResponse)
-def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+def records_page(corrected: Optional[int] = Query(None),
+                 settled: Optional[int] = Query(None),
+                 waived: Optional[int] = Query(None),
+                 conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
     records = read_views.records_ready(conn)
     # One call, indexed in memory — not a query per row. The record's own `status` column is not
     # shown: every pending record reads "pending" until stages 4-7 run, so it would be 25 identical
@@ -532,7 +800,62 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
     posted = {a.record_id: a for a in post_ledger.latest_by_record(conn)}
     # One query, not one per row: which emails carry something that could be a POD.
     pod_emails = _emails_with_a_possible_pod(conn)
+    # What the purchase order says about each row's line — gates 5-8, off the same mirror `flags`
+    # above already reads, so no extra network and no extra document reads. 0.04s for 385 rows.
+    # Three answers, not two: `UNCHECKED` means that order has never been read from Spitfire, which
+    # is not the same as the delivery being wrong, and must never render as a refusal.
+    line_verdicts = read_views.mirror_line_verdicts(conn, records)
     rows = []
+    # Which deliveries have already had their marker drawn. Rows arrive grouped, so the first row
+    # of a block gets "N items" and the rest get nothing — a count repeated on every line of a
+    # six-line delivery reads as six deliveries of six items each.
+    seen_deliveries = set()
+    # Counted over the rows this page is actually drawing, so the badge and the block agree.
+    shown_per_delivery = Counter(r["delivery_id"] for r in records if r["delivery_id"])
+    # Which row of each delivery block carries the Post control. Computed here rather than by
+    # reusing `seen_deliveries`, which `_delivery_marker` fills as it draws: the Post cell is the
+    # third column and the delivery badge is the fifth, so a set shared between them would be
+    # written by whichever ran first and the two would disagree about which row is the first.
+    heads_delivery = {}
+    for r in records:
+        if r["delivery_id"] and r["delivery_id"] not in heads_delivery:
+            heads_delivery[r["delivery_id"]] = r["id"]
+    # What each delivery block still needs, counted across the block rather than read off its first
+    # row. A delivery part-posted before grouping existed — PO 907249's line 2 — leaves that row
+    # finished while nineteen neighbours have never been posted, and reading the control off it
+    # offered "Post report" and no way to post the nineteen.
+    to_post = Counter()
+    report_due = set()
+    verify_target: Dict[int, int] = {}
+    for r in records:
+        did = r["delivery_id"]
+        if not did:
+            continue
+        attempt = posted.get(r["id"])
+        if attempt is not None and attempt.state == post_ledger.POD_POSTED:
+            report_due.add(did)
+            # The first line of the block that actually reached a receipt. Aggregated here with
+            # `to_post` and `report_due` for the same reason they are: read off the first row
+            # instead, and the control describes a different record from the badge beside it.
+            verify_target.setdefault(did, int(r["id"]))
+        if attempt is not None and attempt.is_blocking:
+            continue          # posted, in flight, or half-built: not something to post again
+        # The same certain-and-cheap refusals `_post_cell` declines to draw a button for. A button
+        # whose only outcome is a refusal teaches people to ignore refusals — and a *count* that
+        # disagrees with the buttons under it is worse, because "Post 4 of 6" is read as a promise.
+        # Through `can_post_offline` so the badge and the cell cannot drift apart.
+        if not post_decision.can_post_offline(
+                r, has_pod_bytes=r["source_email_id"] in pod_emails):
+            continue
+        if completeness.gaps(r).missing_required:
+            continue
+        # And what the order itself says. Without this the block promised "Post 16 lines" over rows
+        # the purchase order had already received in full, or that matched no line at all — the
+        # count that read 330 across this page while 56 could post.
+        verdict = line_verdicts.get(r["id"])
+        if verdict is not None and verdict.state == read_views.BLOCKED:
+            continue
+        to_post[did] += 1
     for r in records:
         package = f"{_num(r['package_quantity'])} {r['package_uom'] or ''}".strip()
         po = delivery.get(r["po_number"])
@@ -553,7 +876,22 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             # would fail `test_ui_html.py`. Its label carries the outcome where there is one, so a
             # posted row reads "Posted" rather than inviting a second attempt that the ledger
             # would only refuse.
-            _post_cell(posted.get(r["id"]), r, has_pod=r["source_email_id"] in pod_emails),
+            _post_cell(posted.get(r["id"]), r, has_pod=r["source_email_id"] in pod_emails,
+                       line_verdict=line_verdicts.get(r["id"]),
+                       delivery=(DeliveryCell(
+                           delivery_id=int(r["delivery_id"]),
+                           is_first=heads_delivery.get(r["delivery_id"]) == r["id"],
+                           lines=int(shown_per_delivery.get(r["delivery_id"], 1)),
+                           to_post=int(to_post.get(r["delivery_id"], 0)),
+                           report_due=r["delivery_id"] in report_due,
+                           verify_record_id=verify_target.get(r["delivery_id"]))
+                           if r["delivery_id"] else None)),
+            # Correct this row by hand. Beside Verify and Post rather than at the far right, for
+            # the reason the comment above gives about this table's width — and next to them
+            # specifically, so "what may I do to this row" is answered in one glance instead of
+            # three places. A plain link, not a `data-verify` button: what a reviewer types has to
+            # survive a refusal, and re-rendering a page does that with no script at all.
+            _edit_cell(r, posted.get(r["id"])),
             # Whether a receiver line could be built from this row, in front of the row itself.
             # It is the question this page exists to answer, and it used to be the sixth column.
             _gap_badge(r),
@@ -562,7 +900,8 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             # this line was read from, so the two can be compared.
             html.Raw(str(html.tag("a", r["po_number"], href=f"/ui/po/{r['po_number']}")) + " "
                      + str(html.mail_link(r["source_email_id"], "✉",
-                                          title="Open the email this line was read from"))),
+                                          title="Open the email this line was read from"))
+                     + str(_delivery_marker(r, seen_deliveries, shown_per_delivery))),
             html.badge(po.label, po.status) if po else html.muted("—"),
             _mm(_stamp(r["spec_code"]), mm, "spec"),
             _clipped(r["item_description"], 46),
@@ -595,6 +934,17 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
 
     body = html.section(
         "",
+        # A save that redirects here used to arrive silently, so the only confirmation was finding
+        # the row again in a table of twenty-five. `?corrected=` was already being set and read by
+        # nothing.
+        html.banner(f"Record #{corrected} saved.", kind="good") if corrected else "",
+        # Same defect, same fix, twice more. `?waived=` has been set by `waive_pod` since it was
+        # written and read by nothing, so accepting a delivery with no proof returned somebody to a
+        # table of twenty-five rows with no sign it had worked.
+        html.banner(f"The proof for delivery #{settled} is settled — its lines are ready to post.",
+                    kind="good") if settled else "",
+        html.banner(f"Record #{waived} accepted without a proof of delivery.",
+                    kind="good") if waived else "",
         html.tag(
             "div",
             html.search_box("records-table",
@@ -609,17 +959,22 @@ def records_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> 
             class_="controls",
         ),
         html.table(
-            ["#", "Verify", "Post", "Complete", "PO", "Status", "Spec", "Description",
+            ["#", "Verify", "Post", "Edit", "Complete", "PO", "Status", "Spec", "Description",
              "Qty", "Unit", "Tracking", "Received by", "Line", "Package", "POD date", "Carrier",
              "Conf", "Origin", "Source", "From email"],
             rows, empty=_EMPTY_HINT, table_id="records-table", page_size=25, pane=True,
-            date_column="POD date", no_sort=("Verify", "Post"),
+            date_column="POD date", no_sort=("Verify", "Post", "Edit"),
             num_columns=("Qty", "Conf"),
             # The tick is what makes "Verify all against Spitfire" mean "verify these five".
             select_ids=[r["id"] for r in records], select_noun="record",
             choice_values=choice_values,
             frag_urls=[f"/ui/po/{quote(r['po_number'])}/bar" for r in records],
             frag_title="Show this delivery's progress",
+            # One unit per delivery rather than per row: searching a purchase order returns its
+            # whole block, and a page boundary cannot fall between an item and the delivery it
+            # arrived on. A line with no delivery yet is its own group, so it is never swept into
+            # a neighbouring one.
+            group_keys=[str(r["delivery_id"] or f"row-{r['id']}") for r in records],
         ),
     )
     # The Receiver report sheet used to sit under this table, with its own search, its own pager and
@@ -704,9 +1059,10 @@ def verify_record_fragment(record_id: int, line: Optional[int] = None,
     """One record's comparison. `line` is a reviewer overriding which PO line to compare against,
     posted by the alternatives table inside the popup — the same endpoint, so the dialog refills
     in place rather than the reader losing the record they were reading."""
-    rows = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
-    if not rows:
+    row = _fixable_record_or_none(conn, record_id)
+    if row is None:
         return str(html.tag("p", "No such record.", class_="empty"))
+    rows = [row]
     result = po_verify.verify_records(conn, rows, chosen_line=line)[0]
 
     # Keep what it worked out. Verifying used to resolve the line, render it, and forget it, so a
@@ -717,7 +1073,7 @@ def verify_record_fragment(record_id: int, line: Optional[int] = None,
     if not kept.ok:
         return str(_verification(result))
 
-    fresh = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
+    fresh = [r for r in (_fixable_record_or_none(conn, record_id),) if r is not None]
     banner = html.banner(f"{kept.applied[0]} — {kept.message}", kind="good")
     if not fresh:
         return str(banner) + str(_verification(result))
@@ -738,11 +1094,11 @@ def complete_record_fragment(record_id: int, line: Optional[int] = None,
     A POST for the same reason Verify is: it changes stored data, and a GET would let a prefetch
     do it. The reply is the verification fragment so the dialog shows the effect immediately.
     """
-    rows = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
-    if not rows:
+    row = _fixable_record_or_none(conn, record_id)
+    if row is None:
         return str(html.tag("p", "No such record.", class_="empty"))
 
-    outcome = record_completion.complete(conn, rows[0], line=line)
+    outcome = record_completion.complete(conn, row, line=line)
 
     parts = [html.tag("h3", "Completed from the POD" if outcome.ok else "Not completed"),
              html.tag("p", outcome.message, class_="" if outcome.ok else "warn")]
@@ -750,9 +1106,10 @@ def complete_record_fragment(record_id: int, line: Optional[int] = None,
         parts.append(html.tag("ul", *[html.tag("li", a) for a in outcome.applied]))
 
     if outcome.ok:
-        # Re-read: `records_ready` filters on the very columns just written, so the row in hand is
-        # stale and the comparison below must be built from what is now stored.
-        fresh = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
+        # Re-read: the row in hand is stale the moment `complete` writes, and the comparison below
+        # has to be built from what is now stored — including, in the good case, a record that has
+        # just become complete and moved to the Records page.
+        fresh = [r for r in (_fixable_record_or_none(conn, record_id),) if r is not None]
         if fresh:
             parts.append(html.Raw(str(_verification(
                 po_verify.verify_records(conn, fresh, chosen_line=line)[0]))))
@@ -772,9 +1129,101 @@ def complete_record_fragment(record_id: int, line: Optional[int] = None,
 
 
 def _record_or_none(conn, record_id: int):
-    """A record the *write* stages may act on — one the Records page is currently offering."""
+    """A record the *write* stages may act on — one the Records page is currently offering.
+
+    Still `records_ready`, and now stronger for it: that list means *postable*, so a record with a
+    gap cannot be reached by the Post button at all rather than reaching `post_decision` and being
+    refused at gate 1. The fixable-but-not-postable case has its own lookup,
+    `_fixable_record_or_none` — the two must not be swapped, and the difference is exactly the one
+    a reviewer feels: Fill works on an incomplete record, Post does not.
+    """
     rows = [r for r in read_views.records_ready(conn) if r["id"] == record_id]
     return rows[0] if rows else None
+
+
+def _edit_block_reason(attempt) -> str:
+    """Why this record may no longer be corrected by hand, or `""` if it may.
+
+    Read off the **ledger**, not off `status`. `spitfire_post._mark_pushed` moves a record to
+    `pushed_to_spitfire` only when every step landed — receipt, POD, report, read-back — so a row
+    carrying a real receipt with the receiver report still outstanding is `pending`, is on the
+    Records page, and passes `records_fixable`. Judging this by status therefore offered a
+    correction on a delivery Premier's ERP already holds a document for.
+
+    `FLAGGED` is deliberately not a reason. A refusal is the thing an edit exists to fix, and
+    blocking it would close the only recovery path the record has.
+    """
+    if attempt is None or not attempt.is_blocking:
+        return ""
+    if attempt.state == post_ledger.POD_POSTED:
+        named = attempt.receipt_doc_no or (attempt.receipt_key or "")[:8]
+        return (f"Receipt {named or 'for this delivery'} is already in Spitfire carrying this "
+                f"delivery's proof. Correcting the record now would make it disagree with a "
+                f"document Premier holds. Only the receiver report is still to send.")
+    if attempt.state == post_ledger.PARTIAL:
+        return ("A half-built receipt for this row exists in Spitfire. It needs a person before "
+                "anything else about this record is changed.")
+    if attempt.state == post_ledger.CLAIMED:
+        since = (attempt.claimed_at or "")[:10]
+        return (f"A post claimed this row{f' on {since}' if since else ''} and has not settled. "
+                f"Editing while a write is in flight would change what is being sent.")
+    return (f"This record has been posted to Spitfire ({attempt.state}) and is no longer "
+            f"something a correction can change.")
+
+
+def _edit_cell(row, attempt) -> html.Raw:
+    """Correct this record by hand, or say why it can no longer be corrected.
+
+    A `<button aria-disabled>` rather than a `<span>` for the blocked case, and the choice is not
+    cosmetic. The row-click handler in `html._JS` bails on any click landing inside
+    `a,button,input,label`; a span is in none of those, so clicking a *dead* control would open the
+    delivery fragment dialog, and widening that selector would break the test that pins it.
+    `aria-disabled` rather than `disabled` because a disabled control is not focusable and its
+    `title` is suppressed — and here the tooltip is the entire message.
+    """
+    reason = _edit_block_reason(attempt)
+    if not reason:
+        return html.tag("a", "Edit", href=f"/ui/records/{row['id']}/edit?from=records",
+                        class_="btn small",
+                        title="Correct this record's fields. Saved here, never sent to Spitfire.")
+    return html.tag("button", "Edit", type="button", class_="btn small",
+                    aria_disabled="true", title=reason)
+
+
+def _fixable_record_or_none(conn, record_id: int):
+    """A record a person may still work on — complete or not.
+
+    Deliberately **not** `records_ready`. That list now means "postable", so the moment
+    completeness became part of it, resolving Verify and Fill through it made both controls
+    unreachable for exactly the records that need them: a record with a gap would answer
+    "No such record" to the one button that closes gaps.
+
+    This is the second time that shape has bitten. `_any_record_or_none` below exists because
+    reading Verify POD through `records_ready` made it unreachable for every record it applied to,
+    once posting moved a record out of that view. Same trap, different filter.
+
+    Scoped to `records_fixable` rather than the whole table: a posted record is not fixable, and
+    editing one would change what a receipt already sent to Premier says it received. Wider than
+    `records_ready` in the other direction — a quantity conflict and a zero confidence are reasons
+    a record *needs* correcting, not reasons it cannot be.
+    """
+    rows = [r for r in read_views.records_fixable(conn) if r["id"] == record_id]
+    return rows[0] if rows else None
+
+
+def _editable_record_or_none(conn, record_id: int):
+    """A record the edit form may open, and why not when it may not: `(row, reason)`.
+
+    Narrower than `_fixable_record_or_none`, and only for the edit form. Verify and Fill go on
+    working on a record the ledger blocks — Verify writes nothing a receipt could contradict, and
+    Fill takes its values off the proof of delivery rather than from a person — so tightening the
+    shared helper would have withdrawn two controls that were doing no harm.
+    """
+    row = _fixable_record_or_none(conn, record_id)
+    if row is None:
+        return None, ""
+    reason = _edit_block_reason(post_ledger.latest_for_record(conn, record_id))
+    return (None, reason) if reason else (row, "")
 
 
 def _any_record_or_none(conn, record_id: int):
@@ -793,12 +1242,12 @@ def _any_record_or_none(conn, record_id: int):
         conn.row_factory = prior
 
 
-def _write_guarded(conn, record_id: int, action, headings):
-    """Run one Spitfire write for one record, behind the two guards every write here keeps.
+def _write_refused() -> Optional[str]:
+    """The refusals that apply to *every* write to Premier's ERP, or None to go ahead.
 
-    The kill switch and `runner._LOCK` are not per-route policy — they are the reason a stop is a
-    stop and a double-submit is a no-op rather than two receipts — so both stages and nothing else
-    go through here.
+    Shared by the per-record and the per-delivery routes rather than copied into each. These are
+    not per-route policy — they are the reason a stop is a stop — and a second copy is how one of
+    them quietly stops applying to the newer path.
     """
     if killswitch.is_stopped():
         return str(_post_outcome_fragment(
@@ -816,25 +1265,57 @@ def _write_guarded(conn, record_id: int, action, headings):
             message=("Spitfire can only be written to from Premier's office network, and this "
                      "session is replaying recorded responses. Verifying and reading still work; "
                      "posting does not.")))
+    return None
 
-    row = _record_or_none(conn, record_id)
-    if row is None:
-        return str(html.tag("p", "No such record.", class_="empty"))
 
-    # A second caller is turned away rather than queued, so a double-submit is a no-op rather than
-    # two receipts. The ledger is the durable half of the same guard, for a restart between clicks.
+def _run_locked(action, headings, *args):
+    """Run one write with the single-writer lock held, and render its outcome.
+
+    A second caller is turned away rather than queued, so a double-submit is a no-op rather than two
+    receipts. The ledger is the durable half of the same guard, for a restart between clicks.
+    """
     if not runner._LOCK.acquire(blocking=False):
         return str(_post_outcome_fragment(
             ok=False, heading="Busy",
             message="the automation is mid-run — wait for it to finish and try again."))
     try:
-        result = action(conn, row)
+        result = action(*args)
     finally:
         runner._LOCK.release()
 
     heading = headings.get(result.state, "Posted" if result.ok else "Failed")
     return str(_post_outcome_fragment(ok=result.ok, heading=heading, message=result.message,
                                       result=result))
+
+
+def _write_guarded(conn, record_id: int, action, headings):
+    """Run one Spitfire write for one record, behind the guards every write here keeps."""
+    refusal = _write_refused()
+    if refusal is not None:
+        return refusal
+
+    row = _record_or_none(conn, record_id)
+    if row is None:
+        return str(html.tag("p", "No such record.", class_="empty"))
+
+    return _run_locked(action, headings, conn, row)
+
+
+def _delivery_write_guarded(conn, delivery_id: int, action, headings):
+    """Run one Spitfire write for one whole delivery, behind the same guards.
+
+    Deliberately the same three, in the same order, reached through the same two helpers: the kill
+    switch, the offline refusal, then the lock. This is the route that creates a receipt carrying
+    twenty item lines, so it is the last place a guard should be re-implemented slightly differently.
+    """
+    refusal = _write_refused()
+    if refusal is not None:
+        return refusal
+
+    if deliveries_store.get(conn, delivery_id) is None:
+        return str(html.tag("p", "No such delivery.", class_="empty"))
+
+    return _run_locked(action, headings, conn, delivery_id)
 
 
 _POST_HEADINGS = {"flagged": "Not posted", "session_expired": "Session expired",
@@ -942,6 +1423,33 @@ def verify_pod_fragment(record_id: int,
                                       result=result))
 
 
+def _by_receipt(attempts) -> list:
+    """Ledger rows collapsed into the receipts they describe, newest first.
+
+    The ledger keeps one row per item line — thirty readers key on `record_id`, and a mixed group
+    (seventeen posted, three flagged) is only expressible at that grain. A person reading these
+    sections is looking for a *document*, so the collapse happens here, in the presentation, for the
+    same reason `post_ledger.blocked()` leaves its grouping to the page.
+
+    A row with no `receipt_key` is its own group: it describes an attempt that never became a
+    document, and merging those together would invent a receipt that does not exist.
+    """
+    groups: "OrderedDict[str, list]" = OrderedDict()
+    for attempt in attempts:
+        key = attempt.receipt_key or f"no-receipt-{attempt.id}"
+        groups.setdefault(key, []).append(attempt)
+    return list(groups.values())
+
+
+def _lines_cell(group) -> html.Raw:
+    """How many item lines one receipt carries, and which records they came from."""
+    records = ", ".join(str(a.record_id) for a in group[:8])
+    if len(group) > 8:
+        records += f", +{len(group) - 8} more"
+    return html.tag("span", f"{len(group)} line{'s' if len(group) != 1 else ''}",
+                    title=f"record{'s' if len(group) != 1 else ''} {records}")
+
+
 def _posted_receipts(conn: sqlite3.Connection) -> list:
     """Everything that reached Spitfire, each with the control that proves it is still there.
 
@@ -953,15 +1461,21 @@ def _posted_receipts(conn: sqlite3.Connection) -> list:
     done = [a for a in post_ledger.latest_by_record(conn) if a.state == post_ledger.POSTED]
     if not done:
         return []
-    rows = [[html.badge(a.receipt_doc_no or a.receipt_key[:8], "good"),
-             a.po_number,
-             html.when((a.settled_at or a.claimed_at or "")[:16]),
-             html.verify_button(f"/ui/records/{a.record_id}/verify-pod", "Verify POD",
+    # One row per **receipt**, not per record. A delivery of twenty item lines is one receipt with
+    # twenty ledger rows, and listing them all would draw the same receipt number twenty times and
+    # bury every other receipt under it. The grain of this table is what a person went to Spitfire
+    # to look at, which is a document.
+    receipts = _by_receipt(done)
+    rows = [[html.badge(group[0].receipt_doc_no or group[0].receipt_key[:8], "good"),
+             group[0].po_number,
+             html.when((group[0].settled_at or group[0].claimed_at or "")[:16]),
+             _lines_cell(group),
+             html.verify_button(f"/ui/records/{group[0].record_id}/verify-pod", "Verify POD",
                                 title="Re-read the POD from Spitfire and re-check its hash",
-                                small=True, ghost=True)] for a in done]
+                                small=True, ghost=True)] for group in receipts]
     return [html.section(
-        f"Posted to Spitfire ({len(done)})",
-        html.table(["Receipt", "Purchase order", "Posted", "Proof"], rows,
+        f"Posted to Spitfire ({len(receipts)})",
+        html.table(["Receipt", "Purchase order", "Posted", "Lines", "Proof"], rows,
                    empty="Nothing has been posted.", table_id="posted-receipts",
                    page_size=25, date_column="Posted"),
         note=("Verify POD re-reads the receipt from Spitfire and re-compares the catalog's hash "
@@ -982,18 +1496,65 @@ def _awaiting_report(conn: sqlite3.Connection) -> list:
     waiting = post_ledger.awaiting_report(conn)
     if not waiting:
         return []
-    rows = [[html.badge(a.receipt_doc_no or a.receipt_key[:8], "warn"),
-             a.po_number,
-             f"record {a.record_id}",
-             html.when((a.settled_at or a.claimed_at or "")[:16])] for a in waiting]
+    # One row per receipt — see `_posted_receipts`. Twenty rows reading "receipt 0007" would make
+    # one unfinished document look like twenty.
+    receipts = _by_receipt(waiting)
+    rows = [[html.badge(group[0].receipt_doc_no or group[0].receipt_key[:8], "warn"),
+             group[0].po_number,
+             _lines_cell(group),
+             html.when((group[0].settled_at or group[0].claimed_at or "")[:16])]
+            for group in receipts]
     return [html.section(
-        f"Proof of delivery posted, report outstanding ({len(waiting)})",
-        html.table(["Receipt", "Purchase order", "Record", "POD posted"], rows,
+        f"Proof of delivery posted, report outstanding ({len(receipts)})",
+        html.table(["Receipt", "Purchase order", "Lines", "POD posted"], rows,
                    empty="Nothing is waiting.", table_id="awaiting-report",
                    page_size=25, date_column="POD posted"),
         note=("The receipt exists in Spitfire with the proof of delivery attached. Press "
               "Post report on the record to finish it — the receipt stays In Process either way, "
               "so nothing is routed and no one is emailed."),
+    )]
+
+
+def _stranded_posts(conn: sqlite3.Connection) -> list:
+    """Claims whose chain died mid-flight, and which nothing else in this product shows.
+
+    `CLAIMED` is not a resting state — a row still at it means the process was killed between
+    reserving the work and recording what happened, and Spitfire may be holding a receipt our
+    records do not know is finished. Record 234 on PO 912560 sat like that from 26 August: the
+    receipt, the POD upload and the attach had all succeeded, and because `CLAIMED` is in
+    `BLOCKING`, the Post button was not drawn, "Post report" and "Verify POD" both answered that
+    nothing had been posted, and posting again said "still in flight" about a process that had
+    been dead for a day.
+
+    It appeared in no queue. `blocked()` lists only `FLAGGED` and `awaiting_report()` only
+    `POD_POSTED`, so the sole trace anywhere was the word "Posting…" in one cell of one table.
+    A half-finished write to Premier's ERP is the last thing that should be discoverable only by
+    noticing it.
+    """
+    stranded = post_ledger.stranded(conn)
+    if not stranded:
+        return []
+
+    rows = []
+    for attempt in stranded:
+        rows.append([
+            html.Raw(f"#{attempt.record_id}"),
+            attempt.po_number or html.muted("—"),
+            attempt.receipt_doc_no or (html.muted("not created")
+                                       if not attempt.receipt_key else attempt.receipt_key[:8]),
+            html.when((attempt.claimed_at or "")[:16]),
+            ("a receipt exists and may be unfinished" if attempt.receipt_key
+             else "nothing was created before it died"),
+        ])
+    return [html.section(
+        f"Posts that died mid-flight ({len(stranded)})",
+        html.table(["Record", "PO", "Receipt", "Claimed", "What may be outstanding"],
+                   rows, empty="Nothing is stranded.", table_id="stranded-posting",
+                   page_size=25, date_column="Claimed"),
+        note=("These are stuck: the record shows “Posting…” and every way out of it refuses, "
+              "because the state that blocks a duplicate post also blocks the repair. Run "
+              "`python -m tools.settle_stranded_posts --dry-run` — it reads each receipt back "
+              "from Spitfire and settles the row as whatever is actually on it."),
     )]
 
 
@@ -1038,22 +1599,183 @@ def _blocked_from_posting(conn: sqlite3.Connection) -> list:
 
 
 def _emails_with_a_possible_pod(conn: sqlite3.Connection) -> set:
-    """Emails that could yield a proof of delivery, in one query.
+    """Delegates to `read_views`, which owns this query so `records_postable` can ask it too.
 
-    Deliberately a *superset* of what `spitfire_post._pod_for` will accept: any non-inline
-    attachment already flagged `is_pod`, plus any PDF, because `_pod_for` re-reads a PDF that
-    carries no stored verdict. Erring wide is the safe direction — this decides whether the Post
-    button is drawn at all, and hiding a button on a record that would actually post is a worse
-    failure than showing one that then refuses.
+    Kept as a name here because the page reads better for it, and because a second copy of the
+    query was exactly how the Post button and the posting gate came to disagree.
     """
-    rows = conn.execute(
-        "SELECT DISTINCT email_id FROM attachment_ledger "
-        "WHERE COALESCE(is_inline, 0) = 0 "
-        "  AND (COALESCE(is_pod, 0) = 1 OR sniffed_kind = 'pdf')").fetchall()
-    return {r[0] for r in rows}
+    return read_views.emails_with_a_possible_pod(conn)
 
 
-def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
+def _post_status(attempt, record, *, has_pod: bool = True, line_verdict=None) -> html.Raw:
+    """What happened to one item line, with no control on it.
+
+    Drawn on every row of a delivery block except the first. The state is still per row — each item
+    line is its own row on the receipt and can be flagged on its own while its neighbours post — but
+    the *control* belongs to the block, because the receipt does.
+    """
+    if attempt is not None and attempt.state == post_ledger.POSTED:
+        return html.muted(f"Posted {attempt.receipt_doc_no}".rstrip())
+    if attempt is not None and attempt.state == post_ledger.POD_POSTED:
+        where = attempt.receipt_doc_no or attempt.receipt_key[:8]
+        return html.Raw(str(html.muted(f"on receipt {where}".rstrip())) + " "
+                        + str(html.badge("report pending", "warn")))
+    if attempt is not None and attempt.state == post_ledger.PARTIAL:
+        return html.badge("Partial", "warn")
+    if attempt is not None and attempt.state == post_ledger.CLAIMED:
+        since = (attempt.claimed_at or "")[:10]
+        return html.muted(f"Posting… (since {since})" if since else "Posting…")
+    if attempt is not None and attempt.state == post_ledger.FLAGGED:
+        # The reason rides on the badge itself rather than on an empty element beside it: an
+        # invisible span holding the only explanation is unreachable by mouse and by screen reader.
+        # Acting on it means posting the delivery, and that button is on the first row of the block.
+        again = f" · tried {attempt.attempts}×" if attempt.attempts > 1 else ""
+        return html.tag("span", html.badge("blocked", "hold"),
+                        title=f"Last refused: {attempt.detail}{again}")
+
+    # The order's own verdict, from the mirror, asked first and for the same reason the gate-2
+    # comment below gives: a different answer here would have the block's first row offering Post
+    # while its siblings said the line was already received.
+    if line_verdict is not None and line_verdict.state == read_views.BLOCKED:
+        return html.Raw(str(_clipped(line_verdict.reason, 44)))
+
+    # The same predicate `_post_cell` uses. These are the *other* rows of a delivery block, so a
+    # different answer here would have the first row offering Post while its siblings said "no POD"
+    # about the same delivery.
+    if not post_decision.can_post_offline(record, has_pod_bytes=has_pod):
+        # Pointed at the delivery, not the record, wherever the row belongs to one. A delivery is
+        # received as one receipt, so its proof is one decision; sending a reviewer to the
+        # per-record page from a block of thirty-two rows would ask for thirty-two signatures, and
+        # the reflex press is what the signed page exists to prevent. The per-record page stays for
+        # records that belong to no delivery, which is what it was built for.
+        delivery_id = _maybe(record, "delivery_id")
+        where = (f"/ui/deliveries/{int(delivery_id)}/proof" if delivery_id
+                 else f"/ui/records/{record['id']}/waive-pod")
+        return html.Raw(
+            str(html.muted("no POD")) + " "
+            + str(html.tag("a", "Accept anyway", class_="btn ghost small", href=where,
+                           title="Pick the file that proves this delivery, or record that there "
+                                 "is none and it may be posted without one")))
+    gaps = completeness.gaps(record)
+    if gaps.missing_required:
+        return html.muted(f"{len(gaps.missing_required)} gaps")
+    return html.muted("with delivery")
+
+
+def _delivery_head_cell(delivery, attempt, record, *, has_pod: bool, offline: bool,
+                        verify, line_verdict=None) -> html.Raw:
+    """The controls for a whole delivery block, drawn on its first row.
+
+    **Aggregated over the block, never read off the row that happens to come first.** That row may
+    itself be finished while its neighbours have never been posted at all — which is not a corner
+    case but the ordinary state of every delivery that was part-posted before grouping existed. PO
+    907249 is the live example: line 2 was posted on its own, so the head row sat at `POD_POSTED`
+    and the cell offered only "Post report", leaving the other nineteen lines of the same truck with
+    no way to be posted at all. A dead end, and one that only appears on exactly the deliveries this
+    feature was built to rescue.
+
+    So the two questions are asked of the delivery: is anything still waiting to be posted, and does
+    a receipt of this delivery still owe its report. Both can be true at once, and then both buttons
+    are drawn — they act on two different receipts, which is correct: a line held back is never
+    added to a receipt that already exists.
+    """
+    # What happened to *this* line, when the controls do not already say it. `POD_POSTED` is
+    # omitted because the report button and its badge convey exactly that.
+    own = ""
+    if attempt is not None and attempt.state in (post_ledger.POSTED, post_ledger.PARTIAL,
+                                                 post_ledger.CLAIMED):
+        own = str(_post_status(attempt, record, has_pod=has_pod, line_verdict=line_verdict))
+
+    if offline:
+        return html.Raw(" ".join(part for part in (str(html.muted("offline")), own) if part))
+
+    controls = []
+    if delivery.to_post:
+        controls.append(str(html.verify_button(
+            f"/ui/deliveries/{delivery.delivery_id}/post-pod/confirm",
+            f"Post {delivery.to_post} line{'s' if delivery.to_post != 1 else ''}",
+            title=(f"Create one receipt on PO {record['po_number']} carrying the "
+                   f"{delivery.to_post} line(s) of this delivery that are ready to post"),
+            small=True, ghost=True)))
+    if delivery.report_due:
+        controls.append(str(html.verify_button(
+            f"/ui/deliveries/{delivery.delivery_id}/post-report/confirm", "Post report",
+            title="Add the receiver report to this delivery's receipt", small=True, ghost=True)))
+        controls.append(str(verify))
+        controls.append(str(html.badge("report pending", "warn")))
+
+    if not controls:
+        # Nothing to offer. Fall back to the per-row account — "no POD · Accept anyway", "N gaps" —
+        # so the head row still says *why* its block has no button.
+        return _post_status(attempt, record, has_pod=has_pod,
+                            line_verdict=line_verdict)
+    return html.Raw(" ".join(part for part in controls + [own] if part))
+
+
+@dataclass
+class DeliveryCell:
+    """Where a row sits in its delivery block, for the Post column.
+
+    A delivery is received as one receipt, so it gets **one** Post control — drawn on the first row
+    of the block, the same place `_delivery_marker` draws its count. Every other row of the block
+    shows what happened and offers no button, because a per-row button is how twenty item lines
+    became twenty receipts.
+
+    `to_post` and `report_due` are counted over the **whole block**, never read off the row that
+    happens to come first — see `_delivery_head_cell` for what that cost.
+    """
+    delivery_id: int
+    is_first: bool
+    lines: int
+    """How many rows of this delivery are on this page. What the delivery-count badge says."""
+
+    to_post: int = 0
+    """How many of those could plausibly post now — nothing blocking them, a POD or a waiver, and
+    no missing required field. The number the button offers. Not how many will *land*: that needs
+    the live purchase-order read the confirm dialog pays for, and the dialog is where the
+    "16 of 20" breakdown belongs."""
+
+    report_due: bool = False
+    """Some receipt of this delivery carries a proof of delivery and no receiver report yet."""
+
+    verify_record_id: Optional[int] = None
+    """Which record's POD the block's Verify button re-reads. **Not the head row's own.**
+
+    `verify_pod` resolves an attempt by `record_id`, and the row that happens to come first need
+    not be one that posted. On PO 207249 it was record 163 — refused at gate 6 for a line with
+    nothing outstanding — sitting at the head of a block whose other 19 lines are on receipt 0002.
+    The head row therefore offered a Verify POD whose only possible answer was "nothing has been
+    posted to Spitfire for this record yet", about a receipt that plainly exists.
+
+    There is one POD per receipt, so any posted line of the block answers for all of them."""
+
+
+def _why_postable(record, reason: str) -> str:
+    """Plain English for whichever of the four routes permits posting without a POD file.
+
+    The tooltip used to read "accepted by {waived_by}" unconditionally, which was true while a
+    waiver was the only way to reach it. Body evidence can reach it now, so on those records the
+    sentence would have credited a named person with a decision nobody made — and on the ones
+    where the waiver field is empty it would simply have trailed off.
+    """
+    if reason == "waived":
+        return f"accepted by {str(_maybe(record, 'pod_waived_by') or '').strip()}"
+    if reason == "signer+date":
+        return f"the mail states it was signed for by {str(_maybe(record, 'received_by') or '').strip()}"
+    if reason == "carrier+tracking+date":
+        return (f"the mail states {str(_maybe(record, 'carrier_name') or '').strip()} "
+                f"tracking {str(_maybe(record, 'tracking_number') or '').strip()}")
+    if reason == "document+date":
+        # Named rather than folded into the sentence below, for the same reason the waiver is: a
+        # person reading why a receipt may post with no proof attached needs to know whether that
+        # rests on a document somebody outside Premier wrote or on a colleague's signature.
+        return (f"a delivery document from outside Premier states "
+                f"{str(_maybe(record, 'pod_stated_date') or '').strip()}")
+    return "the delivery is stated in the mail itself"
+
+def _post_cell(attempt, record, *, has_pod: bool = True,
+               delivery: Optional[DeliveryCell] = None,
+               line_verdict=None) -> html.Raw:
     """The Post control for one row, at whichever of the two stages it has reached.
 
     Posting is two steps a person takes separately — the proof of delivery, then the receiver
@@ -1064,9 +1786,34 @@ def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
 
     What is *not* pre-judged is anything needing a live purchase-order read — an over-receive, a
     quantity that moved. Those still refuse on click, and the reason lands on the cell afterwards.
+
+    `delivery` says this row belongs to a delivery block, which is received as one receipt. The
+    control then belongs to the block rather than the row: the first row carries it and points at
+    the delivery routes, and the rest report their state without a button. Left `None` — a record
+    with no delivery, or a test — every button is the per-record one it always was.
     """
+    if delivery is not None and not delivery.is_first:
+        # A row in the middle of a block. It still says what happened to it, because each row is
+        # posted as its own receipt line and can be flagged on its own, but it offers no control:
+        # the delivery's one Post button is on the first row.
+        return _post_status(attempt, record, has_pod=has_pod,
+                            line_verdict=line_verdict)
+
+    # Where this cell's controls point, and what they offer. A delivery is received as one receipt,
+    # so its buttons address the delivery; a record with no delivery keeps the per-record routes it
+    # always had.
+    where = (f"/ui/deliveries/{delivery.delivery_id}" if delivery
+             else f"/ui/records/{record['id']}")
+    lines = delivery.lines if delivery else 1
+    post_label = f"Post {lines} lines" if delivery and lines > 1 else "Post POD"
+
+    # Verify POD re-reads one file's hash out of the catalog. For a lone record that is this row;
+    # for a delivery block it is whichever line actually reached the receipt, because the head row
+    # need not be one of them — see `DeliveryCell.verify_record_id`.
+    verify_id = (delivery.verify_record_id if delivery and delivery.verify_record_id
+                 else record["id"])
     verify = html.verify_button(
-        f"/ui/records/{record['id']}/verify-pod", "Verify POD",
+        f"/ui/records/{verify_id}/verify-pod", "Verify POD",
         title="Re-read the POD from Spitfire and re-check its hash", small=True, ghost=True)
 
     # Offline is a third certain-and-cheap refusal, alongside "no POD" and "N gaps" below: no write
@@ -1074,6 +1821,11 @@ def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
     # happened still shows — a receipt posted last week is a fact, not a control — and Verify POD
     # survives because re-checking a stored file's hash reads from the catalog, which replays.
     offline = spitfire_cassette.writes_refused()
+
+    if delivery is not None:
+        return _delivery_head_cell(delivery, attempt, record, has_pod=has_pod, offline=offline,
+                                   line_verdict=line_verdict,
+                                   verify=verify)
 
     if attempt is not None and attempt.state == post_ledger.POSTED:
         return html.Raw(str(html.muted(f"Posted {attempt.receipt_doc_no}".rstrip()))
@@ -1086,7 +1838,7 @@ def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
         # Offline, the "report pending" badge is the half that still matters — it says a real
         # receipt is unfinished — so it stays and only the button it belongs to goes.
         report = html.muted("offline") if offline else html.verify_button(
-            f"/ui/records/{record['id']}/post-report/confirm", "Post report",
+            f"{where}/post-report/confirm", "Post report",
             title=f"Add the receiver report to receipt {attempt.receipt_doc_no}".rstrip(),
             small=True, ghost=True)
         return html.Raw(
@@ -1097,19 +1849,35 @@ def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
         # one, which is the failure the ledger exists to prevent.
         return html.badge("Partial", "warn")
     if attempt is not None and attempt.state == post_ledger.CLAIMED:
-        return html.muted("Posting…")
+        # Dated, because "Posting…" on its own reads as live and this state is often anything but:
+        # `CLAIMED` never settles itself, so a chain killed mid-flight leaves it here for ever. The
+        # day it was claimed is what separates a post running right now from one abandoned in
+        # August, and it is the difference between waiting and going to look.
+        since = (attempt.claimed_at or "")[:10]
+        return html.muted(f"Posting… (since {since})" if since else "Posting…")
 
     # Nothing posted yet. Three refusals are certain and cheap to know, so no button is drawn for
     # them — the cell says which one instead, so the diagnosis stays where the reviewer is looking.
     if offline:
         return html.muted("offline")
 
-    waived_by = str(_maybe(record, "pod_waived_by") or "").strip()
-    if not has_pod and not waived_by:
-        # Was a dead end: the cell said "no POD" and nothing on the page could act on it, so every
-        # delivery stated in an email body — most Authority Inbound notifications — was permanently
-        # stuck. It is still not a Post button. Automation may not decide that a receipt can go to
-        # Premier's ERP with no proof behind it; a named person may, on a page that says so.
+    # The same question `post_decision` gate 2 asks, asked through the same function. This used to
+    # be `if not has_pod and not waived_by` — which never considered `body_evidence`, Premier's
+    # 2026-08-22 route for a delivery stated entirely in the mail. Eleven records the gate would
+    # have accepted were shown a prompt asking someone to waive a proof that was not required.
+    #
+    # What the purchase order says comes first, from the mirror: a row the order itself refuses
+    # says why rather than offering a control whose only outcome is that refusal. `UNCHECKED`
+    # deliberately falls through and keeps its button — an order nobody has read yet is not a
+    # reason to refuse a delivery.
+    if line_verdict is not None and line_verdict.state == read_views.BLOCKED:
+        return html.Raw(str(_clipped(line_verdict.reason, 44)))
+
+    may_post = post_decision.can_post_offline(record, has_pod_bytes=has_pod)
+    if not may_post:
+        # Still not a Post button. Automation may not decide that a receipt can go to Premier's ERP
+        # with no proof behind it; a named person may, on a page that says so. What changed is only
+        # that this is now the genuinely last resort rather than the first thing offered.
         return html.Raw(
             str(html.muted("no POD")) + " "
             + str(html.tag("a", "Accept anyway", class_="btn ghost small",
@@ -1130,22 +1898,30 @@ def _post_cell(attempt, record, *, has_pod: bool = True) -> html.Raw:
         again = f" · tried {attempt.attempts}×" if attempt.attempts > 1 else ""
         return html.Raw(
             str(html.verify_button(
-                f"/ui/records/{record['id']}/post-pod/confirm", "Post POD",
+                f"{where}/post-pod/confirm", post_label,
                 title=f"Last refused: {attempt.detail}{again}", small=True, ghost=True))
             + " " + str(html.badge("blocked", "hold")))
 
     if not has_pod:
         return html.Raw(
             str(html.verify_button(
-                f"/ui/records/{record['id']}/post-pod/confirm", "Post receipt",
+                f"{where}/post-pod/confirm",
+                f"Post {lines} lines" if delivery and lines > 1 else "Post receipt",
+                # Names whichever route permits this, because there are now three and they are
+                # not interchangeable: a person accepted it, or the mail itself states a signer or
+                # a carrier reference. Reading "accepted by" on a record nobody accepted would put
+                # a name against a judgement that was never made.
                 title=(f"Create a receipt on PO {record['po_number']}. It will carry no proof of "
-                       f"delivery — accepted by {waived_by}."),
+                       f"delivery — {_why_postable(record, may_post)}."),
                 small=True, ghost=True))
             + " " + str(html.badge("no proof", "warn")))
 
     return html.verify_button(
-        f"/ui/records/{record['id']}/post-pod/confirm", "Post POD",
-        title=f"Create a receipt on PO {record['po_number']} and attach the proof of delivery",
+        f"{where}/post-pod/confirm", post_label,
+        title=(f"Create one receipt on PO {record['po_number']} carrying this delivery's "
+               f"{lines} item lines, and attach the proof of delivery" if delivery and lines > 1
+               else f"Create a receipt on PO {record['po_number']} and attach the proof of "
+                    f"delivery"),
         small=True, ghost=True)
 
 
@@ -1158,15 +1934,21 @@ def _maybe(row, name):
 
 
 def _post_outcome_fragment(*, ok: bool, heading: str, message: str,
-                           result=None) -> html.Raw:
+                           result=None, extra=None) -> html.Raw:
     """What the dialog shows afterwards.
 
     The steps are listed even on success, because "posted" alone does not tell a reviewer that the
     pay requests were linked or that one of them was not — and on a partial post the list is the
     only record of how far it got that a person will actually read.
+
+    `extra` is markup already built by the caller, placed between the message and the steps. A
+    delivery post uses it for the per-line breakdown: which item lines went onto the receipt and
+    which did not, which is a table rather than a sentence.
     """
     parts = [html.tag("h3", heading),
              html.tag("p", message, class_="" if ok else "warn")]
+    if extra is not None:
+        parts.append(extra)
     if result is not None and result.receipt_doc_no:
         parts.append(html.tag("p", html.Raw(
             f"Receipt {_escape(result.receipt_doc_no)} on purchase order "
@@ -1176,6 +1958,180 @@ def _post_outcome_fragment(*, ok: bool, heading: str, message: str,
     if result is not None and result.steps:
         parts.append(html.tag("ul", *[html.tag("li", s) for s in result.steps]))
     return html.Raw("".join(str(p) for p in parts))
+
+
+
+
+# --- posting a whole delivery -------------------------------------------------------------------
+# One receipt per (purchase order, delivery), carrying one row per item line. The per-record routes
+# above stay for records that belong to no delivery; these are what the Records page offers on a
+# delivery block, and they are why a truck of twenty lines stops becoming twenty receipts.
+
+
+def _line_table(lines, *, posted: bool) -> html.Raw:
+    """The item lines going onto a receipt, or the ones being left off it, as a small table.
+
+    Shown before anything is created, because this dialog is the last moment a person can catch a
+    line matched to the wrong purchase-order row — after the click there is a permanent document.
+    """
+    rows = []
+    for line in lines:
+        rows.append([
+            (f"{line.line_number:04d}" if line.line_number is not None else html.muted("—")),
+            _clipped(line.description, 44),
+            (f"{po_verify.fmt_qty(line.quantity)} {line.unit_of_measure}".strip()
+             if posted else html.muted("—")),
+            html.muted("") if posted else _clipped(line.reason, 96),
+        ])
+    headers = (["Line", "Description", "Qty", ""] if posted
+               else ["Line", "Description", "", "Why not"])
+    return html.table(headers, rows, empty="none")
+
+
+def _pod_way_out(delivery_id: int, blocked: int) -> html.Raw:
+    """The link out of a dialog that has just refused every line for having no proof.
+
+    Before this, that dialog was the end of the road: it said none of the thirty-two lines could
+    post, gave the reason, and offered nothing — while the escape hatch existed the whole time, one
+    page away, drawn only on rows the page did not believe had a proof. Measured 2026-09-10, the
+    page believed wrongly about 91 of 107 rows.
+
+    A plain anchor, not a `data-verify` button: this navigates to a page rather than swapping a
+    fragment, and the one inline script only intercepts the handful of `data-` attributes it owns.
+    """
+    return html.Raw(str(html.tag(
+        "p",
+        html.tag("a", f"Settle the proof for {blocked} line{'s' if blocked != 1 else ''}",
+                 class_="btn", href=f"/ui/deliveries/{delivery_id}/proof",
+                 title="Pick the file on this message that proves the delivery, or accept that "
+                       "there is none"))))
+
+
+def _delivery_confirm(delivery_id: int, conn, *, stage: str) -> str:
+    """Say exactly what is about to be created, then offer the button that creates it.
+
+    A POST that only reads — the dialog script always POSTs, and this codebase already has the
+    shape. It runs the real gates rather than guessing, so the counts here are the counts that will
+    happen; that costs one live purchase-order read, which is the same read the single-record
+    confirm has always paid and is why it is not done on page render.
+    """
+    delivery = deliveries_store.get(conn, delivery_id)
+    if delivery is None:
+        return str(html.tag("p", "No such delivery.", class_="empty"))
+    po_number = str(delivery["po_number"] or "")
+
+    rows = spitfire_post.delivery_rows(conn, delivery_id)
+    if not rows:
+        return str(_post_outcome_fragment(
+            ok=False, heading="Nothing to post",
+            message=("no line of this delivery is ready — they are held back as quantity "
+                     "conflicts, incomplete, or already posted.")))
+
+    plans, _ = spitfire_post.plan_delivery(conn, rows)
+    going = [p for p in plans if p.ok]
+    skipped = [p for p in plans if not p.ok]
+
+    blocked_on_pod = [p for p in skipped if p.blocked_on_pod]
+    if not going:
+        return str(_post_outcome_fragment(
+            ok=False, heading="Nothing to post",
+            message=(f"none of the {len(plans)} lines on this delivery can be posted right now. "
+                     f"Each reason is below."),
+            extra=html.Raw(str(_line_table(skipped, posted=False))
+                           + (str(_pod_way_out(delivery_id, len(blocked_on_pod)))
+                              if blocked_on_pod else ""))))
+
+    parts = [
+        html.tag("h3", f"Post {len(going)} of {len(plans)} item lines to one receipt?"),
+        html.tag("p", html.Raw(
+            f"This creates <strong>one</strong> receipt on purchase order "
+            f"<strong>{_escape(po_number)}</strong> carrying "
+            f"<strong>{len(going)}</strong> item line"
+            f"{'s' if len(going) != 1 else ''}, uploads the proof of delivery once, checks the "
+            f"catalog's hash against ours, and attaches it.")),
+        _line_table(going, posted=True),
+    ]
+    if skipped:
+        parts += [
+            html.tag("p", html.Raw(
+                f"<strong>{len(skipped)}</strong> line{'s' if len(skipped) != 1 else ''} "
+                f"will <strong>not</strong> be on this receipt. Fixing one later puts it on a "
+                f"second receipt — a posted receipt is never reopened.")),
+            _line_table(skipped, posted=False),
+        ]
+        # The half-blocked delivery has the same dead end as the wholly-blocked one, for fewer
+        # lines and with nothing on screen to say so. Offered here too rather than only above,
+        # because "16 of 20" is exactly the shape in which the other four get forgotten.
+        if blocked_on_pod:
+            parts.append(_pod_way_out(delivery_id, len(blocked_on_pod)))
+    parts += [
+        html.tag("p", "The receiver report is not posted by this step — it becomes a separate "
+                      "button once the proof of delivery is on the receipt.", class_="sub"),
+        html.tag("p", "Nothing is routed. The receipt is left In Process for a person to approve.",
+                 class_="sub"),
+        html.verify_button(f"/ui/deliveries/{delivery_id}/post-pod",
+                           f"Post {len(going)} lines to Spitfire",
+                           title=f"Create one receipt on PO {po_number} for {len(going)} item "
+                                 f"lines and attach the proof of delivery"),
+    ]
+    return str(html.Raw("".join(str(part) for part in parts)))
+
+
+@router.post("/deliveries/{delivery_id}/post-pod/confirm", response_class=HTMLResponse)
+def post_delivery_pod_confirm_fragment(
+        delivery_id: int, conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    return _delivery_confirm(delivery_id, conn, stage="pod")
+
+
+@router.post("/deliveries/{delivery_id}/post-pod", response_class=HTMLResponse)
+def post_delivery_pod_fragment(
+        delivery_id: int, conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Create one receipt for the delivery and put every ready line and the POD on it.
+
+    Synchronous, and for several seconds. A background job would need polling, polling needs script,
+    and `tests/test_ui_html.py` pins these pages to exactly one inline block. It is also *fewer*
+    calls than posting the same lines one at a time, which is what this replaces.
+    """
+    return _delivery_write_guarded(conn, delivery_id, spitfire_post.post_delivery_pod,
+                                   _POST_HEADINGS)
+
+
+@router.post("/deliveries/{delivery_id}/post-report/confirm", response_class=HTMLResponse)
+def post_delivery_report_confirm_fragment(
+        delivery_id: int, conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    delivery = deliveries_store.get(conn, delivery_id)
+    if delivery is None:
+        return str(html.tag("p", "No such delivery.", class_="empty"))
+
+    attempts = spitfire_post.awaiting_report_group(conn, delivery_id)
+    if not attempts:
+        return str(_post_outcome_fragment(
+            ok=False, heading="Nothing to add a report to",
+            message=("the proof of delivery has not been posted for this delivery — post it "
+                     "first, and the report becomes available on the receipt it creates.")))
+
+    where = attempts[0].receipt_doc_no or attempts[0].receipt_key[:8]
+    return str(html.Raw("".join(str(part) for part in [
+        html.tag("h3", f"Post the receiver report onto receipt {where}?"),
+        html.tag("p", html.Raw(
+            f"The proof of delivery is already on this receipt. This builds "
+            f"<strong>one</strong> receiver report covering all "
+            f"<strong>{len(attempts)}</strong> item line"
+            f"{'s' if len(attempts) != 1 else ''} on it, uploads it, attaches it beside the POD, "
+            f"links purchase order <strong>{_escape(str(delivery['po_number'] or ''))}</strong> "
+            f"and any pay requests, and reads the receipt back to confirm both files are on it.")),
+        html.tag("p", "Nothing is routed. The receipt stays In Process.", class_="sub"),
+        html.verify_button(f"/ui/deliveries/{delivery_id}/post-report",
+                           "Post report to Spitfire",
+                           title="Build and attach the receiver report for the whole delivery"),
+    ])))
+
+
+@router.post("/deliveries/{delivery_id}/post-report", response_class=HTMLResponse)
+def post_delivery_report_fragment(
+        delivery_id: int, conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    return _delivery_write_guarded(conn, delivery_id, spitfire_post.post_delivery_report,
+                                   _POST_HEADINGS)
 
 
 @router.post("/records/verify", response_class=HTMLResponse)
@@ -1383,7 +2339,7 @@ def _matched_line(check, vendor_name: str = "", record_vendor: str = "") -> html
     def name_agreement(ours, theirs):
         """Vendor names, where a legal suffix is not a disagreement.
 
-        Live example, PO 208491: the mail says `Light Annex`, the purchase order says
+        Live example, PO 908491: the mail says `Light Annex`, the purchase order says
         `Light Annex, LLC`. Marking that red is the same mistake `UOM_ALIASES` exists to prevent —
         a warning that fires on a difference that is not one teaches a reader to ignore the colour,
         and then the real mismatch goes past unnoticed.
@@ -1505,7 +2461,7 @@ def _mandatory_fields(values, missing=()) -> list:
     return out
 
 
-def _pod_chooser(conn, email_id: str, chosen) -> html.Raw:
+def _pod_chooser(conn, email_id: str, chosen, *, note: str = "") -> html.Raw:
     """Which file on this message is the proof of delivery — or an explicit statement that none is.
 
     Every non-inline attachment is offered whatever its type or disposition. The three cases this
@@ -1561,19 +2517,82 @@ def _pod_chooser(conn, email_id: str, chosen) -> html.Raw:
     return html.section(
         "Proof of delivery",
         *options,
-        note=("Pick the file that proves this delivery, or say there is none. Nothing is assumed: "
-              "a record cannot be created until one of these is chosen."),
+        # Overridable because the same chooser now serves two pages that owe the reader different
+        # sentences. The create form cannot proceed without an answer here; the delivery page can
+        # be left alone entirely, and telling somebody a record "cannot be created" on a page that
+        # creates nothing is the kind of small lie that teaches people to stop reading notes.
+        note=note or ("Pick the file that proves this delivery, or say there is none. Nothing is "
+                      "assumed: a record cannot be created until one of these is chosen."),
+    )
+
+
+def _recorded_so_far(email_id: str, made) -> html.Raw:
+    """What this message has yielded so far, and the two ways to add to it.
+
+    Two buttons rather than one form that guesses. The work takes exactly two shapes — the next
+    line of the delivery just recorded, or a different purchase order named in the same message —
+    and they want opposite things from the form: one carries the PO, the date and the unit forward,
+    the other must not carry anything. A single "create another" would have to decide which as the
+    person typed, clearing fields under them when they edited the PO.
+
+    The last record created is the one another line is measured from: a message listing three POs
+    is worked one PO at a time, so "the most recent" is the delivery in hand.
+    """
+    latest = made[-1]
+    po = (latest["po_number"] or "").strip()
+    listed = ", ".join(f"#{r['id']}" for r in made)
+    who = ", ".join(sorted({str(r["created_by"] or "somebody") for r in made}))
+    return html.section(
+        "Recorded from this message",
+        html.tag("p", html.muted(f"{len(made)} so far — {listed}, by {who}.")),
+        html.tag(
+            "div",
+            html.tag("a", f"Add another line to PO {po}" if po else "Add another line",
+                     class_="btn", href=f"/ui/records/new?email_id={quote(email_id)}"
+                                        f"&after={latest['id']}&same_po=1",
+                     title="Same purchase order, same delivery date — a different item on it"),
+            " ",
+            html.tag("a", "Record a different PO from this message", class_="btn ghost",
+                     href=f"/ui/records/new?email_id={quote(email_id)}",
+                     title="A separate delivery that this same message reports"),
+            " ",
+            # The way out. Without it this page is a loop with no stated end, and the person who
+            # has finished has to reach for the browser's back button to say so.
+            html.tag("a", "Done — back to Needs a human", class_="btn ghost",
+                     href="/ui/manual"),
+            class_="controls",
+        ),
     )
 
 
 def _create_form(conn, email_id: str, *, values=None, chosen=None, created_by="",
-                 note_text="", problem=None) -> str:
-    """The form itself, rendered fresh or re-rendered after a refusal carrying what was typed."""
-    values = values if values is not None else record_create.prefill(conn, email_id)
+                 note_text="", problem=None, after=None, same_po=False) -> str:
+    """The form itself, rendered fresh or re-rendered after a refusal carrying what was typed.
+
+    `after` is the record just created from this message: it turns the page into the confirmation
+    for that write *and* the start of the next one. A delivery notification routinely lists several
+    lines, and the form used to end at a redirect to Records — so recording the second line meant
+    finding the message again on a queue the first line had not removed it from.
+    """
+    if values is not None:
+        seeded = values
+    elif same_po and after is not None:
+        seeded = record_create.line_seed(conn, after)
+    else:
+        seeded = record_create.prefill(conn, email_id)
+    values = seeded
 
     parts = []
     if problem is not None:
         parts.append(html.errors(problem.message, problem.missing))
+    elif after is not None:
+        parts.append(html.banner(
+            f"Record #{after} created from this message."
+            + (f" This is another line of PO {values['po_number']} — the purchase order, the "
+               f"delivery date and the unit are carried over; what the line *is* is not."
+               if same_po and values.get("po_number") else
+               " Anything below is a fresh record from the same message."),
+            kind="good"))
 
     parts.append(html.section(
         "What arrived",
@@ -1601,6 +2620,9 @@ def _create_form(conn, email_id: str, *, values=None, chosen=None, created_by=""
                                                  value=email_id),
                      *parts, submit="Create the record", cancel="/ui/manual",
                      cancel_label="Back to Needs a human")
+    made = record_create.records_from(conn, email_id)
+    if made:
+        body = html.Raw(str(body) + str(_recorded_so_far(email_id, made)))
     # The message itself, beside the form rather than in the popup over it. `bare=1` for the reason
     # `_mail_fragment_html` gives: the Create control that header would carry links back to this
     # very page, and following it throws away everything typed.
@@ -1618,9 +2640,15 @@ def _create_form(conn, email_id: str, *, values=None, chosen=None, created_by=""
 
 
 @router.get("/records/new", response_class=HTMLResponse)
-def new_record_form(email_id: str = "",
+def new_record_form(email_id: str = "", after: Optional[int] = None, same_po: bool = False,
                     conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
-    """Open the form on one message, pre-filled with whatever was already worked out about it."""
+    """Open the form on one message, pre-filled with whatever was already worked out about it.
+
+    `after` says a record was just created and names it; `same_po` says the next one is another
+    line of that same delivery rather than a different purchase order. Both are declared, unlike
+    the `?created=` the Records page has never read — a query parameter no handler names is not a
+    feature, it is a redirect writing into the void.
+    """
     if not email_id:
         return html.page("Create a record", "/ui/manual",
                          html.section("Create a record",
@@ -1630,7 +2658,7 @@ def new_record_form(email_id: str = "",
                          back="/ui/manual", back_label="Needs a human", **_chrome(conn))
     if conn.execute("SELECT 1 FROM email_log WHERE email_id = ?", (email_id,)).fetchone() is None:
         raise HTTPException(status_code=404, detail="no such message")
-    return _create_form(conn, email_id)
+    return _create_form(conn, email_id, after=after, same_po=same_po)
 
 
 @router.post("/records/new", response_class=HTMLResponse)
@@ -1677,7 +2705,13 @@ async def create_record(request: Request):
         conn.close()
     # 303: the browser must follow with a GET, or a refresh on the Records page re-submits the form
     # and stages the delivery twice.
-    return RedirectResponse(f"/ui/records?created={result.record_id}", status_code=303)
+    #
+    # Back to the message, not on to Records. One notification commonly lists several lines, and
+    # landing on Records meant the second line began by finding the message again. The page it
+    # returns to confirms the write and offers the two ways there are to continue — another line of
+    # the same PO, or a different one — with the way out beside them.
+    return RedirectResponse(
+        f"/ui/records/new?email_id={quote(email_id)}&after={result.record_id}", status_code=303)
 
 
 def _int_or_none(value):
@@ -1764,7 +2798,8 @@ async def waive_pod(record_id: int, request: Request):
     Writes nothing outbound. It is the control that lets a write happen later, so it is guarded
     like one, and the name it records is what the ledger will carry.
     """
-    by = (await _form_values(request)).get("by", "").strip()
+    posted = await _form_values(request)
+    by = posted.get("by", "").strip()
     conn = deps.pipeline_connection()
     try:
         if killswitch.is_stopped():
@@ -1776,128 +2811,1276 @@ async def waive_pod(record_id: int, request: Request):
             return HTMLResponse(_waive_page(conn, record_id, by=by, problem=result.message))
     finally:
         conn.close()
-    return RedirectResponse(f"/ui/records?waived={record_id}", status_code=303)
+    return RedirectResponse(
+        _safe_return(posted.get("return_to", ""), f"/ui/records?waived={record_id}"),
+        status_code=303)
+
+
+# --- Settling the proof for a whole delivery -----------------------------------------------------
+#
+# The way out of the dead end. A delivery whose lines gate 2 refuses used to offer a "Post N lines"
+# button, a dialog saying none of them could post, and nothing else — measured 2026-09-10, that was
+# 91 of the 107 rows the Records page believed had a proof, across 24 deliveries.
+#
+# Two outcomes, one page, because they answer the same question and a person should see both before
+# choosing: nominate a file on the message as the proof, or accept that there is none. The chooser
+# is `_pod_chooser`, unchanged from the create form, so the vocabulary a reviewer learns in one
+# place works in the other and the two cannot drift on what may be picked.
+#
+# A page and not a dialog, for the reason the section above gives: this is signed, it has a
+# consequence in Premier's ERP, and one press here covers every line of a truck.
+
+
+def _delivery_proof_page(conn, delivery_id: int, *, by: str = "", problem: str = "",
+                         chosen=None, done: str = "") -> str:
+    delivery = deliveries_store.get(conn, delivery_id)
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="no such delivery")
+    po_number = str(delivery["po_number"] or "")
+
+    blocked = spitfire_post.pod_blocked(conn, spitfire_post.delivery_rows(conn, delivery_id))
+    parts = []
+    if problem:
+        parts.append(html.errors(problem))
+    if done:
+        parts.append(html.banner(done, "good"))
+
+    if not blocked:
+        parts.append(html.section(
+            f"Delivery #{delivery_id} — PO {po_number}",
+            html.tag("p", "Every line of this delivery already has a proof of delivery, or a "
+                          "reason it does not need one. There is nothing to decide here.",
+                     class_="lede"),
+            html.tag("p", html.tag("a", "Back to Records", href="/ui/records", class_="btn")),
+        ))
+        return html.page("Proof of delivery", "/ui/records", *parts, **_chrome(conn))
+
+    # Grouped by message, because attachments belong to a message and not to a delivery. Usually one
+    # group: `deliveries_store` keys a delivery on (purchase order, delivery reference) and its
+    # docstring is explicit that one delivery may be described by several messages, so the case has
+    # to be drawn rather than assumed away. Offering email A's files against email B's records would
+    # draw a trap `choose_delivery_pod` then refuses.
+    groups = OrderedDict()
+    for block in blocked:
+        groups.setdefault(str(_maybe(block.row, "source_email_id") or ""), []).append(block)
+
+    parts.append(html.section(
+        f"Delivery #{delivery_id} — PO {po_number}",
+        html.tag("p", f"{len(blocked)} of this delivery's lines cannot be posted because nothing "
+                      f"on the message was read as a proof of delivery. Settle that here and the "
+                      f"Post button on Records will offer them.", class_="lede"),
+        note=("This does not promise these lines will post. It removes the one refusal a person "
+              "can remove — the purchase order is still read and checked when you press Post."),
+    ))
+
+    for email_id, blocks in groups.items():
+        rows = [[str(_maybe(b.row, "spec_code") or "") or html.muted("—"),
+                 _clipped(str(_maybe(b.row, "item_description") or ""), 52),
+                 f"{_num(_maybe(b.row, 'quantity_received'))} "
+                 f"{_maybe(b.row, 'unit_of_measure') or ''}".strip(),
+                 str(_maybe(b.row, "pod_stated_date") or "")] for b in blocks]
+        parts.append(html.section(
+            f"{len(blocks)} line{'s' if len(blocks) != 1 else ''} on this message",
+            html.tag("p", html.mail_link(email_id, "Read the message first",
+                                         title="What these records were built from")),
+            html.tag("p", blocks[0].reason, class_="warn"),
+            html.scroll_block(html.table(["Spec", "Description", "Qty", "POD date"], rows,
+                                         empty="none")),
+            note="Exactly the lines this decision covers. Nothing else on the delivery moves.",
+        ))
+        parts.append(html.section(
+            "What accepting means",
+            html.tag("ul",
+                     html.tag("li", f"One receipt is created in Spitfire against purchase order "
+                                    f"{po_number} carrying these {len(blocks)} item lines."),
+                     html.tag("li", "If you pick a file, it is uploaded to that receipt as the "
+                                    "proof. If you say there is none, the receipt carries the "
+                                    "receiver report and nothing else, and Premier's ERP will hold "
+                                    "nothing showing the goods arrived."),
+                     html.tag("li", "The email stays here as the audit trail, and your name is "
+                                    "recorded against each of these records for good."),
+                     html.tag("li", html.tag("b", f"This is one signature covering "
+                                                  f"{len(blocks)} lines."))),
+            html.form(
+                f"/ui/deliveries/{delivery_id}/proof",
+                html.tag("input", type="hidden", name_="email_id", value=email_id),
+                _pod_chooser(conn, email_id, chosen,
+                             note="Pick the file that proves this delivery, or say there is none. "
+                                  "A real document on the receipt is always the better answer — "
+                                  "waiving is the last resort."),
+                html.field("by", "Your name", by,
+                           hint="Required to accept a delivery with no proof. Recorded on each "
+                                "record and carried into the ledger entry for the post."),
+                submit="Settle the proof for these lines",
+                cancel="/ui/records", cancel_label="Back to Records"),
+            note="Nothing is sent to Spitfire by this page. It unblocks the Post button, which is "
+                 "still a separate press.",
+        ))
+
+    return html.page("Proof of delivery", "/ui/records", *parts, **_chrome(conn))
+
+
+@router.get("/deliveries/{delivery_id}/proof", response_class=HTMLResponse)
+def delivery_proof_form(delivery_id: int,
+                        conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Which lines of this delivery have no proof, and the two things a person may do about it."""
+    return _delivery_proof_page(conn, delivery_id)
+
+
+@router.post("/deliveries/{delivery_id}/proof", response_class=HTMLResponse)
+async def delivery_proof(delivery_id: int, request: Request):
+    """Nominate a file as the proof for these lines, or accept that they have none.
+
+    **The list of records is recomputed here and never read off the form.** The browser sends only
+    the message, the choice and the name; which lines that covers is resolved again from the store,
+    so a stale page cannot sign for a line that has since moved and a crafted POST cannot widen the
+    decision. `record_create` intersects the ids against the delivery a second time.
+
+    Writes nothing outbound. It is the control that lets a write happen later, so it is guarded like
+    one — the same kill-switch check `waive_pod` keeps, for the same reason.
+    """
+    values = await _form_values(request)
+    by = values.get("by", "").strip()
+    email_id = values.get("email_id", "").strip()
+    choice = values.get("pod_ledger_id", "").strip()
+
+    conn = deps.pipeline_connection()
+    try:
+        if killswitch.is_stopped():
+            return HTMLResponse(_delivery_proof_page(
+                conn, delivery_id, by=by, chosen=choice,
+                problem="the kill switch is engaged — release it before accepting anything."))
+        if not choice:
+            return HTMLResponse(_delivery_proof_page(
+                conn, delivery_id, by=by,
+                problem="pick the file that proves this delivery, or say explicitly that there "
+                        "is none."))
+
+        blocked = spitfire_post.pod_blocked(conn, spitfire_post.delivery_rows(conn, delivery_id))
+        record_ids = [b.record_id for b in blocked
+                      if str(_maybe(b.row, "source_email_id") or "") == email_id]
+
+        if choice == "none":
+            result = record_create.waive_delivery_pod(
+                conn, delivery_id, by=by, record_ids=record_ids)
+        else:
+            result = record_create.choose_delivery_pod(
+                conn, delivery_id, ledger_id=_int_or_none(choice) or 0, email_id=email_id,
+                record_ids=record_ids)
+        if not result.ok:
+            return HTMLResponse(_delivery_proof_page(conn, delivery_id, by=by, chosen=choice,
+                                                     problem=result.message))
+    finally:
+        conn.close()
+    return RedirectResponse(
+        _safe_return(values.get("return_to", ""), f"/ui/records?settled={delivery_id}"),
+        status_code=303)
+
+
+# --- Overruling triage about what a message is ---------------------------------------------------
+#
+# Triage was the only opinion in the system about whether a message is a delivery notification, and
+# the table listing what it set aside invited people to "open it and say so" with nothing to say it
+# with. This is the something.
+#
+# A page rather than a one-click button, for the reason the waiver page is one: the decision changes
+# which queue a message lives in, the next person to read the row needs to know who decided and why,
+# and a bare button on a table row invites the reflex press.
+
+_NOT_DELIVERY_REASONS = (
+    ("No PO or delivery data", "no PO reference or delivery data anywhere in the thread"),
+    ("Advertising", "marketing or advertising mail"),
+    ("Internal mail", "internal correspondence, not a delivery notification"),
+    ("Scheduled report", "an automated scheduled report, not a delivery notification"),
+    ("Order confirmation", "an order confirmation or acknowledgement — the goods have not shipped"),
+    ("Carrier status", "a carrier status or tracking update — nothing has arrived yet"),
+    ("Meeting or invite", "a calendar invite or meeting mail"),
+    ("Nothing arrived", "this thread is about a delivery still to come, not one that happened"),
+)
+"""The reasons a message gets set aside, worded once so nobody types them again.
+
+Drawn from what the rules themselves say and from what people were typing into this box: the
+`rule_5c_internal_noise`, `rule_0c_report_sender` and `rule_5d_no_delivery_claim` populations are
+the first, third, fourth and eighth of these between them, and marketing mail is the commonest thing
+`rule_7_unknown` drops on the queue with no rule able to name it.
+
+Two strings each, and the difference matters. The first is what fits on a button and can be read at
+a glance; the second is what ends up stored, and it has to still mean something to somebody reading
+the row back with none of this screen in front of them — "Advertising" on its own is a category,
+"marketing or advertising mail" is a sentence about this message.
+"""
+
+_DELIVERY_REASONS = (
+    ("POD attached", "the signed proof of delivery is attached to this message"),
+    ("Body states arrival", "the body states the goods arrived, with a date"),
+    ("Confirmed with property", "the property confirmed the delivery directly"),
+    ("Rule too broad", "the rule matched on the sender, but this thread is a real delivery"),
+    ("Missed PO", "it does carry a PO reference the rules did not pick up"),
+)
+"""The other direction, and deliberately a shorter list. Overruling a rule to say a message *is* a
+delivery is the rarer decision and the one worth a sentence of its own more often, so these are
+starting points rather than the eight-way menu above."""
+
+
+_CONFIRMED_REASONS = (
+    ("Property confirmed", "the property confirmed these items were received"),
+    ("Warehouse confirmed", "the warehouse confirmed receipt of these items"),
+    ("POD seen", "I have seen the signed proof of delivery for these items"),
+    ("Checked in Spitfire", "the receipt is visible against these lines in Spitfire"),
+)
+"""Why somebody is willing to sign for goods a Premier-written message only claims.
+
+Every one names **who** confirmed it or **what** was seen, because that is the whole content of
+the decision. A reason like "looks right" would record that a person clicked, which the timestamp
+already says.
+"""
+
+
+_VERDICT_COPY = {
+    mail_overrides.NOT_DELIVERY: {
+        "title": "Not a delivery",
+        "active": "/ui/manual",
+        "origin": "/ui/manual",
+        "origin_label": "Needs a human",
+        # Where a *successful* verdict lands, as distinct from `origin`, which is where Cancel and
+        # the back link go — the page you came from. Sending the redirect to `origin` put people
+        # back on the queue with their search cleared and the total unchanged (it rises on its own
+        # from live ingest), so a verdict that had been recorded correctly looked like a dead
+        # button. Landing on the page the message moved to is the confirmation.
+        "landing": "/ui/not-deliveries",
+        "submit": "Set aside as not a delivery",
+        "reasons": _NOT_DELIVERY_REASONS,
+        "lede": "Say this message is not a delivery notification.",
+        "means": ("It leaves the queue and appears on Not deliveries, listed with your name "
+                  "against it.",
+                  "Every record read out of this message is retired with it — off the queue, off "
+                  "Records, and not postable. Nothing is deleted.",
+                  "You can put it back at any time from that page, records and all."),
+    },
+    mail_overrides.DELIVERY: {
+        "title": "This is a delivery",
+        "active": "/ui/not-deliveries",
+        "origin": "/ui/not-deliveries",
+        "origin_label": "Not deliveries",
+        "submit": "Put this back on the queue",
+        "reasons": _DELIVERY_REASONS,
+        "lede": "Say this message is a delivery notification after all.",
+        "means": ("It returns to Needs a human, badged Set aside in error, with your name and "
+                  "reason on the row.",
+                  "Nothing is extracted from it automatically. The message was never accumulated, "
+                  "so there is no delivery to hang a record on — Create a record on that row is "
+                  "how the record gets made, and the form opens on whatever was already read from "
+                  "this message.",
+                  "It leaves the queue once a record exists."),
+    },
+    mail_overrides.CONFIRMED: {
+        "title": "Confirm the goods arrived",
+        "active": "/ui/manual",
+        "origin": "/ui/manual",
+        "origin_label": "Needs a human",
+        "submit": "Confirm and send to Records",
+        "reasons": _CONFIRMED_REASONS,
+        "lede": "Say the goods this message lists were actually received.",
+        "means": ("Every record read from this message moves to Records, where it can be "
+                  "verified against Spitfire and posted.",
+                  "Nothing is posted by confirming. This says the delivery happened; the Post "
+                  "button still decides whether a receipt can be built, and still refuses an "
+                  "incomplete record.",
+                  "Your name and reason stay on it, and you can withdraw the confirmation from "
+                  "the same row."),
+    },
+}
+"""Everything that differs between the three directions, so the page itself does not branch.
+
+The third is not a variation on the other two. They answer *what kind of message is this* — and a
+Premier-written expediting report is unambiguously delivery mail by that test, which is why it was
+reaching Records. This one answers *did the goods arrive*, which is a question about the world that
+no rule reading the message can settle."""
+
+
+def _thread_offer(conn, email_id: str, to: str) -> tuple:
+    """The rest of this conversation, as a tick list, and the ids it offers.
+
+    Only when setting mail aside. Putting a message *back* on the queue, or confirming goods
+    arrived, is a statement about that message: a reply saying "it landed" says nothing about the
+    fourteen quotes above it in the thread, and sweeping them along would be inventing decisions
+    nobody took.
+    """
+    if to != mail_overrides.NOT_DELIVERY:
+        return html.Raw(""), []
+
+    siblings = read_views.thread_siblings(conn, email_id)
+    if not siblings:
+        return html.Raw(""), []
+
+    offer = [s for s in siblings if not s.excluded]
+    rows = []
+    for sibling in siblings:
+        label = [html.tag("span", _clipped(sibling.subject or "(no subject)", 78),
+                          class_="thread-subject"),
+                 html.tag("span", f"{sibling.sender} · {html.when(sibling.when[:16])}"
+                                  + (f" · {sibling.records} record"
+                                     f"{'' if sibling.records == 1 else 's'}"
+                                     if sibling.records else ""),
+                          class_="thread-meta")]
+        if sibling.excluded:
+            rows.append(html.tag("li", html.tag("div", *label, class_="thread-text"),
+                                 html.tag("span", sibling.excluded, class_="thread-held"),
+                                 class_="thread-row held"))
+            continue
+        rows.append(html.tag("li", html.tag(
+            "label",
+            html.tag("input", type="checkbox", name_="also", value=sibling.email_id,
+                     checked="checked"),
+            html.tag("div", *label, class_="thread-text")), class_="thread-row"))
+
+    carried = sum(s.records for s in offer)
+    heading = (f"Also set aside the other {len(offer)} message"
+               f"{'' if len(offer) == 1 else 's'} in this conversation"
+               + (f" ({carried} record{'' if carried == 1 else 's'})" if carried else ""))
+    return html.tag(
+        "div",
+        html.tag("p", heading, class_="thread-head"),
+        html.tag("ul", *rows, class_="thread-list"),
+        html.tag("p", "Replies and forwards of the same subject, sharing a purchase order. Each "
+                      "keeps its own verdict and can be put back on its own.", class_="hint"),
+        class_="thread-offer"), [s.email_id for s in offer]
+
+
+def _verdict_fragment(conn, email_id: str, to: str, *, by: str = "", note: str = "",
+                      problem: str = "") -> str:
+    """The same decision, rendered for the popup over the page the reader is already on.
+
+    Not a second implementation of the page: same copy, same guards, same two fields, same thread
+    list. What it leaves out is the page — heading bar, sidebar, the "what this means" essay — so
+    the decision sits over the queue rather than replacing it.
+    """
+    copy = _VERDICT_COPY.get(to)
+    if copy is None:
+        raise HTTPException(status_code=400, detail="unknown verdict")
+    row = email_log.get(conn, email_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such message")
+
+    offer, _ = _thread_offer(conn, email_id, to)
+    standing = mail_overrides.get(conn, email_id)
+    parts = [html.errors(problem) if problem else html.Raw("")]
+    if standing is not None:
+        held = _VERDICT_COPY[standing.verdict]["title"].lower()
+        parts.append(html.banner(
+            f"{standing.decided_by} already marked this “{held}”. Submitting below replaces that.",
+            kind="warn"))
+    parts.append(html.tag("p", copy["lede"], class_="lede"))
+    parts.append(html.tag("p", _clipped(row.subject or email_id, 96), class_="thread-subject"))
+    # The one consequence that is not obvious from the button, kept even in the short form: this is
+    # what makes the rows vanish from the table underneath.
+    parts.append(html.tag("p", copy["means"][0], class_="hint"))
+    parts.append(html.form(
+        "/ui/mail/verdict",
+        html.tag("input", type="hidden", name_="email_id", value=email_id),
+        html.tag("input", type="hidden", name_="to", value=to),
+        html.field("by", "Your name", by, required=True,
+                   hint="Recorded against the message and shown on the row."),
+        html.note_presets("note", copy["reasons"]),
+        html.textarea("note", "Why", note,
+                      hint="Optional, and the most useful thing on the row in three months."),
+        offer,
+        submit=copy["submit"]))
+    return "".join(str(part) for part in parts)
+
+
+def _verdict_page(conn, email_id: str, to: str, *, by: str = "", note: str = "",
+                  problem: str = "") -> str:
+    """The confirm form, in whichever direction `to` names.
+
+    One page for both, because they are the same decision with the sign flipped: same guards, same
+    two fields, same table row moving between the same two pages. Two of these would be one of them
+    copied, and the copy is where a guard stops applying.
+
+    **Deliberately without `_waive_page`'s "Already accepted" dead end.** A waiver is irreversible
+    and the first name is the one that took the risk; a verdict about what a message *is* can be
+    wrong and is meant to be corrected. So an existing verdict is shown in a banner and the form
+    still renders — re-submitting is how a name or a reason gets fixed.
+    """
+    copy = _VERDICT_COPY.get(to)
+    if copy is None:
+        # Off the query string, and it decides every word on this page. Refused before anything is
+        # read rather than defaulted to a direction the person did not ask for.
+        raise HTTPException(status_code=400, detail="unknown verdict")
+
+    row = email_log.get(conn, email_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such message")
+
+    parts = []
+    if problem:
+        parts.append(html.errors(problem))
+
+    standing = mail_overrides.get(conn, email_id)
+    if standing is not None:
+        held = _VERDICT_COPY[standing.verdict]["title"].lower()
+        parts.append(html.banner(
+            f"{standing.decided_by} already marked this “{held}” on "
+            f"{(standing.decided_at or '')[:16].replace('T', ' ')}"
+            + (f" — {standing.note}" if standing.note else "")
+            + ". Submitting below replaces that.",
+            kind="warn"))
+
+    parts.append(html.section(
+        row.subject or email_id,
+        html.tag("p", copy["lede"], class_="lede"),
+        html.tag("p", f"From {row.sender or 'an unknown sender'}, ",
+                 html.when((row.processed_at or "")[:16]), "."),
+        html.tag("p", "Triage read it as ", _stamp(row.matched_rule or "no rule"), ": ",
+                 row.reason or "no reason recorded", "."),
+        html.tag("p", html.mail_link(email_id, "Read the message first",
+                                     reason=row.reason or "",
+                                     title="What this decision is about")),
+        note="Triage decides this for every message from the sender, the thread and what is "
+             "attached. It is sometimes wrong, and this is the only thing that can say so.",
+    ))
+
+    parts.append(html.section(
+        "What this means",
+        html.tag("ul", *[html.tag("li", line) for line in copy["means"]]),
+        html.form("/ui/mail/verdict",
+                  html.tag("input", type="hidden", name_="email_id", value=email_id),
+                  html.tag("input", type="hidden", name_="to", value=to),
+                  html.field("by", "Your name", by, required=True,
+                             hint="Recorded against this message and shown on the row, so the "
+                                  "next person knows who to ask."),
+                  # Above the box, not inside it. They write into the same textarea the form
+                  # submits, so a reason nobody anticipated is still just typed, and two of them
+                  # is two clauses rather than a choice between them.
+                  html.note_presets("note", copy["reasons"]),
+                  html.textarea("note", "Why", note,
+                                hint="Optional. Press the reasons above to fill this in, add your "
+                                     "own, or both — it is the most useful thing on the row when "
+                                     "somebody reads it back in three months."),
+                  submit=copy["submit"],
+                  cancel=copy["origin"], cancel_label=f"Back to {copy['origin_label']}"),
+        note="Nothing is sent to Spitfire by this page, and no record is created or destroyed. It "
+             "moves one message between two lists.",
+    ))
+    return html.page(copy["title"], copy["active"], *parts,
+                     back=copy["origin"], back_label=copy["origin_label"], **_chrome(conn))
+
+
+@router.get("/mail/verdict", response_class=HTMLResponse)
+def mail_verdict_form(id: str = "", to: str = "", inline: int = 0,
+                      conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Explain what reclassifying a message does, and ask who is doing it and why.
+
+    `id` rather than a path segment: a Message-ID is up to 255 characters of angle brackets and `@`,
+    and putting one in a URL segment means escaping it at both ends for nothing — the same reason
+    `mails_acknowledge` carries it in a form body.
+
+    `inline=1` asks for the form alone, to open in the message popup over whichever queue the
+    reader is standing on. The page form stays exactly where it was — it is what a browser with no
+    script gets, and what a refused submission re-renders.
+    """
+    if inline:
+        return _verdict_fragment(conn, id, to)
+    return _verdict_page(conn, id, to)
+
+
+@router.post("/mail/verdict", response_class=HTMLResponse)
+async def set_mail_verdict(request: Request):
+    """Record the verdict and send the browser back to the page the row just left.
+
+    **The kill switch is deliberately not honoured here**, unlike `create_record` and `waive_pod`.
+    Those are guarded because they stage or unblock something the next press of Post would send to
+    Premier's ERP, and a stop means the system is not to act. This writes one row that only two view
+    functions read: nothing in the pipeline consults it, no record is created, and the one path
+    onward from a reclassified message — Create a record — checks the switch itself. The precedent
+    for a pure human annotation is `mails_acknowledge`, also unguarded. And a stop is when people
+    are working out what went wrong; blocking the one control that records "triage got this wrong"
+    would block the diagnosis while the incident is live.
+
+    The connection is opened here rather than through `Depends`, matching the other POST handlers:
+    a sync dependency resolves on a worker thread while an async handler runs on the event loop, and
+    a sqlite connection belongs to the thread that made it.
+    """
+    posted = await _form_values(request)
+    email_id = posted.get("email_id", "")
+    to = posted.get("to", "")
+    by = posted.get("by", "").strip()
+    note = posted.get("note", "")
+    # Which of the conversation's other messages were left ticked. Multi-valued, so it cannot come
+    # from `_form_values`, which keeps one value per key.
+    also = _form_list(await request.body(), "also")
+    # The popup asks for an answer it can act on; a browser form asks for a page.
+    wants_json = "application/json" in (request.headers.get("accept") or "")
+
+    if to not in mail_overrides.VERDICTS:
+        raise HTTPException(status_code=400, detail="unknown verdict")
+
+    conn = deps.pipeline_connection()
+    decided = []
+    try:
+        if not email_id or email_log.get(conn, email_id) is None:
+            # Not a silent no-op, unlike `mails_acknowledge` — its SQL guard makes a miss harmless,
+            # where this would write a verdict about a message that does not exist.
+            raise HTTPException(status_code=404, detail="no such message")
+        if not by:
+            problem = ("Your name is required — this decision is recorded against the message "
+                       "and has to be signed.")
+            if wants_json:
+                return JSONResponse({"ok": False, "problem": problem})
+            return HTMLResponse(_verdict_page(conn, email_id, to, by=by, note=note,
+                                              problem=problem))
+        # No "already in that state" refusal. The write is an upsert on one row, so a second press,
+        # a browser retry or a corrected spelling all land as the same single verdict.
+        mail_overrides.set_verdict(conn, email_id=email_id, verdict=to, decided_by=by, note=note,
+                                   at=_now())
+        decided.append(email_id)
+
+        if also:
+            # The ids arrive in a form body, so membership is worked out again here rather than
+            # trusted. A page cannot nominate mail it was never offered: `_thread_offer` is the
+            # same call that drew the tick list, and anything not in it is dropped silently — the
+            # decision the person did take is still recorded.
+            _, offered = _thread_offer(conn, email_id, to)
+            together = f"set aside with “{_clipped(email_log.get(conn, email_id).subject or '', 60)}”"
+            for other in also:
+                if other not in offered:
+                    continue
+                mail_overrides.set_verdict(
+                    conn, email_id=other, verdict=to, decided_by=by,
+                    note="; ".join(filter(None, [note, together])), at=_now())
+                decided.append(other)
+    finally:
+        conn.close()
+
+    if wants_json:
+        return JSONResponse({"ok": True, "verdict": to, "email_ids": decided})
+
+    # Back where the person was standing, which is the page the row has just left. Deliberately not
+    # `_back_to(request)`: on this POST the referer is the confirm form itself, so that would send
+    # them straight back onto the form they just submitted.
+    copy = _VERDICT_COPY[to]
+    # Back to the queue they were standing on, when the page said which one that was. The landing
+    # page below is what a verdict with no script lands on, and stays the fallback.
+    return RedirectResponse(
+        _safe_return(posted.get("return_to", ""), copy.get("landing", copy["origin"])),
+        status_code=303)
+
+
+# --- Correcting a record by hand ----------------------------------------------------------------
+#
+# The other half of "create a record". A message with no record gets the create form; a record that
+# already exists and is missing something gets this one — the same layout, over what it already
+# holds. Before it, a queue row could only offer `Fill`, which reads the delivery date and the
+# signature off the proof and cannot know a spec code, and `Verify`, which compares against the
+# purchase order and writes nothing unless the spec matches exactly. Seventeen of the twenty-one
+# incomplete records are missing precisely that spec code.
+
+_EDIT_LABELS = {
+    "spec_code": ("Spec code", "As Premier names the item — STE-402-LT-B, GR-350a-WTF. Read it "
+                               "off the purchase order if the delivery note does not say."),
+    "item_description": ("Description", "What arrived, in the words the paperwork uses."),
+    "quantity_received": ("Quantity received",
+                          "Items, not packages. A header saying 41 CTN against a line saying "
+                          "11 EA means eleven items in forty-one cartons — record the eleven."),
+    "unit_of_measure": ("Unit", "EA, YD, SF — as the purchase order states it."),
+    "package_quantity": ("Packages", "How many cartons, pallets or rolls the items came in. The "
+                                     "count on the delivery header, not the quantity above."),
+    "package_uom": ("Package unit", "CTN, PLT, ROLL — what the packages are, not what is in them."),
+    "pod_stated_date": ("Delivery date",
+                        "The day the goods arrived, as YYYY-MM-DD. Not the day the email was sent."),
+    "carrier_name": ("Carrier", "Who moved it. Blank is legitimate on a warehouse Inbound notice, "
+                                "where the goods never left the 3PL's own network."),
+    "tracking_number": ("Tracking number", "The carrier's own reference for the shipment."),
+    "received_by": ("Received by", "Who signed for it. Prefer the name on the proof of delivery "
+                                   "over your own — Fill reads it off the POD without asking."),
+    "vendor_name": ("Vendor", "Who supplied it. The receiver report fills this from the purchase "
+                              "order when it is blank, so type one only to correct a wrong name."),
+    "notification_number": ("Notification number",
+                            "The warehouse's own inbound reference, where the message carries one. "
+                            "Not the purchase order number."),
+}
+
+_EDIT_GROUPS = (
+    ("What arrived", ("spec_code", "item_description", "quantity_received", "unit_of_measure",
+                      "package_quantity", "package_uom"),
+     "Everything already known is filled in. Change only what is wrong or missing."),
+    ("How and when it arrived", ("pod_stated_date", "carrier_name", "tracking_number",
+                                 "received_by"),
+     "What the proof of delivery states. Fill takes the date and the signature off the POD itself "
+     "and is the better route when there is one attached."),
+    ("Who it came from", ("vendor_name", "notification_number"),
+     "Blank is normal here — the receiver report fills the vendor from the purchase order."),
+)
+"""The editable fields in three named groups rather than one flat run of twelve boxes.
+
+A form long enough to scroll is a form whose last field nobody reads, and these three questions —
+what, when, from whom — are the ones a reviewer is actually answering. Built from
+`extracted_store.EDITABLE_FIELDS` rather than replacing it: anything in the whitelist and not named
+here is still rendered, in a final catch-all group, so widening the whitelist can never silently
+produce a field with no box.
+"""
+
+_EDIT_RETURNS = {
+    "manual": ("/ui/manual", "Needs a human"),
+    "records": ("/ui/records", "Records"),
+}
+_EDIT_RETURN_DEFAULT = "manual"
+
+
+def _edit_return(value) -> str:
+    """Where Cancel, the header's Back link and a saved correction go — chosen from a fixed set.
+
+    A key, never a URL. This form is reachable from two places and has to return to whichever it
+    came from; the smallest thing that does that and cannot become an open redirect is a dictionary
+    lookup with a default. Nothing a caller sends ever reaches a `Location` header or an `href` —
+    only the two literals above do.
+    """
+    key = str(value or "").strip()
+    return key if key in _EDIT_RETURNS else _EDIT_RETURN_DEFAULT
+
+
+def _edit_form(conn, record_id: int, *, values=None, edited_by="", problem=None,
+               return_to=_EDIT_RETURN_DEFAULT):
+    """The record's own values, editable. `None` when there is no such record to correct."""
+    row = _fixable_record_or_none(conn, record_id)
+    if row is None:
+        return None
+
+    return_to = _edit_return(return_to)
+    destination, back_label = _EDIT_RETURNS[return_to]
+
+    if values is None:
+        values = {name: ("" if row[name] is None else str(row[name]))
+                  for name in extracted_store.EDITABLE_FIELDS}
+        # Trailing `.0` is what a REAL column renders as, and it is noise in a box somebody is
+        # about to retype. Both numeric fields, not just the quantity: `package_quantity` is the
+        # same column type and reads `41.0` for the same reason.
+        for name in ("quantity_received", "package_quantity"):
+            if values.get(name, "").endswith(".0"):
+                values[name] = values[name][:-2]
+    values = dict(values)
+    values["po_number"] = row["po_number"] or ""
+
+    gaps = completeness.gaps(row)
+    parts = []
+    if problem is not None:
+        parts.append(html.errors(problem.message, problem.errors))
+    elif gaps.missing_required:
+        parts.append(html.banner(f"This record is {gaps.describe()}.", kind="warn"))
+
+    if record_edit.CONFLICT_MARKER in (row["extraction_source"] or ""):
+        parts.append(html.banner(
+            "Two sources stated different quantities for this delivery and neither was chosen. "
+            "Setting the quantity here settles it — the record is then treated as any other.",
+            kind="warn"))
+
+    def _box(name):
+        label, hint = _EDIT_LABELS.get(name, (completeness.LABELS.get(name, name), ""))
+        return html.field(name, label, values.get(name, ""),
+                          required=name in completeness.REQUIRED, hint=hint)
+
+    # Two fields nobody may change, shown rather than hidden. A form that silently omits the two
+    # facts a reviewer is most likely to want to correct reads as an oversight; one that shows them
+    # greyed with a reason reads as a decision, which is what it is.
+    parts.append(html.section(
+        "What this record is against",
+        html.field("po_number", "PO number", values.get("po_number", ""), readonly=True,
+                   source="not editable here",
+                   hint="Moving a delivery to a different purchase order would move its receipt "
+                        "to a different budget line. That is a bigger act than a correction, so "
+                        "it is not one this form can make."),
+        html.field("po_line_number", "PO line #",
+                   "" if row["po_line_number"] is None else str(row["po_line_number"]),
+                   readonly=True, source="not editable here",
+                   hint="Which line of the purchase order this is booked against. Typing a number "
+                        "here would not suggest a line, it would choose one — posting stops "
+                        "matching on spec code and books against whatever was typed, so a "
+                        "transposed digit would satisfy the very check meant to catch it. Press "
+                        "Verify and pick from the alternatives table instead, where each line's "
+                        "description and outstanding quantity are shown."),
+        note="Both come from the purchase order, and neither is something a correction may move."))
+
+    grouped = set()
+    for title, names, note in _EDIT_GROUPS:
+        boxes = [_box(n) for n in names if n in extracted_store.EDITABLE_FIELDS]
+        grouped.update(names)
+        if boxes:
+            parts.append(html.section(title, *boxes, note=note))
+    # Anything whitelisted and not named in `_EDIT_GROUPS` — so widening the whitelist can
+    # never produce a field the form quietly declines to show.
+    rest = [_box(n) for n in extracted_store.EDITABLE_FIELDS if n not in grouped]
+    if rest:
+        parts.append(html.section("Other fields", *rest))
+
+    parts.append(html.section(
+        "You",
+        html.field("edited_by", "Your name", edited_by, required=True,
+                   hint="Recorded against this record and against every field you change, so a "
+                        "hand-typed value is never mistaken later for one the machine read."),
+    ))
+
+    past = record_edit.history(conn, record_id)
+    if past:
+        parts.append(html.section("Already corrected", html.tag(
+            "ul",
+            *[html.tag("li",
+                       html.muted(f"{e['edited_at']} · {e['edited_by']} · "),
+                       f"{completeness.LABELS.get(e['field'], e['field'])}: "
+                       f"{e['old_value'] or '(blank)'} → {e['new_value'] or '(blank)'}")
+              for e in past],
+            class_="plain-list"),
+            note="Every field a person has changed on this record, newest first."))
+
+    body = html.form(f"/ui/records/{record_id}/edit?from={return_to}", *parts,
+                     submit="Save the correction",
+                     cancel=destination, cancel_label=f"Back to {back_label}")
+    email_id = row["source_email_id"] or ""
+    if email_id:
+        host = html.mail_url(email_id, "", html.DEFAULT_MAIL_SOURCE) + "&bare=1"
+        body = html.split(body, html.mail_pane(
+            host, _mail_fragment_html(email_id, src=html.DEFAULT_MAIL_SOURCE, bare=True),
+            note="The message this record was read from. Open an attachment and it opens here, "
+                 "beside the form, not over it."))
+
+    return html.page(f"Correct record #{record_id}", destination, body,
+                     back=destination, back_label=back_label, **_chrome(conn))
+
+
+def _no_edit_page(conn, record_id: int, reason: str, return_to: str) -> str:
+    """Why this record cannot be corrected, as a page rather than a bare 404 body."""
+    destination, back_label = _EDIT_RETURNS[_edit_return(return_to)]
+    return html.page(
+        "Nothing to correct", destination,
+        html.section("Nothing to correct",
+                     html.tag("p", reason or
+                              f"Record #{record_id} is not one this page can change — it has "
+                              f"either been posted to Spitfire already or no longer exists.",
+                              class_="note")),
+        back=destination, back_label=back_label, **_chrome(conn))
+
+
+@router.get("/records/{record_id}/edit", response_class=HTMLResponse)
+def edit_record_form(record_id: int, from_: str = Query(_EDIT_RETURN_DEFAULT, alias="from"),
+                     conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> HTMLResponse:
+    row, reason = _editable_record_or_none(conn, record_id)
+    if row is None:
+        return HTMLResponse(status_code=404,
+                            content=_no_edit_page(conn, record_id, reason, from_))
+    return HTMLResponse(_edit_form(conn, record_id, return_to=from_))
+
+
+@router.post("/records/{record_id}/edit", response_class=HTMLResponse)
+async def edit_record(record_id: int, request: Request):
+    """Save the correction, or come back carrying what was typed.
+
+    Re-rendering the page on a refusal is what keeps a rejected value on screen with no JavaScript
+    — the same reasoning the create form gives for being a page rather than a dialog.
+    """
+    posted = await _form_values(request)
+    return_to = _edit_return(request.query_params.get("from", ""))
+    conn = deps.pipeline_connection()
+    try:
+        row, reason = _editable_record_or_none(conn, record_id)
+        if row is None:
+            # The same refusal the GET gives, and it must be here too: the disabled button on the
+            # Records page is a courtesy, and a form left open while somebody else posted the row
+            # would otherwise still submit.
+            return HTMLResponse(status_code=404,
+                                content=_no_edit_page(conn, record_id, reason, return_to))
+        fields = {name: posted.get(name, "") for name in extracted_store.EDITABLE_FIELDS}
+        result = record_edit.apply(conn, row, fields, edited_by=posted.get("edited_by", ""))
+        if not result.ok:
+            return HTMLResponse(_edit_form(conn, record_id, values=fields,
+                                           edited_by=posted.get("edited_by", ""),
+                                           problem=result, return_to=return_to))
+        # Back where the reviewer came from. A record corrected from Records belongs on Records
+        # whether or not the edit closed its last gap — the row they just changed sitting
+        # there is the confirmation that it worked. From the queue, a record that is now complete
+        # has *left* that queue, so it goes to Records for the same reason.
+        target = (f"/ui/records?corrected={record_id}"
+                  if return_to == "records" or result.is_complete else "/ui/manual")
+        # Unless the page said where it came from. `return_to` above is the *kind* of page this
+        # edit was opened from (`?from=`); this is the exact one, filter and all.
+        target = _safe_return(posted.get("return_to", ""), target)
+    finally:
+        conn.close()
+    return RedirectResponse(target, status_code=303)
 
 
 @router.get("/manual", response_class=HTMLResponse)
 def manual_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Everything a person has to deal with, in one queue, newest first.
+
+    It was three tables — emails, then attachments, then records — which put a message from May
+    above an attachment from this morning and made the top of the page the oldest thing on it. The
+    three kinds are still distinguishable (the View dropdown narrows to one), but they are one
+    queue because that is what they are: a list of work, in the order it arrived.
+    """
     items = read_views.manual_queue(conn)
-    groups = (
-        ("email", "Emails", "Triaged to a person, quarantined, or failed to process."),
-        ("attachment", "Attachments", "Received but not readable — each with the disposition recorded against it."),
-        ("record", "Records", "Extracted, but missing what downstream matching needs."),
-    )
-    sections = []
-    # One search box above every table on this page. Someone chasing a PO number wants it found in
-    # whichever queue it landed in, not in the one they happened to point at — see `html.search_box`.
-    # The chatter table is included on purpose: "did a real delivery get filed as chatter?" is
-    # exactly the question that brings someone to this page, and it is the last place they would
-    # think to look separately.
-    present = [f"manual-{kind}" for kind, _t, _n in groups if any(i.kind == kind for i in items)]
-    if read_views.filtered_mail(conn):
-        present.append("manual-filtered")
-    if present:
-        sections.append(html.section(
-            "Find something",
-            html.search_box(present, placeholder="Search PO, subject, sender, reason…",
-                            label="Search everything needing a person"),
-            html.date_filter(present, label="date it arrived"),
-            note="Searches every table on this page at once, including the filtered chatter below.",
-        ))
-    for kind, title, note in groups:
-        group = [i for i in items if i.kind == kind]
-        rows = [[
-            i.ref,
-            # The PO opens the email the record was read from, so the two can be compared. It is
-            # also the identifier a person actually works with — the What column says
-            # "record #126", which is a row id nobody outside the database can use.
-            html.mail_link(i.email_id, i.po_number, reason=i.reason) if i.po_number
-            else html.muted("—"),
-            i.subject[:45] or html.muted("—"), html.when(i.when[:16]),
-            i.reason, i.detail or html.muted("—"),
-            # The way out of this queue. Every row here is work the pipeline could not finish, and
-            # until this existed the page could only say so — a person could read the message and
-            # had nowhere to put what they learned from it.
+    # How many records a person has already built from each message, counted once for the page. Per
+    # row it would be one query per row, and this queue is thousands of rows long.
+    # Positional, because this connection's row_factory is whatever the last caller left it as.
+    made_per_email = {
+        row[0]: row[1] for row in conn.execute(
+            "SELECT source_email_id, COUNT(*) FROM extracted_records "
+            "WHERE origin = 'manual' GROUP BY source_email_id")}
+
+    rows, kinds, reasons = [], [], []
+    for i in items:
+        rows.append([
+            _arrival_cell(i),
+            # The short reason is the whole sentence's headline, and the sentence is on hover.
+            # A column of paragraphs cannot be scanned, and scanning is what a queue is for.
             #
-            # A link, not a `button_form`: the target is a page to land on and filling it in has no
-            # effect until it is submitted, so a prefetch can do no harm. Record rows are excluded
-            # — those already have a record, and the fix for them is the Complete control on the
-            # Records page rather than a second row for the same delivery.
-            _create_link(i.email_id) if kind != "record" else html.muted("—"),
-        ] for i in group]
-        sections.append(html.section(
-            f"{title} ({len(group)})",
+            # A merged row badges the message's own reason and counts the rest. Naming the second
+            # reason instead of counting them would be a third badge on some rows and not others,
+            # and the number is what says whether the message is one problem or nine.
+            html.tag("span", html.badge(_REASON_LABELS.get(i.code, "Needs a look"),
+                                        _REASON_TONES.get(i.code, "plain")),
+                     *((" ", html.muted(f"+{i.rolled_up - 1} more"))
+                       if i.rolled_up > 1 else ()),
+                     title=i.reason),
+            _stamp(i.when[:16].replace("T", " ")),
+            i.filed_to or html.muted("—"),
+            # What was delivered. Its own column because it is the only thing that differs between
+            # the 23 rows of a signage package — the other seven fields on those rows are
+            # identical, so without this the page shows one row repeated 23 times.
+            html.tag("span", (i.item or "—")[:58], class_="nw", title=i.item or "") if i.item
+            else html.muted("—"),
+            _po_cell(i),
+            # The way out of this queue, and it differs by what the row *is*.
+            #
+            # A message or an attachment has no record yet, so the way out is to create one. A
+            # record row already exists and cannot be created again — it needs its gaps closed,
+            # which is what Fill and Verify do. That distinction used to be a dash: record rows,
+            # 44 of the 62 on this page, were listed with **no action at all**, on the reasoning
+            # that the fix lived on the Records page. It did — right up until a record with gaps
+            # stopped appearing there, at which point the dash was the whole story and the gaps
+            # were unreachable.
+            #
+            # A link for Create (a page to land on, harmless to prefetch); `verify_button` for the
+            # other two, which POST because they write.
+            _queue_action(i, made_per_email),
+        ])
+        kinds.append(i.kind)
+        # Every code on the row, space-separated, matched as tokens by the chip filter. A merged
+        # message badged `routed` still has to appear when someone presses `Needs OCR`, because the
+        # OCR failures are why they are looking and the message is now the only row holding them.
+        reasons.append(" ".join(i.codes or (i.code,)))
+
+    # Counted per code, so a row that carries two is counted under both. These therefore no longer
+    # sum to the number of rows — `html.reason_filter` says so on hover.
+    counts = Counter(code for i in items for code in (i.codes or (i.code,)))
+    # The queue alone. The chatter table used to sit at the bottom of this page and be searched
+    # from here with it — "did a real delivery get filed as chatter?" is a question that brings
+    # people here — but it has its own page now, and its own search box on it.
+    searched = ["manual-table"]
+    body = html.section(
+        "",
+        html.tag(
+            "div",
+            html.search_box(searched, placeholder="Search PO, subject, sender, reason…",
+                            label="Search everything needing a person"),
+            html.date_filter(searched, label="date it arrived", presets=True),
+            html.choice_filter("manual-table",
+                               # "Messages", not "Emails": a message that yielded nothing is now one
+                               # row standing for its bad attachments too, so this option answers
+                               # "which messages need me" rather than "which rows are emails". The
+                               # attachment rows that survive are the ones on mail that *did*
+                               # produce records, which is a narrower thing than it used to be and
+                               # is named as such.
+                               [(kind, label) for kind, label in
+                                (("email", "Messages"),
+                                 ("attachment", "Attachments on recorded mail"),
+                                 ("record", "Records"))
+                                if kind in kinds],
+                               label="View", all_label="Everything waiting", boxed=True),
+            class_="controls",
+        ),
+        # Every reason, including the ones at zero — see `html.reason_filter`.
+        html.reason_filter("manual-table",
+                           [(code, label, counts.get(code, 0))
+                            for code, label in _REASON_LABELS.items()]),
+        html.table(
+            # No Detail column: it is the line under the subject already. It was both, and every
+            # record row read "via pdf:carrier_pod" twice, a few centimetres apart.
+            ["What arrived", "Reason", "When", "Filed to", "Item", "PO", ""],
+            rows, empty=_EMPTY_HINT, table_id="manual-table", page_size=25, pane=True,
+            date_column="When", no_sort=("",),
+            # Every row, as this page has always sent. It is the argument that eventually
+            # retired the cap everywhere: this is the page people search by hand for a message
+            # from weeks ago, the search box only ever sees what was sent, and a capped table
+            # answered "No rows match — 500 hidden" for a 299-row message that was simply older
+            # than the newest 500. Measured 2026-09-15, capping saved well under a second of load
+            # (3.1 s → 3.9 s for 3,782 rows) because `manual_queue` builds every item either way.
+            choice_values=kinds, reason_values=reasons,
+            # So a bare number in the search box means "this PO", not "this text appears
+            # somewhere in the row" — see `termMatches` in html.py.
+            po_values=[i.po_number for i in items],
+            # Which message each row came from, so a verdict taken in the popup can take its rows
+            # off this page without reloading it — the message's own row, its attachments and every
+            # record read out of it, all at once.
+            email_ids=[i.email_id for i in items],
             # `frag_urls`, not `mail_ids`: the convenience path cannot express `src`, and without
             # it `_store_for` resolves to the retired `.msg` corpus — so every row on this page
             # reported its message missing, having searched a folder of test files for Premier's
             # live mail.
-            html.table(["What", "PO", "Email", "When", "Why it needs a person", "Detail", ""],
-                       rows, empty="Nothing in this group.", no_sort=("",),
-                       table_id=f"manual-{kind}", page_size=25, date_column="When",
-                       frag_urls=[html.mail_url(i.email_id, i.reason) for i in group],
-                       frag_title="Open this message"),
-            note=note,
-        ))
+            frag_urls=[html.mail_url(i.email_id, i.reason) for i in items],
+            frag_title="Open this message",
+        ),
+    )
+    sections = [body]
     sections.extend(_awaiting_report(conn))
     sections.extend(_posted_receipts(conn))
+    sections.extend(_stranded_posts(conn))
     sections.extend(_blocked_from_posting(conn))
-
-    if not items:
-        # One "nothing here" panel in place of three empty groups — but *keeping* whatever came
-        # before it. This used to rebuild the list from scratch, which also threw away the search
-        # box above; on a page whose queues are empty but whose chatter table is not, that left a
-        # table nobody could search and no sign that anything had gone missing.
-        sections = sections[:-len(groups)] + [
-            html.section("Needs a human", html.table([], [], empty=_EMPTY_HINT))
-        ]
-    sections.append(_filtered_section(conn))
-    return html.page("Needs a human", "/ui/manual", *sections,
-                     **_chrome(conn))
+    sections.append(_filtered_pointer(conn))
+    return html.page(
+        "Needs a human", "/ui/manual", *sections,
+        subtitle="Triaged to a person, quarantined, or failed to process.",
+        **_chrome(conn))
 
 
-def _create_link(email_id) -> html.Raw:
-    """"Create a record" for one message, or nothing if there is no message to build it from."""
+_REASON_LABELS = OrderedDict((
+    ("no_po", "No PO"),
+    ("qty_conflict", "Qty conflict"),
+    ("incomplete", "Incomplete"),
+    ("status_report", "Status report"),
+    ("awaiting_confirmation", "Awaiting confirmation"),
+    ("needs_ocr", "Needs OCR"),
+    ("nothing_recognised", "Nothing recognised"),
+    ("corrupt", "Corrupt"),
+    ("unreadable", "Unreadable"),
+    ("nothing_extracted", "Nothing extracted"),
+    ("duplicate", "Duplicate"),
+    ("overridden", "Set aside in error"),
+    ("maybe_advertising", "Maybe advertising"),
+    ("routed", "Routed"),
+    ("quarantined", "Quarantined"),
+    ("error", "Error"),
+))
+"""`ManualItem.code` in the words the chips and the Reason column use.
+
+Ordered by what a person would work through first — the records that are nearly there, then the
+files nothing could read, then the mail that was only ever routed to a person. The order is the
+order of the chips, so it is a statement about priority and not just about layout.
+"""
+
+_REASON_TONES = {
+    "no_po": "hold", "qty_conflict": "hold", "incomplete": "hold",
+    # Plain, like `maybe_advertising`: nothing failed. The document was read perfectly and is
+    # simply not a delivery document, and the only thing left is for somebody to say so.
+    "status_report": "plain",
+    "needs_ocr": "route", "nothing_recognised": "hold",
+    "corrupt": "error", "unreadable": "error",
+    "nothing_extracted": "hold", "duplicate": "plain",
+    # Waiting work, not a failure: a person has personally said this message is a delivery and
+    # nothing has been recorded from it yet.
+    "overridden": "hold",
+    # Plain, not a warning colour: nothing has gone wrong, somebody just has to say which
+    # of the two it is.
+    "maybe_advertising": "plain",
+    "routed": "plain", "quarantined": "error", "error": "error",
+}
+
+
+def _po_cell(item) -> html.Raw:
+    """The purchase order, and the line on it once that is known: `907514 : 13`.
+
+    A PO on its own does not identify a delivery. PO 907514 carries 29 lines that all read
+    `LOB-900-SI`, so its 23 queued rows each said "907514" and nothing that distinguished them —
+    correctly, since all 23 really are on that order. The line is what says *which item*, and it is
+    also what Spitfire needs to post the receipt against the right budget line.
+
+    Still the control that opens the mail the record was read from, so the link text changes and
+    nothing else does.
+    """
+    if not item.po_number:
+        return html.muted("—")
+    label = item.po_number
+    if item.po_line_number is not None:
+        label = f"{item.po_number} : {item.po_line_number}"
+    return html.mail_link(item.email_id, label, reason=item.reason)
+
+
+def _arrival_cell(item) -> html.Raw:
+    """What arrived, over who or what it came from.
+
+    Same shape as the Mail page's subject cell and for the same reason: the sender was a column of
+    its own, one long address set its width, and the subject — the thing anyone scans for — was
+    squeezed beside it.
+    """
+    what = (item.subject or item.ref or "").strip() or "(no subject)"
+    shown = what if len(what) <= 48 else what[:48].rstrip() + "…"
+    under = f"from {_short_address(item.sender)}" if item.sender else item.detail
+    return html.tag(
+        "div",
+        html.tag("span", shown, class_="subj nw", title=what),
+        html.tag("span", (under or "—")[:52], class_="from nw", title=item.detail or ""),
+        class_="cell-subject",
+    )
+
+
+def _queue_action(item, made=None) -> html.Raw:
+    """What this queue row offers a person: create a record, or close an existing record's gaps.
+
+    Fill takes what the proof of delivery already asserts — the delivery date, who signed for it —
+    rather than asking anyone to retype it, so the record and the file posted beside it cannot
+    disagree. Verify opens the comparison against the purchase order, which is where a spec code or
+    a quantity gets corrected from the order itself.
+
+    Both are the same controls the Records page carries; the record simply is not on that page any
+    more, so they had to come here with it.
+    """
+    if item.code == "awaiting_confirmation":
+        # Records already exist on this message — a great many of them — so Create a record is the
+        # one thing this row must not offer. The question here is not what is missing, it is
+        # whether what the message claims actually happened, and only a person can answer it.
+        return html.Raw(str(_verdict_link(
+            item.email_id, mail_overrides.CONFIRMED, "Confirm",
+            f"Confirm the goods arrived and send {item.rolled_up} record"
+            f"{'' if item.rolled_up == 1 else 's'} to Records")) + " " + str(_verdict_link(
+                item.email_id, mail_overrides.NOT_DELIVERY, "Not a delivery",
+                "Say this message is not a delivery notification, and take it off this queue")))
+    if item.kind != "record" or not item.ref_id:
+        # Two ways out of a message row, and they are the two answers to the same question. Either
+        # it is a delivery and the record is what is missing, or it is not one and it should never
+        # have been here — and until now only the first of those could be said.
+        create = _create_link(item.email_id, made.get(item.email_id, 0) if made else 0)
+        if not item.email_id:
+            return create
+        return html.Raw(str(create) + " " + str(_verdict_link(
+            item.email_id, mail_overrides.NOT_DELIVERY, "Not a delivery",
+            "Say this message is not a delivery notification, and take it off this queue")))
+    # `Fix` leads, and `Fill` follows it, because that is the order they are useful in. Measured on
+    # this queue: of the twenty-one incomplete records, seventeen are missing a spec code, sixteen
+    # a description and sixteen a quantity — **none of which any proof of delivery contains**. Fill
+    # can only supply the delivery date and the signature, which covers fourteen. Leading with the
+    # button that cannot answer the commonest question is what made these rows look unfixable.
+    return html.Raw(
+        str(html.tag("a", "Fix", href=f"/ui/records/{item.ref_id}/edit?from=manual",
+                     class_="btn small",
+                     title="Open this record and correct what is missing"))
+        + " "
+        + str(html.verify_button(f"/ui/records/{item.ref_id}/complete", "Fill", small=True,
+                                 ghost=True,
+                                 title="Take the delivery date and signature off the proof"))
+        + " "
+        + str(html.verify_button(f"/ui/records/{item.ref_id}/verify", "Verify", small=True,
+                                 ghost=True, title="Compare against the purchase order")))
+
+
+def _create_link(email_id, made: int = 0) -> html.Raw:
+    """"Create a record" for one message, or nothing if there is no message to build it from.
+
+    `made` is how many records a person has already built from this message. It only changes the
+    words: the destination is the same form either way, and "Create a record" on a message already
+    carrying two of them reads as though the first two did not happen.
+    """
     if not email_id:
         return html.muted("—")
-    return html.tag("a", "Create a record", class_="btn ghost small",
+    return html.tag("a", "Create another record" if made else "Create a record",
+                    class_="btn ghost small",
                     href=f"/ui/records/new?email_id={quote(str(email_id))}",
-                    title="Record this delivery by hand, from what this message says")
+                    title=(f"{made} already recorded from this message by hand — add another"
+                           if made else
+                           "Record this delivery by hand, from what this message says"))
 
 
-def _filtered_section(conn: sqlite3.Connection) -> html.Raw:
-    """Mail triage set aside as internal chatter, shown rather than hidden.
+def title_for_frag(verdict: str) -> str:
+    """The popup's heading for a reclassify form — the same words as the page's own title."""
+    return _VERDICT_COPY.get(verdict, {}).get("title", "This message")
 
-    Twelve of the fourteen emails in this queue were all-associates broadcasts and calendar
-    invites, each stating "no PO reference found anywhere in the thread". Every one of them was
-    true, and together they buried the two entries that were real work.
 
-    They are listed here, not deleted, because a suppression rule nobody can inspect is a rule
-    nobody can trust — and this is the table that shows a delivery wrongly filed as chatter.
+def _verdict_link(email_id, verdict: str, label: str, title: str) -> html.Raw:
+    """The way to the confirm form for overruling triage about one message.
+
+    A link and not a `button_form`, because the destination is a page to land on and is harmless for
+    a prefetch to follow — the write is behind that page's own POST. The id rides in the query
+    string, never a path segment, for the reason `mails_acknowledge` gives: a Message-ID is up to
+    255 characters of angle brackets and `@`.
+    """
+    url = f"/ui/mail/verdict?id={quote(str(email_id))}&to={quote(verdict)}"
+    # `data-frag` opens the same form in the popup already over the queue, so the decision is taken
+    # without the page going anywhere and the rows it retires leave the table in place. The `href`
+    # is unchanged and is what a browser with no script follows.
+    return html.tag("a", label, class_="btn ghost small", title=title, href=url,
+                    data_frag=f"{url}&inline=1", data_frag_title=title_for_frag(verdict))
+
+
+def _filtered_pointer(conn: sqlite3.Connection) -> html.Raw:
+    """Where the set-aside mail went, in one line.
+
+    The table itself used to sit here, at the bottom of a page whose whole subject is work waiting.
+    It was never work — nothing on it is queued, and its own note says so — and at 152 rows it was
+    the longest thing on the page. It now has a page of its own, where the rule that set each
+    message aside and the person who disagreed can both be read, and where either can be changed.
+
+    The count is still here because "is a real delivery being filed as chatter?" is a question that
+    brings people to this page, and a link with no number on it does not invite anyone to look.
+    """
+    total = read_views.filtered_count(conn)
+    return html.section(
+        "Not a delivery mail",
+        html.tag("p",
+                 f"{total} message{'' if total == 1 else 's'} set aside as not a delivery — by a "
+                 f"triage rule, or by a person. Not queued, not deleted, and not counted as work. ",
+                 html.tag("a", "Open the list", href="/ui/not-deliveries"),
+                 class_="note"),
+    )
+
+
+@router.get("/not-deliveries", response_class=HTMLResponse)
+def not_deliveries_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Everything taken out of the queue as not a delivery notification, and by whom.
+
+    Twelve of the fourteen messages this began with were all-associates broadcasts and calendar
+    invites, each stating "no PO reference found anywhere in the thread". Every one was true, and
+    together they buried the two entries that were real work. They are listed and not deleted
+    because a suppression nobody can inspect is a suppression nobody can trust.
+
+    Two populations, on purpose. A rule set most of these aside and is named on the row; a person
+    set the rest aside and is named on theirs. Both columns stay because a rule can be inspected and
+    a person can be asked, which are not the same kind of accountability — and either can be
+    overturned from the last column.
     """
     filtered = read_views.filtered_mail(conn)
-    rows = [[
-        _clipped(m["subject"] or m["email_id"], 60),
-        m["sender"] or html.muted("—"),
-        html.when((m["processed_at"] or "")[:16]),
-        _clipped(m["reason"], 70),
-    ] for m in filtered]
-    return html.section(
-        f"Filtered as internal chatter ({len(filtered)})",
-        html.table(["Subject", "From", "When", "Why it was set aside"], rows,
-                   empty="Nothing has been filtered.", table_id="manual-filtered", page_size=25,
-                   date_column="When",
-                   frag_urls=[html.mail_url(m["email_id"], m["reason"] or "") for m in filtered],
+    rows = []
+    for m in filtered:
+        who = (m["decided_by"] or "").strip()
+        rows.append([
+            _clipped(m["subject"] or m["email_id"], 58),
+            m["sender"] or html.muted("—"),
+            html.when((m["processed_at"] or "")[:16]),
+            _stamp(m["matched_rule"] or ""),
+            # The person's reason when there is one: they were looking at the message, and the rule
+            # they overruled has already said its piece in the column before this.
+            _clipped(m["decided_note"] or m["reason"], 66),
+            (html.tag("span", html.badge(who, "hold"),
+                      title=f"set aside by hand on "
+                            f"{(m['decided_at'] or '')[:16].replace('T', ' ')}")
+             if who else html.muted("triage")),
+            _verdict_link(m["email_id"], mail_overrides.DELIVERY, "This is a delivery",
+                          "Put this message back on the queue as a real delivery"),
+        ])
+    body = html.section(
+        f"Not a delivery mail ({len(filtered)})",
+        html.tag(
+            "div",
+            html.search_box(["not-deliveries-table"],
+                            placeholder="Search subject, sender, rule, name…",
+                            label="Search set-aside mail"),
+            html.date_filter(["not-deliveries-table"], label="date it arrived", presets=True),
+            class_="controls",
+        ),
+        html.table(["Subject", "From", "When", "Rule", "Why it was set aside", "Set aside by", ""],
+                   rows, empty="Nothing has been set aside.", table_id="not-deliveries-table",
+                   page_size=25, pane=True, date_column="When", no_sort=("",),
+                   # Every row — see the same note on `manual_page`. 1,269 rows are 1.7 MB and
+                   # 0.19 s here; capping saved nothing and hid the mail people come to look for.
+                   frag_urls=[html.mail_url(m["email_id"], m["decided_note"] or m["reason"] or "")
+                              for m in filtered],
+                   # A message put back on the queue leaves this page in the same press, without
+                   # the reader losing their search of 1,269 rows.
+                   email_ids=[m["email_id"] for m in filtered],
                    frag_title="Open this message"),
-        note="Not queued, not deleted. Internal mail with no PO, nothing readable attached and no "
-             "delivery vocabulary anywhere in the thread. If a real delivery appears here, the rule "
-             "is wrong — open it and say so.",
+        note="Not queued, not deleted, and not counted as work. A triage rule identified most of "
+             "these as something other than a delivery notification: internal chatter, a carrier "
+             "status notice, a scheduled report, or a thread whose every hop declines to say goods "
+             "arrived. The rule that decided it is named on each row, and a person may have "
+             "overruled it either way. If a real delivery is here, the rule is wrong — open it, "
+             "then say so with the last column.",
     )
+    return html.page(
+        "Not a delivery mail", "/ui/not-deliveries", body,
+        subtitle="Set aside by a triage rule or by a person, and never deleted.",
+        **_chrome(conn))
+
+
+@router.get("/cancellations", response_class=HTMLResponse)
+def cancellations_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+    """Purchase orders a cancellation notice named, and whether Spitfire has been told.
+
+    Triage already routes these out of the delivery path — rule 0a, "needs a manual PO update in
+    Spitfire, not a delivery event" — and that is where they stopped. Measured 2026-09-16: 66
+    notices, 7 naming a purchase order, none of those 7 marked Canceled in Spitfire.
+
+    **This page does not write to Spitfire, and that is deliberate.** Cancelling a purchase order
+    is `PATCH /api/document/{id}/Status`, which `connectors/spitfire_write._DENIED_SUBSTRINGS`
+    refuses by name: the same call marks a receipt POD Confirmed with no review and no Fixed-Asset
+    Accounting sign-off. Receiving goods records something that happened; cancelling retires a
+    commitment, so it stays a person's to make. `done` is read back from the mirror, so an order
+    cancelled directly in Spitfire leaves this list on its own.
+
+    **The notice is evidence, not a verdict.** `CANCELLATION_RE` is a keyword match over subject
+    and body, and two of the sixty-six are Cintas out-of-office replies on a thread whose subject
+    says FINAL NOTICE — they name two purchase orders that Spitfire still holds as Committed with
+    69 pending records between them. Which is exactly why the notice's subject and sender are
+    columns here rather than a hidden reason: a reviewer must be able to see that it was an
+    automatic reply before acting on it.
+    """
+    work = read_views.cancellation_worklist(conn)
+    unnamed = read_views.cancellations_without_a_po(conn)
+
+    rows = []
+    for item in work:
+        if item["done"] is True:
+            state = html.badge("Canceled in Spitfire", "good")
+        elif item["done"] is False:
+            state = html.tag("span", html.badge(item["spitfire_status"] or "open", "hold"),
+                             title="Spitfire still holds this order — the cancellation has not "
+                                   "been applied")
+        else:
+            state = html.tag("span", html.muted("not read yet"),
+                             title="this purchase order has never been read from Spitfire, so "
+                                   "nothing here knows what it holds")
+        rows.append([
+            html.token(item["po_number"]),
+            html.when(item["cancelled_at"]),
+            _clipped(item["subject"], 62),
+            _clipped(item["sender"], 30),
+            state,
+            (html.tag("a", f"{item['queued']} queued", class_="btn ghost small",
+                      href=f"/ui/records?q={item['po_number']}",
+                      title="records still pending against this order — a cancelled order with "
+                            "rows on Records is how goods get received against something nobody "
+                            "is buying any more")
+             if item["queued"] else html.muted("—")),
+        ])
+
+    outstanding = sum(1 for item in work if item["done"] is not True)
+    body = html.section(
+        f"Cancellation notices ({outstanding} outstanding of {len(work)})",
+        html.table(["PO", "Notice arrived", "Subject", "From", "Spitfire", "Still queued"],
+                   rows, empty="No cancellation notice names a purchase order.",
+                   table_id="cancellations-table", page_size=25, pane=True,
+                   date_column="Notice arrived", no_sort=("Still queued",),
+                   frag_urls=[html.mail_url(item["email_id"], item["subject"]) for item in work],
+                   email_ids=[item["email_id"] for item in work],
+                   frag_title="Open this notice"),
+        note="Read-only. Nothing here is sent to Spitfire: cancelling a purchase order retires a "
+             "commitment rather than recording something that happened, and the API call that "
+             "does it is the same one that would mark a receipt approved without review — so it "
+             "is refused by name in the write client. Open the notice, check it actually says the "
+             "order is cancelled, then close the order out in Spitfire. The row clears itself "
+             "once the mirror shows it Canceled."
+             + (f" {unnamed} further notice(s) name no purchase order and are not listed — there "
+                f"is nothing to act on until somebody reads them." if unnamed else ""),
+    )
+    return html.page(
+        "Cancellations", "/ui/cancellations", body,
+        subtitle="Orders a cancellation notice named, and whether Spitfire has been told.",
+        **_chrome(conn))
 
 
 @router.get("/po", response_class=HTMLResponse)
 def po_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
-    """Where each purchase order stands, from what the mail has said about it so far."""
-    pos = read_views.po_delivery_status(conn)
+    """Where each purchase order with a final receipt in Spitfire stands.
+
+    Only purchase orders whose final receipt was submitted (Premier, 2026-09-15). Every other PO the mail mentions is still
+    reachable from Records and from `/ui/po/{po}`.
+    """
+    pos = _posted_pos(conn)
     rows = []
     for p in pos:
         notices = ", ".join(
@@ -1961,10 +4144,16 @@ def po_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
     )
     return html.page(
         "Delivery status", "/ui/po", body,
-        subtitle="Where each purchase order stands. Status is inferred from the notifications "
-                 "received, not recorded.",
+        subtitle="Purchase orders with a final receipt submitted to Spitfire. Status is inferred "
+                 "from the notifications received, not recorded.",
         actions=[_export_po()],
         **_chrome(conn))
+
+
+def _posted_pos(conn: sqlite3.Connection) -> list:
+    """`po_delivery_status`, narrowed to purchase orders with a final receipt in Spitfire."""
+    posted = post_ledger.posted_po_numbers(conn)
+    return [p for p in read_views.po_delivery_status(conn) if str(p.po_number).strip() in posted]
 
 
 def _export_po() -> html.Raw:
@@ -1987,7 +4176,7 @@ def po_csv(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> Respon
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\r\n")
     writer.writerow(_PO_CSV_COLUMNS)
-    for p in read_views.po_delivery_status(conn):
+    for p in _posted_pos(conn):
         notices = ", ".join(
             f"{t.replace('_', ' ')}" + (f" ×{n}" if n > 1 else "")
             for t, n in sorted(p.notifications.items())
@@ -2072,23 +4261,126 @@ _ATTACHMENT_DISPOSITIONS = {
 }
 
 
+_ATTACHMENT_VIEWS = {
+    "file": "Real files",
+    "inline": "Inline images",
+    "all": "All attachments",
+}
+"""Which rows the Attachments page loads. A view, not a filter: the browser never receives the
+rows a view leaves out, which is the entire point — see `attachments_page`."""
+
+
+def _attachment_view_links(current: str, counts: dict, place: dict) -> html.Raw:
+    """The three row sets, each with how many rows it holds, current one marked.
+
+    Printed rather than hidden in a dropdown because the default no longer shows everything, and a
+    page that quietly holds back 27,393 rows owes the reader both the number and the way to them.
+
+    `place` carries every other control's setting into the link. These used to be bare
+    `?view=inline`, which silently threw away the search, the sort and the date range the moment
+    you changed view -- so looking for one filename across both sets meant typing it again.
+    `page` is deliberately dropped: page 400 of one view is not page 400 of another.
+    """
+    parts = []
+    for value, label in _ATTACHMENT_VIEWS.items():
+        count = counts.get(value)
+        text = f"{label} ({count:,})" if count is not None else label
+        if value == current:
+            parts.append(html.tag("span", text, class_="chip chip-on", aria_current="true"))
+        else:
+            href = "/ui/attachments" + html.query_string(
+                {**place, "view": value if value != "file" else "", "page": ""})
+            parts.append(html.tag("a", text, href=href, class_="chip"))
+    return html.Raw(" ".join(str(p) for p in parts))
+
+
+_ATTACHMENT_DAYS = (("Today", "0"), ("7d", "7"), ("30d", "30"), ("All", ""))
+
+
+def _attachment_date_links(days: str, place: dict) -> html.Raw:
+    """Today / 7d / 30d / All, as links that narrow the query.
+
+    These were `html.date_filter` chips, which hide rows the browser is already holding. On a table
+    the browser only ever sees 25 rows of, that control could not do anything at all -- it would
+    have narrowed the current page and reported nothing about the rest. Same four choices, asked of
+    the database.
+    """
+    chips = []
+    for label, value in _ATTACHMENT_DAYS:
+        if value == days:
+            chips.append(html.tag("span", label, class_="chip chip-on", aria_current="true"))
+        else:
+            href = "/ui/attachments" + html.query_string({**place, "days": value, "page": ""})
+            chips.append(html.tag("a", label, href=href, class_="chip"))
+    return html.tag("div", *chips, class_="chips")
+
+
+def _since_for(days: str) -> str:
+    """The `first_seen_at` floor for a preset, or "" for all of time.
+
+    Date-only, and compared as a string: `first_seen_at` is ISO-8601, so `>= '2026-09-16'` is every
+    instant on the 16th and after. "0" means today, which is a floor of today's date -- not of
+    "now", which would exclude everything that arrived this morning.
+    """
+    if not days:
+        return ""
+    try:
+        back = int(days)
+    except ValueError:
+        return ""
+    return (datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d")
+
+
 @router.get("/attachments", response_class=HTMLResponse)
-def attachments_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
+def attachments_page(view: str = "file", q: str = "", page: int = 1, size: int = 25,
+                     sort: str = "", dir: str = "desc", state: str = "", days: str = "",
+                     conn: sqlite3.Connection = Depends(deps.get_pipeline_conn)) -> str:
     """Every file taken off every email, with what we know about each one.
 
     The only page that answers "what have we actually got?". `/ui/manual` lists the attachments
     needing attention and the mail dialog lists one message's worth; neither can show that the same
     bytes arrived twice under different filenames, which is exactly what the two FedEx PDFs on the
-    210634 thread do.
+    910634 thread do.
 
-    Every attachment is listed, always: they were all downloaded and all take up disk, so the count
-    on screen matches the count in the database. Signature logos and letterhead outnumber the real
-    files better than two to one, and the View dropdown is where they are put aside — that used to
-    be `?inline=hide`, a link that reloaded the whole page to hide rows it had already rendered.
+    **This table is searched, sorted and paged by the database, not by the browser**, and it is the
+    only one in the app that is. Every other page ships every row it stands for, so a filter in the
+    browser is filtering everything there is. This one cannot: signature logos do not merely
+    outnumber the real files, they are 27,393 of 29,766 on Premier's live store, and sending all of
+    them so the browser could hide all but 25 cost 25 MB of HTML and 4.2 seconds before the page
+    began to paint.
+
+    What that used to buy was a cap and an apology — the newest 500 rows and a note underneath
+    reading "the search and filters cover these 500". This asks the server instead, so the search
+    box covers all 29,766 and the pager says where in them you are. Nothing is hidden, and nothing
+    has to be loaded to be found.
+
+    Every one of these parameters is validated against a whitelist before it reaches a query;
+    `sort` in particular picks a key in `read_views.ATTACHMENT_SORTS` and never becomes SQL.
     """
-    rows_in = read_views.attachments(conn)
+    view = view if view in _ATTACHMENT_VIEWS else "file"
+    size = size if size in html.SERVER_PAGE_SIZES else 25
+    sort = sort if sort in read_views.ATTACHMENT_SORTS else ""
+    state = state if state == "unread" else ""
+    days = days if days in {value for _label, value in _ATTACHMENT_DAYS} else ""
+    descending = dir != "asc"
+    page = max(1, page)
 
-    rows, states = [], []
+    narrowing = {
+        "q": q,
+        "include_inline": view in ("all", "inline"),
+        "inline_only": view == "inline",
+        "unread_only": state == "unread",
+        "since": _since_for(days),
+    }
+    matched = read_views.attachment_count(conn, **narrowing)
+    # Clamp before querying rather than after: `?page=99999` should show the last page, not an
+    # empty table that still claims 29,766 rows exist.
+    pages = max(1, -(-matched // size))
+    page = min(page, pages)
+    rows_in = read_views.attachments(conn, limit=size, offset=(page - 1) * size,
+                                     sort=sort, descending=descending, **narrowing)
+
+    rows = []
     for a in rows_in:
         pod = (html.Raw(str(html.badge("POD", "pod")) + " "
                         + str(html.token(a["pod_po_numbers"] or "unnamed")))
@@ -2096,7 +4388,12 @@ def attachments_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn))
         asserts = " · ".join(x for x in (a["pod_delivery_date"], a["pod_signed_by"]) if x)
         stored = (html.token(a["stored_sha"][:10]) if a["stored_sha"]
                   else html.badge("not stored", "error"))
-        view = f"/ui/mail/attachment/view?id={quote(a['email_id'])}&n={a['ordinal']}&src=inbox"
+        # `open_url`, never `view`. This was named `view`, which is also this page's own `?view=`
+        # parameter — so every row overwrote it, and after the loop the view tabs and the "Load all"
+        # button were built from the last attachment's viewer URL: the button went to
+        # `/ui/attachments?view=/ui/mail/attachment/view…&all=1`. Found 2026-09-15, when the search
+        # readout started offering that same link.
+        open_url = f"/ui/mail/attachment/view?id={quote(a['email_id'])}&n={a['ordinal']}&src=inbox"
         download = (f"/ui/mail/attachment?id={quote(a['email_id'])}&n={a['ordinal']}"
                     f"&src=inbox&download=1")
         rows.append([
@@ -2105,7 +4402,7 @@ def attachments_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn))
             # Filename over what it weighs and what became of it. Size was its own column and is
             # not worth one: nobody scans a table by kilobytes, but "1.2 MB · decorative" beside a
             # filename is the whole story of that row in six words.
-            _file_cell(a, view),
+            _file_cell(a, open_url),
             html.muted((a["sniffed_kind"] or "unknown").upper()),
             _po_evidence(a),
             a["records_extracted"] or html.muted("0"),
@@ -2124,47 +4421,65 @@ def attachments_page(conn: sqlite3.Connection = Depends(deps.get_pipeline_conn))
             # same kind: the file, the bytes, the message it came on.
             html.Raw(
                 str(html.tag("button", "View", type="button", class_="btn ghost small",
-                             data_frag=view, title="Open this file in the page"))
+                             data_frag=open_url, title="Open this file in the page"))
                 + " "
                 + str(html.tag("a", "Download", href=download, class_="btn ghost small"))
                 + " "
                 + str(html.mail_link(a["email_id"], "✉", cls="btn ghost small",
                                      title="Open the email this arrived on"))),
         ])
-        states.append(_attachment_state(a))
 
-    # The inline toggle used to be a link that reloaded the page with `?inline=hide`. It is a view
-    # of the same rows, so it is one of the views — and the dropdown can say the other two things
-    # the old link could not: which files could not be read, and the logos on their own.
-    present = set(states)
-    views = [(value, label) for value, label in (
-        ("unread", "My triage queue"),
-        ("file", "Real files only"),
-        ("inline", "Inline images only"),
-    ) if any(value in state.split() for state in present)]
+    total_attachments = read_views.attachment_count(conn)
+    real_attachments = read_views.attachment_count(conn, include_inline=False)
+
+    # What every control other than itself is currently set to, so each one carries the rest along.
+    # Pressing Search must not drop the view you were in, and sorting must not drop your search.
+    place = {"view": view if view != "file" else "", "q": q, "size": size if size != 25 else "",
+             "sort": sort, "dir": "" if descending else "asc", "state": state, "days": days}
+
+    def sort_url(key: str) -> str:
+        # Clicking the column you are already sorted by turns it around; clicking another starts
+        # that one at its natural end -- newest first for a date, A-Z for a name.
+        turning = key == sort or (not sort and key == "received")
+        way = "asc" if (turning and descending) else ("" if turning else _ATTACHMENT_SORT_START[key])
+        return "/ui/attachments" + html.query_string({**place, "sort": key, "dir": way, "page": ""})
 
     body = html.section(
         "",
         html.tag(
             "div",
-            html.search_box("attachments-table",
-                            placeholder="Search filename, PO, type…",
-                            label="Search attachments"),
-            html.date_filter("attachments-table", label="received", presets=True),
-            html.choice_filter("attachments-table", views, label="View",
-                               all_label="All attachments", boxed=True),
+            html.server_search("/ui/attachments", q, place, table_id="attachments-table",
+                               placeholder="Search filename, PO, subject, sender…",
+                               label="Search attachments"),
+            _attachment_date_links(days, place),
+            _attachment_state_links(state, place),
+            _attachment_view_links(view, place=place, counts={
+                "file": real_attachments,
+                "inline": total_attachments - real_attachments,
+                "all": total_attachments,
+            }),
             class_="controls",
         ),
         html.table(
             ["#", "Received", "Filename", "Type", "PO", "Records", "Stored", "Inline", "POD",
              "POD says", "Disposition", "Read by", "From mail", ""],
-            rows, empty="No attachments have been downloaded yet.",
-            table_id="attachments-table", page_size=25, pane=True, date_column="Received",
-            no_sort=("", "Filename"), num_columns=("Records",), choice_values=states,
+            rows, empty=_no_attachments_hint(q, state, days),
+            table_id="attachments-table", pane=True, num_columns=("Records",),
+            # `page_size=0`: no client pager. The browser holds 25 rows, so there is nothing for it
+            # to page through -- `server_pager` below is what moves between slices.
+            page_size=0,
+            sort_urls={"Received": sort_url("received"), "Filename": sort_url("filename"),
+                       "Type": sort_url("type"), "Records": sort_url("records"),
+                       "Disposition": sort_url("disposition"),
+                       "From mail": sort_url("subject")},
+            sorted_by=(_ATTACHMENT_SORT_HEADINGS.get(sort or "received", ""),
+                       "desc" if descending else "asc"),
             frag_urls=[f"/ui/mail/attachment/view?id={quote(a['email_id'])}"
                        f"&n={a['ordinal']}&src=inbox" for a in rows_in],
             frag_title="Open this attachment",
         ),
+        html.server_pager("/ui/attachments", place, table_id="attachments-table",
+                          page=page, size=size, total=matched, unit="attachment"),
     )
     return html.page(
         "Attachments", "/ui/attachments", body,
@@ -2208,18 +4523,57 @@ def _file_cell(a, view_url: str) -> html.Raw:
     )
 
 
-def _attachment_state(a) -> str:
-    """What this row *is*, for the view dropdown, as space-separated words.
+_ATTACHMENT_SORT_START = {
+    # Which end a column starts at when you first click it. A date means "newest first"; a name
+    # means A-Z. Getting this wrong is not an error, only an extra click every single time.
+    "received": "", "records": "", "size": "",
+    "filename": "asc", "type": "asc", "disposition": "asc", "subject": "asc",
+}
 
-    Not a column: "this is a signature logo" and "nothing could read this" are two different facts
-    and a row can carry both, so neither is a cell the filter could match against. `is_inline` is
-    the ledger's own flag; unread is the union of the three ways a file ends up with nothing read
-    out of it — the reader raised, the bytes were unusable, or the bytes never landed at all.
+_ATTACHMENT_SORT_HEADINGS = {
+    "received": "Received", "filename": "Filename", "type": "Type", "records": "Records",
+    "disposition": "Disposition", "subject": "From mail", "size": "Filename",
+}
+
+
+def _attachment_state_links(state: str, place: dict) -> html.Raw:
+    """"Everything" / "Nothing could be read", as links rather than a dropdown.
+
+    It was a `choice_filter`, which matches against `data-choice-value` on rows the browser is
+    holding -- so it could only ever narrow the 25 rows on screen. As a link it narrows the query,
+    and the count it produces is the count of every unreadable file in the ledger.
     """
-    words = ["inline" if a["is_inline"] else "file"]
-    if a["error_type"] or a["disposition"] in ("corrupt", "empty") or not a["stored_sha"]:
-        words.append("unread")
-    return " ".join(words)
+    options = (("", "Everything"), ("unread", "Nothing could be read"))
+    links = [
+        html.tag("span", label, class_="chip on") if value == state else
+        html.tag("a", label, class_="chip",
+                 href="/ui/attachments" + html.query_string({**place, "state": value, "page": ""}))
+        for value, label in options
+    ]
+    return html.tag("div", *links, class_="chips")
+
+
+def _no_attachments_hint(q: str, state: str, days: str = "") -> str:
+    """Why the table is empty, in terms of what was asked -- never a bare "nothing here".
+
+    An empty table after a search is a different fact from an empty ledger, and saying the second
+    when the first is true is how somebody concludes the file never arrived.
+    """
+    if q and state:
+        return f"No unreadable attachment matches {q!r}."
+    if q:
+        return f"No attachment matches {q!r}."
+    if state:
+        return "Every attachment in this range was read."
+    if days:
+        return "Nothing arrived in this period."
+    return "No attachments have been downloaded yet."
+
+
+# `_attachment_state` lived here: it read each row in Python and handed the answer to a dropdown
+# in the browser, which meant all 29,766 rows had to be rendered before one could be filtered out.
+# The same union is now `read_views.UNREAD_CLAUSE`, evaluated in SQL where the rows are, and the
+# control that drives it is `_attachment_state_links`.
 
 
 def _export_attachments() -> html.Raw:
@@ -2434,8 +4788,11 @@ def _mail_fragment_html(email_id: str, *, src: str = "", reason: str = "", image
     db_path = _store_for(src)
     mail = mail_view.resolve(email_id, db_path=db_path)
     # Offered from the message itself, because that is where somebody works out that the pipeline
-    # missed something — reading the mail, not scanning the queue that listed it. Says what has
-    # already been made from this message rather than inviting a second record for one delivery.
+    # missed something — reading the mail, not scanning the queue that listed it. It used to say
+    # what had already been made from this message *instead of* offering a second record, on the
+    # reasoning that one delivery needs one record. That is true of a delivery and false of a
+    # message: a notification lists the lines of a delivery, and sometimes several POs. So it now
+    # says what has been made and offers both ways to add to it.
     header = "" if bare else _create_from_mail(email_id)
     return header + mail_view.render(
         mail, reason=reason, remote_images=images,
@@ -2462,12 +4819,34 @@ def mail_fragment(id: str = "", reason: str = "", images: int = 0, src: str = ""
     return _mail_fragment_html(id, src=src, reason=reason, images=bool(images), bare=bool(bare))
 
 
+def _verdict_from_mail(email_id: str, set_aside: bool) -> html.Raw:
+    """The reclassify control for the message dialog, pointing whichever way this message is not.
+
+    Direction comes from the message's own state rather than from the page the dialog was opened
+    over, and that is what makes one control correct everywhere it appears: on the queue it offers
+    "Not a delivery", on the not-a-delivery page it offers "This is a delivery", and on the Mail
+    page it offers whichever of those the message is not already. A dialog is fetched by script from
+    any page and cannot be told where it was opened from, so asking the message is not a shortcut —
+    it is the only answer that cannot be wrong.
+    """
+    if set_aside:
+        return _verdict_link(email_id, mail_overrides.DELIVERY, "This is a delivery",
+                             "Put this message back on the queue as a real delivery")
+    return _verdict_link(email_id, mail_overrides.NOT_DELIVERY, "Not a delivery",
+                         "Say this message is not a delivery notification, and take it off "
+                         "the queue")
+
+
 def _create_from_mail(email_id: str) -> str:
-    """The Create control, and what has already been built from this message.
+    """The Create control, the reclassify control, and what has already been built from this message.
 
     Only offered for live mail: a record has to carry a `source_email_id` the rest of the system
     can resolve, and the retired corpus store is not that. `_store_for` resolves an unknown `src`
     to the corpus on purpose, so this asks the live store directly rather than trusting the caller.
+
+    Both controls, side by side, because reading the message is where somebody settles which of them
+    this is. Sending them back to the row to press the other one is asking them to find it again on
+    a page of five hundred, having just closed the only thing that answered the question.
     """
     conn = deps.pipeline_connection()
     try:
@@ -2475,20 +4854,34 @@ def _create_from_mail(email_id: str) -> str:
         if known is None:
             return ""
         made = record_create.records_from(conn, email_id)
+        verdict = _verdict_from_mail(email_id, read_views.is_set_aside(conn, email_id))
     finally:
         conn.close()
 
     if made:
         who = ", ".join(sorted({str(r["created_by"] or "somebody") for r in made}))
         numbers = ", ".join(f"#{r['id']}" for r in made)
+        latest = made[-1]
+        po = (latest["po_number"] or "").strip()
         return str(html.tag(
             "p",
             html.muted(f"{len(made)} record(s) created from this message by hand ({numbers}, "
                        f"by {who})."),
             " ",
+            html.tag("a", f"Add another line to PO {po}" if po else "Add another line",
+                     class_="btn ghost small",
+                     href=f"/ui/records/new?email_id={quote(email_id)}"
+                          f"&after={latest['id']}&same_po=1",
+                     title="Same purchase order, same delivery date — a different item on it"),
+            " ",
+            html.tag("a", "Different PO", class_="btn ghost small",
+                     href=f"/ui/records/new?email_id={quote(email_id)}",
+                     title="A separate delivery that this same message reports"),
+            " ",
             html.tag("a", "Records", href="/ui/records", class_="btn ghost small"),
+            " ", verdict,
             class_="mail-created"))
-    return str(html.tag("p", _create_link(email_id), class_="mail-created"))
+    return str(html.tag("p", _create_link(email_id), " ", verdict, class_="mail-created"))
 
 
 @router.get("/mail/attachment/view", response_class=HTMLResponse)
@@ -2593,6 +4986,8 @@ def mail_attachment(id: str = "", n: int = 0, download: int = 0, src: str = "") 
         # has always done; the two disagreeing is why an image 404'd beside a spreadsheet that
         # rendered.
         found = attachment_bytes.resolve(conn, id, n)
+        # Read while the connection is open, and only when there is something to explain.
+        why = attachment_bytes.missing_reason(conn, id, n) if found is None else None
     finally:
         conn.close()
 
@@ -2601,8 +4996,7 @@ def mail_attachment(id: str = "", n: int = 0, download: int = 0, src: str = "") 
     # the browser something it cannot render and no reason why. The popup shows the ledger's own
     # verdict beside each attachment; this just refuses to pretend there are bytes.
     if found is None:
-        return Response(content=b"This attachment was not retained - see the verdict beside it.",
-                        status_code=404, media_type="text/plain")
+        return _no_bytes_response(why, download)
 
     content_type = (found.content_type or "").lower()
     kind = (found.kind or "").lower()
@@ -2623,6 +5017,56 @@ def mail_attachment(id: str = "", n: int = 0, download: int = 0, src: str = "") 
                                    f'filename="{filename}"',
             "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; object-src 'none'",
+        },
+    )
+
+
+_BLANK_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=")
+"""A 1x1 fully transparent PNG, 68 bytes. See `_no_bytes_response`."""
+
+
+def _no_bytes_response(why, download: int) -> Response:
+    """How to say "there are no bytes", in the register the asker is using.
+
+    A signature logo whose bytes were deliberately released is the one case worth answering with a
+    picture. `mail_view._resolve_inline_images` points every `cid:` in a stored message body at
+    this route, and the frame's CSP is `img-src 'self' data:` with no remote fallback -- so a 404
+    there is a broken-image icon in the middle of somebody's signature block, on a message where
+    nothing is actually wrong. A transparent pixel lets the body lay out as its sender intended.
+
+    Everything else keeps the refusal, unchanged and deliberate:
+
+    * `download=1` is a person asking for the file. Handing them a blank pixel named as their
+      document would be a lie with a filename on it.
+    * a non-inline decorative row, an unknown ordinal, and every other disposition -- `corrupt`,
+      `service_unavailable`, `dropped_oversize` -- mean something a reader needs to know. The
+      popup prints the ledger's own verdict beside each attachment; this must not contradict it.
+
+    `X-Attachment-Placeholder` is how an operator, a log and a test tell a blank pixel from real
+    bytes without parsing the body. `no-store` because restoring the blob, or setting
+    `PREMIER_STORE_DECORATIVE=1`, must take effect on the next load rather than after a cache
+    expires.
+    """
+    refusal = Response(
+        content=b"This attachment was not retained - see the verdict beside it.",
+        status_code=404, media_type="text/plain")
+    if download or why is None:
+        return refusal
+    disposition, is_inline = why
+    if disposition != attachment_ledger.DROPPED_DECORATIVE or not is_inline:
+        return refusal
+    return Response(
+        content=_BLANK_PNG,
+        media_type="image/png",
+        headers={
+            # Our file, not the sender's: naming it after their attachment would make a saved copy
+            # claim to be the document.
+            "Content-Disposition": 'inline; filename="placeholder.png"',
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; object-src 'none'",
+            "Cache-Control": "no-store",
+            "X-Attachment-Placeholder": attachment_ledger.DROPPED_DECORATIVE,
         },
     )
 
@@ -2649,27 +5093,8 @@ def _num(value) -> str:
 # would make the receiver report unusable as evidence.
 # ==========================================================================
 
-_MAX_FORM_BYTES = 64 * 1024
-
-
-async def _form_values(request: Request) -> dict:
-    """Parse an urlencoded form body without python-multipart.
-
-    `await request.form()` cannot be used: Starlette asserts python-multipart is importable *before*
-    it looks at the content type at all, so a plain urlencoded body — which is all an HTML form
-    sends — raises AssertionError when the library is absent. That is what made every Save return
-    500 and no schedule ever get written.
-
-    Parsing the body directly keeps the dependency out, which also keeps multipart *upload* parsing
-    structurally unreachable in an app whose entire guarantee is that it only reads.
-    `tests/test_operations_controls.py` asserts the library stays out of requirements.txt.
-    """
-    if not request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
-        return {}
-    if int(request.headers.get("content-length") or 0) > _MAX_FORM_BYTES:
-        return {}
-    parsed = parse_qs((await request.body()).decode("utf-8", "replace"), keep_blank_values=True)
-    return {key: values[-1] for key, values in parsed.items()}
+# `_form_values` and `_form_list` moved to `api/forms.py` when the sign-in page needed them too.
+# The names are kept as aliases so the eight call sites above read unchanged.
 
 
 def _now() -> str:
@@ -2724,8 +5149,67 @@ def live_version_token() -> str:
 
 @router.get("/version")
 def version_endpoint() -> dict:
-    """What the page poller asks, ten seconds at a time. See `_JS` in `api/ui/html.py`."""
-    return {"token": live_version_token()}
+    """What the page poller asks, ten seconds at a time. See `_JS` in `api/ui/html.py`.
+
+    `running` rides along because the poller has to behave differently during a run, and asking
+    a second endpoint for it would double a request that exists precisely because it is cheap.
+
+    Why the poller needs it at all: `live_version_token()` includes `email_log`'s row count and
+    highest id, both of which climb continuously while a pass writes. So during a run the token
+    changes on essentially every poll, and a poller that reloads whenever the token moved would
+    reload every ten seconds for the length of the run — re-creating, more slowly, the two-second
+    meta refresh that was just removed from `/ui/automation`. `runner.is_running()` is a memory
+    read of a plain flag; it costs nothing to answer.
+    """
+    return {"token": live_version_token(), "running": runner.is_running()}
+
+
+@router.get("/run-progress")
+def run_progress_endpoint() -> dict:
+    """Where the run in progress has got to. Polled every couple of seconds while one is running.
+
+    **Separate from `/ui/version`, and the difference is the whole point: this touches no database
+    at all.** `live_version_token()` opens two connections and runs `mail_arrivals`'
+    pending anti-join; that is affordable once every ten seconds and not five times as often. Every
+    field here is a read of a plain dict in this process (`runner._STATE`, `runner._PROGRESS`), so
+    the endpoint costs microseconds and can be polled as fast as the ring needs to move.
+
+    This exists because the progress ring had no way to advance. A `<meta http-equiv="refresh">`
+    used to reload `/ui/automation` every two seconds, and removing it — correctly, it threw away
+    scroll position, open dialogs and table filters hundreds of times per run — left nothing in its
+    place. `/ui/version` carries no progress, and the poller in `_JS` deliberately refuses to reload
+    while a run is in flight. So for the length of a multi-minute run the ring, the phase and the
+    count were a snapshot from page load that never moved.
+
+    `elapsed_seconds` is computed here rather than in the browser: the client's clock is not ours,
+    and "started 2 minutes ago" rendered from a mismatched clock is worse than no number.
+    """
+    running = runner.is_running()
+    since = runner.running_since()
+    elapsed = None
+    if since:
+        try:
+            elapsed = max(0, int((datetime.now() - datetime.strptime(
+                since, "%Y-%m-%d %H:%M:%S")).total_seconds()))
+        except (ValueError, TypeError):
+            elapsed = None
+    progress = runner.progress() if running else {}
+    return {
+        "running": running,
+        "since": since,
+        "elapsed_seconds": elapsed,
+        "phase": progress.get("phase", ""),
+        "label": html.progress_label(progress.get("phase", "")),
+        "done": progress.get("done", 0),
+        "total": progress.get("total", 0),
+        "note": progress.get("note", ""),
+        # How long since the run last showed any sign of life. A slow read keeps this near zero,
+        # a hung one watches it climb — which is the difference an operator needs while deciding
+        # whether to press Stop, and before `runner.reap_if_stuck` decides for them.
+        "silent_seconds": (None if not running or runner.seconds_since_activity() is None
+                           else int(runner.seconds_since_activity())),
+        "stop_requested": runner.stop_requested(),
+    }
 
 
 def _live_conn() -> sqlite3.Connection:
@@ -2776,16 +5260,33 @@ def automation_page(refused: str = "") -> str:
     if running:
         tone, headline = "warn", "Running now…"
         since = runner.running_since()
+        # Says what the page actually does, which for a while it did not. This used to promise
+        # "this page refreshes itself until it finishes" — written when a `<meta refresh>` reloaded
+        # every two seconds. That refresh is gone, and for a time the sentence outlived it: the
+        # page froze mid-run and went on claiming to be working long after the run had ended.
+        # Copy describing behaviour has to be changed with the behaviour.
         detail = ("The automation is working through the mail"
                   + (f", started {_ago(since)}" if since else "")
-                  + ". You can leave this page — it keeps going, and this page refreshes itself "
-                    "until it finishes.")
+                  + ". You can leave this page — it keeps going, and the progress above advances "
+                    "as it does.")
     elif last is None:
         tone, headline = "", "Not run yet"
         detail = "Press Run now to read the delivery emails and build the receiver report."
     elif last.error:
         tone, headline = "bad", f"Last run failed {_ago(last.started_at)}"
         detail = last.error
+    elif last.emails == 0 and _unread_arrivals():
+        # A run that read nothing while mail is *known* to be waiting is not a healthy run, and
+        # this branch used to call it one — "everything in the inbox has already been through the
+        # pipeline" was printed while 24 messages sat unreadable, one of them an urgent PO email.
+        #
+        # The count is not new information: `mail_arrivals` minus `email_log` is exactly what the
+        # Mail page already displays. Nothing consulted it here, so the console's own summary was
+        # the thing hiding the fault. Silence is not health.
+        waiting = _unread_arrivals()
+        tone, headline = "bad", f"Last run read nothing, {_ago(last.started_at)}"
+        detail = (f"{waiting} message{_s(waiting)} arrived and still has no verdict, so this run "
+                  "reading nothing is a fault rather than an idle inbox. See Mail for which.")
     elif last.emails == 0:
         # Zeroes read as a failure. A run that found nothing new is the normal, healthy outcome
         # once the inbox has been read once, and saying so is the difference between "it worked"
@@ -2802,23 +5303,56 @@ def automation_page(refused: str = "") -> str:
                   + (f"{last.needs_person} need a person." if last.needs_person
                      else "Nothing needs a person."))
 
-    progress = runner.progress() if running else None
+    # Rendered on every visit, not only during a run, and hidden when idle. A run started in another
+    # tab — or by the schedule — can then be shown by the ticker in `_JS` writing into markup that is
+    # already here, instead of the page needing a reload it has good reasons to refuse.
+    progress = runner.progress() if running else {}
+
+    # **`—`, not `0`, while a run is in flight.** `ops_store.start_run` inserts the run row *before*
+    # the pass, with every count defaulting to zero, and `last_run()` is that row — so for the whole
+    # of a multi-minute run this strip sat under the words "Running now…" asserting `0 emails read /
+    # 0 receiver lines / 0 need a person / 0s`. Four confident zeroes about work in progress read as
+    # a run that is finding nothing, which is the opposite of what is happening. An em dash says
+    # "not known yet", and the ring above is what carries the truth meanwhile.
+    def figure(value):
+        return html.muted("—") if running else value
 
     status = html.card(
         # The refusal sits above the status, not instead of it: it explains what this press did,
         # while the card below still answers what the automation is doing.
         html.tag("p", refused, class_="err") if refused else html.Raw(""),
-        (html.progress_ring(progress["phase"], progress["done"], progress["total"],
-                            progress.get("note", ""))
-         if progress else html.Raw("")),
-        html.tag("p", detail, class_="note"),
+        html.progress_ring(progress.get("phase", ""), progress.get("done", 0),
+                           progress.get("total", 0), progress.get("note", ""),
+                           hidden=not running),
+        html.tag("p", detail, class_="note", data_run_detail="1"),
         html.stat_row([
-            (last.emails if last else 0, "emails read"),
-            (last.records if last else 0, "receiver lines"),
-            (last.needs_person if last else 0, "need a person"),
-            (f"{last.elapsed_seconds:g}s" if last else "—", "time taken"),
+            (figure(last.emails if last else 0), "emails read"),
+            (figure(last.records if last else 0), "receiver lines"),
+            (figure(last.needs_person if last else 0), "need a person"),
+            (figure(f"{last.elapsed_seconds:g}s" if last else "—"), "time taken"),
         ]),
-        html.button_form("/ui/automation/run", "Run now", style="margin-top:18px"),
+        html.tag("div",
+                 html.button_form("/ui/automation/run", "Run now"),
+                 # Beside Run now rather than instead of it, and a separate thing from "Stop
+                 # automation" in the sidebar: that one engages the kill switch, which survives a
+                 # restart and pauses the schedule. This stops the pass in progress and nothing else.
+                 #
+                 # **Always drawn, greyed out while idle.** It was hidden when nothing was running,
+                 # and the first thing anyone did was come looking for it between runs and conclude
+                 # it did not exist. A control you can see but not press says "nothing to stop";
+                 # a control that is not there says nothing at all.
+                 html.tag("span",
+                          html.button_form("/ui/automation/run/stop",
+                                           "Stopping…" if runner.stop_requested()
+                                           else "Stop this run",
+                                           busy_label="Stopping…",
+                                           disabled=not running or runner.stop_requested(),
+                                           title=("Stops the run in progress. Nothing is running "
+                                                  "right now." if not running else
+                                                  "Stops the run in progress; the schedule "
+                                                  "carries on.")),
+                          data_run_stop="1"),
+                 style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap"),
         title=headline,
         tone=tone,
     )
@@ -2923,13 +5457,25 @@ def automation_page(refused: str = "") -> str:
     return html.page("Automation", "/ui/automation", status, schedule_card, watch_card, history,
                      subtitle="Run the automation, or have it run itself.",
                      **_sidebar_counts(),
-                     # Only while a run is in flight, so the page stops reloading the moment it
-                     # settles. `running` was read once above, before the render, so a run that
-                     # finishes mid-render still leaves one last refresh to show the result.
+                     # **Never.** This was `2 if running else 0` — a `<meta http-equiv="refresh">`
+                     # reloading the whole page every two seconds for the entire length of a run,
+                     # to advance the progress ring.
                      #
-                     # Two seconds, not five: this is what advances the progress ring, and a run
-                     # of this length redrawing three times total would not read as progress.
-                     refresh_seconds=2 if running else 0)
+                     # Two problems, and the second is the one that decided it. A run is minutes
+                     # long, so that is hundreds of full reloads; and while the token call could
+                     # hang (see `settings.GRAPH_AUTH_TIMEOUT_SECONDS`) `running` stayed true for
+                     # twelve hours at a stretch, so the page hammered itself for half a day.
+                     #
+                     # More importantly it reloaded *unconditionally*, throwing away scroll
+                     # position, open dialogs and active table filters — the exact etiquette `_JS`
+                     # already works out in `safeToReloadWithoutAsking()` before it reloads for new
+                     # mail. A meta tag cannot consult any of that. So the progress refresh now
+                     # goes through that same poller, which holds back and offers the pill instead
+                     # of reloading under someone who is reading.
+                     #
+                     # The cost, accepted deliberately: the progress ring no longer advances on its
+                     # own. That was the whole of what the two-second reload bought.
+                     refresh_seconds=0)
 
 
 @router.post("/automation/run")
@@ -2949,6 +5495,19 @@ def automation_run():
     if outcome.skipped:
         return RedirectResponse(f"/ui/automation?refused={quote(outcome.error or 'busy')}",
                                 status_code=303)
+    return RedirectResponse("/ui/automation", status_code=303)
+
+
+@router.post("/automation/run/stop")
+def automation_run_stop():
+    """Stop the run in progress, and only that.
+
+    Not guarded by the kill switch and not taking the run lock — the run is holding it, and a stop
+    that waited for the lock would wait for the very run it is meant to end. The run notices at its
+    next Graph call or its next email; if it has not let go within
+    `settings.RUN_STOP_GRACE_SECONDS`, the scheduler's watchdog abandons it and frees the automation.
+    """
+    runner.request_stop()
     return RedirectResponse("/ui/automation", status_code=303)
 
 
@@ -3030,6 +5589,28 @@ def automation_resume(request: Request):
     finally:
         conn.close()
     return RedirectResponse(_back_to(request), status_code=303)
+
+
+def _safe_return(value: str, default: str) -> str:
+    """Where a form asked to be sent afterwards, if it is allowed to ask.
+
+    The value is filled in by the page script with the list the person came from, so a verdict
+    pressed from Needs a human lands back on Needs a human rather than on the page the route
+    happens to name — which is what made a filtered queue reset to five hundred rows.
+
+    It is still a value off a form body, so it is held to exactly the rules `_back_to` applies to
+    `Referer`: our own pages only, under `/ui/`, and never a protocol-relative `//host` that a
+    browser reads as somewhere else entirely. Anything else falls back to the route's own
+    destination rather than being refused — a bad return is not worth failing a recorded decision.
+    """
+    path = (value or "").strip()
+    if not path.startswith("/ui/") or path.startswith("//") or "://" in path or "\\" in path:
+        return default
+    # `/ui/../admin` passes every test above and is `/admin` by the time a browser has resolved it,
+    # so the prefix has to be checked against the *normalised* path rather than the typed one.
+    if urlparse(path).path != posixpath.normpath(urlparse(path).path):
+        return default
+    return path
 
 
 def _back_to(request: Request) -> str:

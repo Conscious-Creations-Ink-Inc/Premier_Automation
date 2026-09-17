@@ -101,14 +101,26 @@ def next_arrival_poll_at() -> Optional[datetime]:
 def _loop() -> None:
     while not _stop.wait(_TICK_SECONDS):
         try:
+            # First, and ahead of the kill switch. A stuck run is exactly the moment an operator
+            # pulls the switch, and a watchdog that stood down when they did would leave the run
+            # holding the lock for as long as it liked.
+            runner.reap_if_stuck()
+        except Exception:                                      # noqa: BLE001
+            pass
+        try:
             if killswitch.is_stopped():
                 continue     # the switch is the operator's; the schedule is not consulted at all
             # The watch first, and in its own try below, so that a Graph outage cannot stop the
             # ingest schedule from firing — they fail independently because they are independent.
             _tick_arrivals()
-            if _due():
+            if _due() and not runner.is_running():
                 schedule_source = _source()
-                runner.run(trigger="scheduled", source=schedule_source)
+                # On its own thread, never this one. `runner.run` used to be called right here, so
+                # a run that blocked took the whole scheduler with it: the new-mail watch stopped
+                # ticking ("last checked 8 minutes ago" on 2026-09-15, frozen at the second run 1179
+                # began) and nothing was left awake to notice the run was stuck. This thread's only
+                # job is to keep waking up.
+                runner.start_background(trigger="scheduled", source=schedule_source)
         except Exception:                                      # noqa: BLE001
             # A scheduler that dies on one bad tick is worse than one that keeps trying; the
             # failure is already recorded as a run row with its error text.

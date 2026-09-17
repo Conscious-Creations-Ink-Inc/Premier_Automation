@@ -3,11 +3,11 @@
 Two corpus facts drive this module:
 
 **The newest hop is rarely the informative one.** Every file Premier sent is a `Fw:` from Maria
-Gutierrez carrying a one-line annotation, with the payload — an Authority Logistics notification,
+Rivera carrying a one-line annotation, with the payload — an Authority Logistics notification,
 or a property reply to a table sent three hops earlier — quoted underneath. Triaging on
-`RawEmail.sender_address` alone therefore sees `premierpm.com` on all fourteen messages and the
-real originator (`warehousing@authoritylogistics.com`, `routing@authoritylogistics.com`,
-`Elber@5starinterior.com`) on none of them.
+`RawEmail.sender_address` alone therefore sees `example-pm.test` on all fourteen messages and the
+real originator (`warehousing@example-logistics.test`, `routing@example-logistics.test`,
+`Elber@example-interiors.test`) on none of them.
 
 **Confirmations carry no PO.** *"We can confirm that we have only received the Sheer Fabric
 (GR-350c-WTF)"* names neither a PO nor a quantity; both live in the request table quoted below
@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
+
+from config import settings
 
 # Outlook renders a quoted hop as a From/Sent/To[/Cc]/Subject header block. Coming out of HTML
 # each label frequently lands on its own line with the value on the next, so the pattern has to
@@ -40,7 +42,11 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 # Addresses that only ever forward — seeing one as the sender means the payload came from
 # somewhere else and the quoted chain must be consulted.
-INTERNAL_DOMAINS = {"premierpm.com"}
+#
+# Sourced from settings rather than duplicated here: this module and Stage 1 triage must agree on
+# what "internal" means, and a second literal list is exactly how they would drift apart. The real
+# domains are environment configuration, never source (Ashford Standards v1.5 §12).
+INTERNAL_DOMAINS = set(settings.INTERNAL_DOMAINS)
 
 # "Is this a forward?" asked of a subject that may carry any run of prefixes before the one that
 # answers it: `Fw:`, `[External] Fw:`, `Re: Fw:`, `[External] FW:` are all forwards. Only `fw`/`fwd`
@@ -203,7 +209,7 @@ def resolve_origin(
 
 
 def strip_forward_prefixes(subject: str) -> str:
-    """`"Fw: [External] RE: Cameo ..."` -> `"Cameo ..."`. Vendor subject grammars are written
+    """`"Fw: [External] RE: Example Hotel ..."` -> `"Example Hotel ..."`. Vendor subject grammars are written
     against what the originator actually sent, so the accumulated prefixes have to come off."""
     if not subject:
         return ""

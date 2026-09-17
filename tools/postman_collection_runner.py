@@ -483,7 +483,7 @@ def main() -> int:
     ap.add_argument("--phase", default="reads", choices=["reads", "all"])
     ap.add_argument("--allow-writes", action="store_true", help="permit the 10 mutating requests")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--po", default="207030", help="PO number to run against")
+    ap.add_argument("--po", default="907030", help="PO number to run against")
     ap.add_argument("--receipt-dmk", default="",
                     help="an existing receipt DocMasterKey, so the four receipt-reading requests "
                          "can be exercised without creating one")
@@ -495,7 +495,7 @@ def main() -> int:
     env["sfPMSAuth"] = dotenv.get("SPITFIRE_SESSION_COOKIE", "")
     env["apiClientId"] = dotenv.get("SPITFIRE_API_CLIENT_ID", "")
     env["apiClientKey"] = dotenv.get("SPITFIRE_API_CLIENT_KEY", "")
-    base = dotenv.get("SPITFIRE_BASE_URL", "https://training.remingtonhotels.com/Training")
+    base = dotenv.get("SPITFIRE_BASE_URL", "https://spitfire-host.test/instance")
     env["base"] = base
     env["baseUrl"] = base
     env["poNumber"] = args.po

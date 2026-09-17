@@ -207,7 +207,7 @@ def build(cap: Capture) -> str:
               [[esc(p), ("<span class='ok'>1 — found</span>" if (pr := cap.find("POST", f"/api/project/{p}/docs")) and pr.get("row_count")
                          else "0")] for p in projects]))
     add(f"<p><code>DocNoLike</code> is a <i>contains</i> match, so <code>2124</code> would return "
-        f"212456 alongside 212457. Every candidate is re-checked for an exact hit on "
+        f"912456 alongside 912457. Every candidate is re-checked for an exact hit on "
         f"<code>DocNo</code> or <code>SubContract</code> before its key is accepted.</p>")
     add("<div class='lbl'>hop 3 — the project CODE comes from the PO header, not the search</div>")
     add(pre(f"GET /api/document/{key}\n  -> header.Project    = the project code\n"
@@ -244,7 +244,7 @@ def build(cap: Capture) -> str:
                    ["<code>DocItemTask[0].AccountCategory</code>",
                     esc(lines[0].get("AccountCategory")),
                     "what makes a line receivable. TAX- and FRT- prefixes are skipped."]]))
-    add("<p>On corpus PO 208491, <b>10 of 25 lines are non-receivable</b> tax and freight, and "
+    add("<p>On corpus PO 908491, <b>10 of 25 lines are non-receivable</b> tax and freight, and "
         "nothing about their shape distinguishes them from an under-populated goods line &mdash; "
         "the account category is the only reliable discriminator.</p>")
     add(cap.block("GET", f"/api/document/{key}/addresses", label="vendor and ship-to"))
@@ -303,7 +303,7 @@ def build(cap: Capture) -> str:
         "on it.</div>")
     add("<div class='lbl'>8.2 title it — the body is a bare JSON string</div>")
     add(pre('PATCH /api/document/{receiptKey}/Title\n'
-            '"CC-TEST - receiver automation - PO 212559 - 2026-08-17 - DO NOT PROCESS"'))
+            '"CC-TEST - receiver automation - PO 912559 - 2026-08-17 - DO NOT PROCESS"'))
     add("<div class='lbl'>8.3 add the receipt line — the body is an ARRAY</div>")
     add(jsonpre([{"Description": "CC-TEST Amenity Tray at Ballroom Restrooms",
                   "ItemQuantity": 4.0,
@@ -325,7 +325,7 @@ def build(cap: Capture) -> str:
                  "MD5": "8342F644E7DC630772686415F287020B",
                  "date": "2026-08-17T00:00:00", "DocDate": "2026-08-17T00:00:00",
                  "ReferenceDate": "2026-08-17T00:00:00", "Due": "2026-08-17T00:00:00",
-                 "Keywords": "CC-TEST POD 212559"}))
+                 "Keywords": "CC-TEST POD 912559"}))
     add("<p>The failure ladder, each rung walked into in turn:</p>")
     add(table(["What is wrong", "What the server says"],
               [["no <code>file</code> part, or a hand-set <code>Content-Type</code>",
@@ -353,7 +353,7 @@ def build(cap: Capture) -> str:
         "then uploaded and attached exactly as the POD was. Two document links follow.</p>")
     add("<p><b>One endpoint, two body shapes.</b> A file link populates <code>DocKey</code>; a "
         "document link populates <code>AttachedDocMaster</code> and leaves <code>DocKey</code> as "
-        "the null GUID. Premier's own receipt 209330 carries both shapes in one collection.</p>")
+        "the null GUID. Premier's own receipt 909330 carries both shapes in one collection.</p>")
     add(jsonpre([{"DocKey": "00000000-0000-0000-0000-000000000000",
                   "AttachedDocMaster": "<the PO's DocMasterKey>",
                   "Note": "CC-TEST purchase order",
@@ -622,7 +622,7 @@ def markdown(cap: Capture) -> str:
         pr = cap.find("POST", f"/api/project/{p}/docs")
         add(f"| `{p}` | {'**1 — found**' if pr and pr.get('row_count') else '0'} |")
     add("")
-    add("`DocNoLike` is a *contains* match, so `2124` would also return 212456 and 212457. Every "
+    add("`DocNoLike` is a *contains* match, so `2124` would also return 912456 and 912457. Every "
         "candidate is re-checked for an exact hit on `DocNo` or `SubContract` before its key is "
         "accepted.")
     add("")
@@ -666,7 +666,7 @@ def markdown(cap: Capture) -> str:
         add(f"| `DocItemTask[0].AccountCategory` | `{lines[0].get('AccountCategory')}` | what makes "
             f"a line receivable — `TAX-` and `FRT-` are skipped |")
         add("")
-    add("On corpus PO 208491, **10 of 25 lines are tax and freight**, and nothing in their shape "
+    add("On corpus PO 908491, **10 of 25 lines are tax and freight**, and nothing in their shape "
         "distinguishes them from an under-populated goods line. The account category is the only "
         "reliable discriminator.")
     add("")
@@ -740,7 +740,7 @@ def markdown(cap: Capture) -> str:
     add("")
     add("```http")
     add("PATCH /api/document/{receiptKey}/Title")
-    add('"CC-TEST - receiver automation - PO 212559 - 2026-08-17 - DO NOT PROCESS"')
+    add('"CC-TEST - receiver automation - PO 912559 - 2026-08-17 - DO NOT PROCESS"')
     add("```")
     add("")
     add("### 8.3 Add the receipt line — the body is an **array**")
@@ -770,7 +770,7 @@ def markdown(cap: Capture) -> str:
                     "MD5": "8342F644E7DC630772686415F287020B",
                     "date": "2026-08-17T00:00:00", "DocDate": "2026-08-17T00:00:00",
                     "ReferenceDate": "2026-08-17T00:00:00", "Due": "2026-08-17T00:00:00",
-                    "Keywords": "CC-TEST POD 212559"}, indent=2))
+                    "Keywords": "CC-TEST POD 912559"}, indent=2))
     add("")
     add('-> 200 {"name":"CC-TEST.POD.FedEx.pdf",'
         '"key":"8a0af8b5-3fb3-44e5-af75-b4ebd490fcca","size":64,'
@@ -817,7 +817,7 @@ def markdown(cap: Capture) -> str:
     add("")
     add("**One endpoint, two body shapes.** A *file* link populates `DocKey`; a *document* link "
         "populates `AttachedDocMaster` and leaves `DocKey` as the null GUID. Premier's own receipt "
-        "209330 carries both shapes in one collection.")
+        "909330 carries both shapes in one collection.")
     add("")
     add("```http")
     add("POST /api/document/{receiptKey}/attachments")

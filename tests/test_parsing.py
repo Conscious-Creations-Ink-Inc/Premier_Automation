@@ -14,15 +14,15 @@ from pipeline.parsing import boilerplate, confirmation, pod, sniff, tables, text
 
 
 @pytest.mark.parametrize("raw, expected", [
-    ("PO 213987", ["213987"]),
-    ("PO# 213987", ["213987"]),
-    ("PO #213987", ["213987"]),
-    ("P.O.# 210634", ["210634"]),
-    ("PO: 213987", ["213987"]),
-    ("po 213987", ["213987"]),                       # case-insensitive — the old regex was not
-    ("Purchase Order 210634", ["210634"]),
-    ("PO 211310 + PO 212578", ["211310", "212578"]),
-    ("PO 207505, 207514, 212559", ["207505", "207514", "212559"]),
+    ("PO 913987", ["913987"]),
+    ("PO# 913987", ["913987"]),
+    ("PO #913987", ["913987"]),
+    ("P.O.# 910634", ["910634"]),
+    ("PO: 913987", ["913987"]),
+    ("po 913987", ["913987"]),                       # case-insensitive — the old regex was not
+    ("Purchase Order 910634", ["910634"]),
+    ("PO 911310 + PO 912578", ["911310", "912578"]),
+    ("PO 907505, 907514, 912559", ["907505", "907514", "912559"]),
 ])
 def test_labelled_po_forms(raw, expected):
     assert tokens.find_po_numbers(raw) == expected
@@ -31,18 +31,18 @@ def test_labelled_po_forms(raw, expected):
 def test_bare_six_digit_numbers_are_not_treated_as_pos():
     """An Authority subject holds the inbound number, two POs and a project number, three of
     them six digits. Only position tells them apart, so the free-text scan claims none of them."""
-    subject = "239260 - Inbound Notification - 206725, 207665 - 2978 : LXR Cameo Beverly Hills"
+    subject = "939260 - Inbound Notification - 906725, 907665 - 9078 : Example Hotel Downtown"
     assert tokens.find_po_numbers(subject) == []
 
 
 def test_po_list_reads_an_isolated_slot():
-    assert tokens.parse_po_list("206725, 207665") == ["206725", "207665"]
+    assert tokens.parse_po_list("906725, 907665") == ["906725", "907665"]
 
 
 def test_po_line_ref():
-    reference = tokens.parse_po_line_ref("208491 : 300")
-    assert (reference.po_number, reference.line_number) == ("208491", 300)
-    assert tokens.parse_po_line_ref("208491") is None
+    reference = tokens.parse_po_line_ref("908491 : 300")
+    assert (reference.po_number, reference.line_number) == ("908491", 300)
+    assert tokens.parse_po_line_ref("908491") is None
 
 
 # --- Spec codes -------------------------------------------------------------
@@ -125,23 +125,23 @@ def test_date_normalization(raw, expected):
 
 
 def test_shipment_leg_suffix_is_dropped():
-    """The Inbound states `50052 : 1` and the matching Delivered states `50052`. Keeping the leg
+    """The Inbound states `90052 : 1` and the matching Delivered states `90052`. Keeping the leg
     counter would stop the two joining."""
-    assert tokens.parse_shipment_number("50052 : 1") == "50052"
-    assert tokens.parse_shipment_number("50009") == "50009"
+    assert tokens.parse_shipment_number("90052 : 1") == "90052"
+    assert tokens.parse_shipment_number("90009") == "90009"
     assert tokens.parse_shipment_number("") is None
 
 
 def test_tracking_cell_with_carrier_appended():
-    assert tokens.parse_tracking_numbers("31457971\n7497809572 FEDEX") == ["31457971", "7497809572"]
+    assert tokens.parse_tracking_numbers("91457971\n7497809572 FEDEX") == ["91457971", "7497809572"]
 
 
 def test_fedex_reference_field_is_split_not_trusted():
-    """`Purchase Order 31457971,210634,49985 : 1` is labelled PO but holds a carrier reference,
-    the PO, and the Authority shipment. Reading the field whole gives 31457971 as the PO."""
-    pos, others = tokens.split_reference_field("31457971,210634,49985 : 1")
-    assert pos == ["210634"]
-    assert others == ["31457971", "49985"]
+    """`Purchase Order 91457971,910634,99985 : 1` is labelled PO but holds a carrier reference,
+    the PO, and the Authority shipment. Reading the field whole gives 91457971 as the PO."""
+    pos, others = tokens.split_reference_field("91457971,910634,99985 : 1")
+    assert pos == ["910634"]
+    assert others == ["91457971", "99985"]
 
 
 # --- Boilerplate ------------------------------------------------------------
@@ -171,18 +171,18 @@ def test_caution_banner_is_stripped():
 FORWARDED = """anything else weird that happened on this one!!
 
 From:
- warehousing@authoritylogistics.com <warehousing@authoritylogistics.com>
+ warehousing@example-logistics.test <warehousing@example-logistics.test>
 
 Sent:
  Wednesday, October 1, 2025 1:59 PM
 
 To:
- Johnson, Kamilah <kamilahjohnson@premierpm.com>; victoria.cortez@goarmstrong.com
- <victoria.cortez@goarmstrong.com>; nick.beasley@goarmstrong.com
- <nick.beasley@goarmstrong.com>; Morales, Michael <michaelmorales@premierpm.com>
+ Johnson, Kamilah <kamilahjohnson@example-pm.test>; victoria.cortez@example-flooring.test
+ <victoria.cortez@example-flooring.test>; nick.beasley@example-flooring.test
+ <nick.beasley@example-flooring.test>; Morales, Michael <michaelmorales@example-pm.test>
 
 Subject:
- [External] 239260 - Inbound Notification - 206725, 207665
+ [External] 939260 - Inbound Notification - 906725, 907665
 
 Received Date:
 09/24/2025
@@ -191,25 +191,25 @@ Received Date:
 
 def test_forwarded_origin_is_recovered_from_the_quoted_chain():
     """Every corpus file is a `Fw:` from an internal expeditor, so the envelope sender is
-    premierpm.com on all fourteen and identifies the originator on none."""
-    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com", "Fw: [External] 239260 - Inbound Notification")
-    origin = thread.resolve_origin("mariagutierrez@premierpm.com",
-                                   "Fw: [External] 239260 - Inbound Notification", parsed)
-    assert origin.sender_address == "warehousing@authoritylogistics.com"
-    assert "239260 - Inbound Notification" in origin.subject
+    example-pm.test on all fourteen and identifies the originator on none."""
+    parsed = thread.split_thread(FORWARDED, "arivera@example-pm.test", "Fw: [External] 939260 - Inbound Notification")
+    origin = thread.resolve_origin("arivera@example-pm.test",
+                                   "Fw: [External] 939260 - Inbound Notification", parsed)
+    assert origin.sender_address == "warehousing@example-logistics.test"
+    assert "939260 - Inbound Notification" in origin.subject
 
 
 def test_a_multi_line_recipient_list_does_not_break_hop_detection():
     """The `To:` list wraps over several lines before `Subject:` appears — a tighter pattern
     matched zero hops on every Authority forward."""
-    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com", "Fw: x")
+    parsed = thread.split_thread(FORWARDED, "arivera@example-pm.test", "Fw: x")
     assert len(parsed.hops) == 2
 
 
 def test_direct_mail_is_taken_at_face_value():
-    parsed = thread.split_thread("Received Date:\n10/09/2025", "warehousing@authoritylogistics.com", "x")
-    origin = thread.resolve_origin("warehousing@authoritylogistics.com", "x", parsed)
-    assert origin.sender_address == "warehousing@authoritylogistics.com"
+    parsed = thread.split_thread("Received Date:\n10/09/2025", "warehousing@example-logistics.test", "x")
+    origin = thread.resolve_origin("warehousing@example-logistics.test", "x", parsed)
+    assert origin.sender_address == "warehousing@example-logistics.test"
 
 
 @pytest.mark.parametrize("raw, expected", [
@@ -250,15 +250,15 @@ def test_the_raw_sent_header_survives_even_when_it_cannot_be_parsed():
 def test_the_forwarded_hop_carries_the_date_it_was_actually_sent():
     """End to end on the real corpus fixture: the quoted Authority hop states its own send date,
     months before Premier forwarded the file."""
-    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com", "Fw: x")
-    origin = thread.resolve_origin("mariagutierrez@premierpm.com", "Fw: x", parsed)
+    parsed = thread.split_thread(FORWARDED, "arivera@example-pm.test", "Fw: x")
+    origin = thread.resolve_origin("arivera@example-pm.test", "Fw: x", parsed)
     assert origin.sent_at == "2025-10-01"
 
 
 @pytest.mark.parametrize("subject, expected", [
-    ("Fw: [External] RE: Cameo Public Space", "Cameo Public Space"),
+    ("Fw: [External] RE: Example Hotel Public Space", "Example Hotel Public Space"),
     ("RE: FW: [External] Verification of Fabric Receipt", "Verification of Fabric Receipt"),
-    ("[External] 239475 - Inbound Notification", "239475 - Inbound Notification"),
+    ("[External] 939475 - Inbound Notification", "939475 - Inbound Notification"),
 ])
 def test_forward_prefixes_are_stripped(subject, expected):
     assert thread.strip_forward_prefixes(subject) == expected
@@ -274,7 +274,7 @@ def test_kinds_are_decided_by_bytes_not_by_name():
 
 
 def test_xlsx_is_recognised_with_no_content_type():
-    """`Cameo Receivers.xlsx` arrives with `mimetype=None`; a content-type equality check
+    """`Property Receivers.xlsx` arrives with `mimetype=None`; a content-type equality check
     rejected it and the tracker never reached an adapter."""
     import io
 
@@ -283,7 +283,7 @@ def test_xlsx_is_recognised_with_no_content_type():
     workbook.active.append(["PO#", "Spec#", "QTY"])
     buffer = io.BytesIO()
     workbook.save(buffer)
-    assert sniff.sniff(buffer.getvalue(), "Cameo Receivers.xlsx", "").kind == sniff.KIND_XLSX
+    assert sniff.sniff(buffer.getvalue(), "Property Receivers.xlsx", "").kind == sniff.KIND_XLSX
 
 
 def test_signature_logo_is_decorative_and_a_photo_is_not():
@@ -304,7 +304,7 @@ def test_grid_is_found_by_header_signature_among_layout_tables():
         "<table><tr><td>signature block</td></tr></table>"
         "<table><tr><th>PO # / Line #</th><th>Supplier</th><th>Part #</th><th>Item</th>"
         "<th>Package</th><th>Comments</th></tr>"
-        "<tr><td>208491 : 300</td><td>Light Annex</td><td>STE-402-LT-B</td>"
+        "<tr><td>908491 : 300</td><td>Light Annex</td><td>STE-402-LT-B</td>"
         "<td>11 EA - BASE</td><td>11 CTN</td><td></td></tr></table>"
     )
     grid = tables.find_grid(tables.extract_tables(html),
@@ -314,10 +314,10 @@ def test_grid_is_found_by_header_signature_among_layout_tables():
 
 def test_key_value_table_reads_as_a_dict():
     html = ("<table><tr><td>Received Date:</td><td>09/24/2025</td></tr>"
-            "<tr><td>ALS Shipment #:</td><td>50009 : 1</td></tr></table>")
+            "<tr><td>ALS Shipment #:</td><td>90009 : 1</td></tr></table>")
     values = tables.as_key_values(tables.extract_tables(html)[0])
     assert values["received date"] == "09/24/2025"
-    assert values["als shipment #"] == "50009 : 1"
+    assert values["als shipment #"] == "90009 : 1"
 
 
 def test_html_to_text_keeps_block_boundaries():
@@ -341,10 +341,10 @@ def test_plain_po_spec_qty_table_is_not_a_confirmation_grid():
 def test_tracker_row_marked_yes_becomes_a_confident_record():
     header = ["Vendor", "PO#", "Spec#", "QTY", "Item Description", "Tracking", "Delivery Date",
               "Confirmed Received: Yes or No"]
-    rows = [["Daniel Stuart", "207030", "LOB-203-PI", "12", '18"x18" Throw Pillow',
+    rows = [["Daniel Stuart", "907030", "LOB-203-PI", "12", '18"x18" Throw Pillow',
              "FedEx 476858924781", "2025-09-22", "yes"]]
     record = confirmation.records_from_grid(header, rows, "msg-1", "2026-01-01", "excel")[0]
-    assert record.po_number == "207030"
+    assert record.po_number == "907030"
     assert record.spec_code == "LOB-203-PI"
     assert record.quantity_received == 12.0
     assert record.pod_stated_date == "2025-09-22"
@@ -356,7 +356,7 @@ def test_tracker_row_marked_yes_becomes_a_confident_record():
 def test_a_no_answer_is_recorded_with_no_quantity_rather_than_dropped():
     """Dropping the row would erase the one record stating the goods did not arrive."""
     header = ["Vendor", "PO#", "Spec#", "QTY", "Item Description", "Confirmed Received: Yes or No"]
-    rows = [["Amtrend", "206481", "PAT-200-SG", "1", "L-Shaped Banquette", "no"]]
+    rows = [["Amtrend", "906481", "PAT-200-SG", "1", "L-Shaped Banquette", "no"]]
     record = confirmation.records_from_grid(header, rows, "msg-1", "2026-01-01", "excel")[0]
     assert record.quantity_received is None
     assert record.extraction_confidence == 0.0
@@ -366,10 +366,29 @@ def test_a_no_answer_is_recorded_with_no_quantity_rather_than_dropped():
 def test_qty_delivered_wins_over_ordered_qty():
     header = ["Description of Item", "SPEC # or Phase Code", "UOM", "Qty", "Qty Delivered",
               "Qty to be Received", "P.O.#", "Vendor"]
-    rows = [["Amenity Tray", "BRR-803-AC", "Set", "4", "", "4", "212559", "Pigeon & Poodle"]]
+    rows = [["Amenity Tray", "BRR-803-AC", "Set", "4", "4", "0", "912559", "Pigeon & Poodle"]]
     record = confirmation.records_from_grid(header, rows, "msg-1", "2026-01-01", "excel")[0]
     assert record.quantity_received == 4.0
     assert record.unit_of_measure == "SET"
+
+
+def test_an_outstanding_balance_is_not_a_received_quantity():
+    """`Qty to be Received` is what has *not* arrived, and it may not supply a receipt.
+
+    This row is copied from `Public Space - Pending Receipt Confirmation Orders.xlsx`, where every
+    line reads `Qty 4 | Qty Delivered blank | Qty to be Received 4 | RECEIVED? blank` — an
+    unanswered request. It used to be the second entry in the gate's quantity columns, so the
+    outstanding figure was read as the delivered one and `stated is not None` then proved receipt:
+    57 phantom receipts on that one attachment, and on the Spitfire expediting export the same
+    path staged rows reading "0 delivered" against live purchase orders.
+    """
+    header = ["Description of Item", "SPEC # or Phase Code", "UOM", "Qty", "Qty Delivered",
+              "Qty to be Received", "P.O.#", "Vendor"]
+    rows = [["Amenity Tray", "BRR-803-AC", "Set", "4", "", "4", "912559", "Pigeon & Poodle"]]
+    record = confirmation.records_from_grid(header, rows, "msg-1", "2026-01-01", "excel")[0]
+    assert record.quantity_received is None
+    assert record.quantity_ordered == 4.0
+    assert record.extraction_confidence < 0.5
 
 
 # --- Carrier PODs -----------------------------------------------------------
@@ -384,7 +403,7 @@ Signed for by: U ALI
 Service type: FedEx Freight Priority
 Tracking number: 7497809572 Ship Date: Sep 5, 2025
 Weight: 392.0 LB/177.97 KG
-Purchase Order 31457971,210634,49985 : 1
+Purchase Order 91457971,910634,99985 : 1
 """
 
 
@@ -394,8 +413,8 @@ def test_fedex_pod_fields():
     assert document.signed_for_by == "U ALI"
     assert document.carrier_name == "FedEx"
     assert document.tracking_numbers[0] == "7497809572"
-    assert document.po_numbers == ["210634"]
-    assert "49985" in document.other_references
+    assert document.po_numbers == ["910634"]
+    assert "99985" in document.other_references
 
 
 def test_a_non_pod_document_is_not_parsed_as_one():
@@ -418,8 +437,8 @@ def _exchange_mime(received_chain_bytes: int = 3000) -> bytes:
     return (chain
             + b"Content-Type: multipart/alternative; boundary=\"x\"\r\n"
             + b"Date: Wed, 10 Sep 2025 20:00:47 +0000\r\n"
-            + b"From: routing@authoritylogistics.com\r\n"
-            + b"Subject: 49985 - Delivered Notification - 210634\r\n"
+            + b"From: routing@example-logistics.test\r\n"
+            + b"Subject: 99985 - Delivered Notification - 910634\r\n"
             + b"\r\nbody\r\n")
 
 
@@ -461,17 +480,70 @@ def test_an_external_tagged_forward_is_still_a_forward():
     forward reaches us as `[External] Fw: ...`. Testing the raw subject read that as "not a
     forward" and took the forwarder's own annotation as the payload; three subjects in Premier's
     live mailbox already have that shape."""
-    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com",
-                                 "[External] Fw: 239260 - Inbound Notification")
-    origin = thread.resolve_origin("mariagutierrez@premierpm.com",
-                                   "[External] Fw: 239260 - Inbound Notification", parsed)
-    assert origin.sender_address == "warehousing@authoritylogistics.com"
+    parsed = thread.split_thread(FORWARDED, "arivera@example-pm.test",
+                                 "[External] Fw: 939260 - Inbound Notification")
+    origin = thread.resolve_origin("arivera@example-pm.test",
+                                   "[External] Fw: 939260 - Inbound Notification", parsed)
+    assert origin.sender_address == "warehousing@example-logistics.test"
 
 
 def test_a_reply_is_not_treated_as_a_forward():
     """`Re:` alone must not reach past the top hop — a genuine reply *is* the payload."""
-    parsed = thread.split_thread(FORWARDED, "mariagutierrez@premierpm.com",
-                                 "RE: 239260 - Inbound Notification")
-    origin = thread.resolve_origin("mariagutierrez@premierpm.com",
-                                   "RE: 239260 - Inbound Notification", parsed)
-    assert origin.sender_address == "mariagutierrez@premierpm.com"
+    parsed = thread.split_thread(FORWARDED, "arivera@example-pm.test",
+                                 "RE: 939260 - Inbound Notification")
+    origin = thread.resolve_origin("arivera@example-pm.test",
+                                   "RE: 939260 - Inbound Notification", parsed)
+    assert origin.sender_address == "arivera@example-pm.test"
+
+
+# --- A non-PO must never become a delivery key ------------------------------
+
+def test_only_six_digit_tokens_are_purchase_orders():
+    """`is_po_number` is the shape gate every path into an accumulation key now passes.
+
+    Measured 2026-08-25 on an Atlas Logistics "Warehouse Receiving Report" that no parser knew:
+    the generic table path read an address block and produced the purchase orders
+    `(812) 424-2222`, `Premier`, `1150 New` and `Circuit of\nc/o EDC\nDept #`. All four became
+    delivery-event keys in `released_events` and `accumulation`, while the document's real PO sat
+    in it as `Project #: 911798`.
+    """
+    from pipeline.parsing import tokens
+
+    assert tokens.is_po_number("912614")
+    assert tokens.is_po_number("  912614  "), "surrounding whitespace is not a difference"
+
+    for junk in ("(812) 424-2222", "Premier", "1150 New", "Circuit of\nc/o EDC\nDept #",
+                 "", None, "21261", "2126145", "21261a"):
+        assert not tokens.is_po_number(junk), f"{junk!r} is not a purchase order"
+
+
+def test_a_table_column_that_is_not_a_po_does_not_become_one():
+    """`map_headers` matches headers fuzzily against short synonyms, so on an unrecognised document
+    it lands on whatever column looked closest. The cell value has to be checked too."""
+    from pipeline.stage3_extract.base import build_record_from_row, ExtractionSource
+
+    src = ExtractionSource(source_email_id="m1", email_date="2026-08-25T00:00:00Z",
+                           source_type="attachment")
+    record = build_record_from_row(
+        src, ["(812) 424-2222", "CTP-025-NA", "1"],
+        {"po_number": 0, "spec_code": 1, "quantity_received": 2}, "pdf")
+    assert record.po_number != "(812) 424-2222"
+    assert record.spec_code == "CTP-025-NA", "the rest of the row is still read"
+
+
+def test_attachment_evidence_only_contributes_real_po_numbers():
+    from pipeline import evidence
+    from pipeline.models import ExtractedRecord
+
+    def rec(po):
+        return ExtractedRecord(
+            source_email_id="m1", po_number=po, shipment_number=None, spec_code=None,
+            parent_spec_code=None, sub_spec_suffix=None, item_description=None, vendor_name=None,
+            carrier_name=None, tracking_number=None, quantity_received=None, unit_of_measure=None,
+            pod_stated_date=None, email_date="2026-08-25T00:00:00Z", delivery_location=None,
+            comments=None, extraction_source="pdf", extraction_confidence=0.3, raw_snippet="")
+
+    bundle = evidence.EmailEvidence(email_id="m1",
+                                    records=[rec("911798"), rec("Premier"), rec("(812) 424-2222")])
+    evidence._summarise(bundle)
+    assert bundle.po_numbers == ["911798"]

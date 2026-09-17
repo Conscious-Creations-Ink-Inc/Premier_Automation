@@ -20,11 +20,12 @@ Two design points carry the weight:
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from config import settings
 from pipeline import attachment_store
 from pipeline.models import Attachment, RawEmail
-from pipeline.parsing import sniff
+from pipeline.parsing import receipt, sniff
 
 # --- Dispositions -----------------------------------------------------------
 
@@ -45,6 +46,15 @@ NO_ADAPTER = "no_adapter"             # nothing claimed it — a real coverage g
 UNSUPPORTED_FORMAT = "unsupported_format"   # recognised, deliberately no reader (.doc, .pptx)
 DROPPED_DECORATIVE = "dropped_decorative"
 DROPPED_DUPLICATE = "dropped_duplicate"
+DUPLICATE_CONTENT_MISMATCH = "duplicate_content_mismatch"
+"""Byte-identical to another attachment, but its filename promises a different document.
+
+Premier really does send the same POD twice under two names, and dropping the second copy is
+correct. But the corpus carries a case where that is a different fact entirely:
+`FedEx 884603885067  GR-350d-WTF 78 yards from Daniel Stuart.pdf` is byte-identical to
+`910634 - P. Kaufmann FedEx POD.pdf` — a different tracking number and a different spec on the
+label, the same 910634 POD inside. Somebody attached the wrong file, so a proof everybody
+believes was supplied does not exist. Still dropped; no longer dropped silently."""
 DROPPED_OVERSIZE = "dropped_oversize"
 DROPPED_DEPTH = "dropped_depth"
 DROPPED_COUNT = "dropped_count"
@@ -55,16 +65,34 @@ carrying no bytes. Distinct from `NO_ADAPTER` on purpose: nothing is missing fro
 there is simply nothing to read. Fetching it would need `Files.Read.All` and a separate consent
 conversation, so the URL is recorded and a person opens it."""
 
+SERVICE_UNAVAILABLE = "service_unavailable"
+"""An external dependency failed. The file is fine, the bytes are here, and this is re-runnable
+the moment the dependency is.
+
+Distinct from `UNREADABLE` and `CORRUPT`, and the distinction is the whole point. Azure Document
+Intelligence returned 401 for an unknown period; every photographed POD that arrived in that
+window read nothing, and the pipeline recorded each one as `extracted` with `records_extracted=1`
+because `OcrAdapter` returned a one-element placeholder list that `dispatch`'s `if records:` found
+truthy. The ledger — the table whose docstring promises nothing is silently dropped — asserted
+success for every one of them, so after the key was fixed there was no way to name what to re-run.
+
+`unreadable` would have been a lie of a different kind ("our reader failed on this file") and
+`corrupt` worse still ("the file is structurally broken"), both blaming a sender's photograph for
+someone else's auth failure. This says what actually happened, carries the reason in
+`disposition_detail`, and is what `tools/reextract.py` selects on."""
+
 ALL_DISPOSITIONS = frozenset({
     OBSERVED, NOT_DISPATCHED, AWAITING_RELEASE, CONTAINER_EXPANDED, EXTRACTED, EMPTY, UNREADABLE, ENCRYPTED,
-    CORRUPT, NO_ADAPTER, UNSUPPORTED_FORMAT, DROPPED_DECORATIVE, DROPPED_DUPLICATE,
-    DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT, DROPPED_EMPTY, DROPPED_REFERENCE,
+    CORRUPT, NO_ADAPTER, UNSUPPORTED_FORMAT, SERVICE_UNAVAILABLE, DROPPED_DECORATIVE,
+    DROPPED_DUPLICATE, DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT, DROPPED_EMPTY,
+    DROPPED_REFERENCE, DUPLICATE_CONTENT_MISMATCH,
 })
 TERMINAL = ALL_DISPOSITIONS - {OBSERVED}
 
 NEEDS_ATTENTION = frozenset({
-    UNREADABLE, ENCRYPTED, CORRUPT, NO_ADAPTER, UNSUPPORTED_FORMAT,
+    UNREADABLE, ENCRYPTED, CORRUPT, NO_ADAPTER, UNSUPPORTED_FORMAT, SERVICE_UNAVAILABLE,
     DROPPED_OVERSIZE, DROPPED_DEPTH, DROPPED_COUNT, DROPPED_REFERENCE,
+    DUPLICATE_CONTENT_MISMATCH,
 })
 """Dispositions a person should see. Deliberately excludes the decorative/duplicate drops,
 which are routine and correct, and `empty`, which means we read it and it genuinely held
@@ -78,6 +106,36 @@ REVIEW_NONE = "none"
 REVIEW_PENDING = "pending_review"
 REVIEW_ACKNOWLEDGED = "acknowledged"
 REVIEW_REPROCESS = "reprocess_requested"
+
+
+def status_report_verdict(grid_verdicts) -> str:
+    """The reason this file is a status report rather than a delivery document, or `""`.
+
+    Reads what `grid_reader` kept on the source. A workbook is judged sheet by sheet and the
+    verdicts disagree routinely — `ANS-026 ... Expediting Report.xlsx` holds a Spitfire export
+    beside a confirmation grid — so this answers for the file as a whole, and the order is what
+    decides it.
+
+    **A positive `delivery_document` on any sheet wins.** Premier really does send one workbook
+    holding both a receiver and a tracker, and a file somebody can receive goods against is never
+    to be set aside on the strength of a second sheet. `no_receipt_column` is not consulted at all:
+    it is the absence of evidence, the same thing `stage1_triage` declines to act on for
+    `Intent.NEITHER`, and acting on it would sweep up packing slips and receiving reports whose
+    header simply did not parse.
+    """
+    verdicts = list(grid_verdicts or [])
+    if any(kind == receipt.DELIVERY_DOCUMENT for _label, kind, _reason in verdicts):
+        return ""
+    for label, kind, reason in verdicts:
+        if kind != receipt.STATUS_REPORT:
+            continue
+        # `classify_grid` phrases every reason as a noun phrase — "a system export — …",
+        # "a status tracker — …" — so naming the sheet in front of it makes one sentence rather
+        # than two clauses joined by a second dash. The adapter prefix is dropped for reading:
+        # `excel:` is already said by the `via excel:Expediting` line the record rows carry.
+        sheet = (label or "").split(":", 1)[-1].strip()
+        return f"the sheet '{sheet}' is {reason}" if sheet else reason
+    return ""
 
 _COLUMNS = (
     "email_id", "parent_id", "depth", "ordinal", "container_path", "filename",
@@ -111,6 +169,14 @@ class LedgerRow:
     queries already order by it, but it was never carried onto the row — so the manual queue built
     its attachment items with a blank date, and the When column was empty on every one of them."""
 
+    is_status_report: int = 0
+    status_report_reason: str = ""
+    """Whether this file is one of Premier's own worklists, and in `classify_grid`'s own words.
+
+    Set at ingest from the verdict `grid_reader` takes anyway. Stored rather than recomputed at
+    read time because the manual queue builds four thousand items per render and reopening every
+    workbook to do it is not a page load."""
+
 
 def _row(record: sqlite3.Row) -> LedgerRow:
     return LedgerRow(
@@ -122,6 +188,8 @@ def _row(record: sqlite3.Row) -> LedgerRow:
         records_extracted=record["records_extracted"], error_type=record["error_type"],
         triage_category=record["triage_category"], review_status=record["review_status"],
         parent_id=record["parent_id"], first_seen_at=record["first_seen_at"] or "",
+        is_status_report=record["is_status_report"] or 0,
+        status_report_reason=record["status_report_reason"] or "",
     )
 
 
@@ -178,6 +246,32 @@ def add_child(
     return attachment.ledger_id
 
 
+def keeps_bytes(drop_hint: Optional[str]) -> bool:
+    """Whether this attachment's bytes may go to the store, judged from its drop hint alone.
+
+    Asked by the connectors *before* they release the bytes, and by `_insert` after. Those were two
+    different rules, and that is why `PREMIER_STORE_DECORATIVE=0` did nothing: it gated `_insert`
+    only, while both connectors had already called `attachment_store.put()` on the way past and
+    `_insert`'s `exists()` re-link then attached the row to the bytes anyway. Measured 2026-09-16:
+    23,863 of 23,867 decorative rows had blobs with the setting off, the newest stamped that day.
+
+    **The connectors were not wrong to keep them.** Their comments make a real argument -- the
+    classifier decides "decorative" from a known hash, or from being cid-referenced and under 64 KB,
+    or from being under 16 KB (`parsing/sniff.py:334-348`), and `mail_view` says in as many words
+    that "a pasted photograph is often the proof of delivery itself". A misclassification that
+    destroys bytes destroys evidence. That hedge is now spelled `PREMIER_STORE_DECORATIVE=1`, which
+    restores exactly the old behaviour on every path at once, and is what
+    `test_the_setting_brings_the_old_behaviour_back` holds open.
+
+    Only `decorative` is gated. A `duplicate` hint must still call `put`: it is a no-op on bytes
+    already stored under that hash, and narrowing it would be a second behaviour change riding
+    along on this one.
+    """
+    if settings.STORE_DECORATIVE_ATTACHMENTS:
+        return True
+    return _disposition_for_hint(drop_hint)[0] != DROPPED_DECORATIVE
+
+
 def _disposition_for_hint(drop_hint: Optional[str]) -> tuple:
     """A connector's `drop_hint` becomes a terminal disposition; no hint means still in flight."""
     if not drop_hint:
@@ -186,6 +280,7 @@ def _disposition_for_hint(drop_hint: Optional[str]) -> tuple:
     mapping = {
         "decorative": DROPPED_DECORATIVE,
         "duplicate": DROPPED_DUPLICATE,
+        "duplicate_mismatch": DUPLICATE_CONTENT_MISMATCH,
         "oversize": DROPPED_OVERSIZE,
         "empty": DROPPED_EMPTY,
         "depth": DROPPED_DEPTH,
@@ -219,8 +314,17 @@ def _insert(
     # Outlook mailbox. Two cases meet here: an attachment still holding its bytes is stored now,
     # and one already released by the connector was stored there, before the release — the
     # `exists` branch is what re-attaches that row to its blob.
+    #
+    # Except a logo. `settings.STORE_DECORATIVE_ATTACHMENTS` is off by default, and a sender's
+    # logo or signature graphic is never evidence — so its bytes are not kept, while the row
+    # recording that we saw it still is. The row is the audit trail; the pixels are not.
+    #
+    # Gated here, before `put`, because that is the only place it saves anything: deciding after
+    # the write would store the blob and then think better of it. An already-stored blob is still
+    # re-attached below, so turning the setting off never orphans a row from bytes already on disk.
     digest = attachment.sha256 or result.sha256
-    blob = attachment_store.put(attachment.content_bytes)
+    store_bytes = settings.STORE_DECORATIVE_ATTACHMENTS or disposition != DROPPED_DECORATIVE
+    blob = attachment_store.put(attachment.content_bytes) if store_bytes else None
     if blob is None and digest and attachment_store.exists(digest):
         blob = digest
     values = (
@@ -268,6 +372,7 @@ def record_outcome(
     detail: str = "",
     error_type: Optional[str] = None,
     pod_document: Any = None,
+    grid_verdicts: Any = None,
 ) -> None:
     """Close a row with what actually happened. A no-op for `ledger_id=None` so callers that
     don't have one (unit tests, direct adapter calls) need no special-casing.
@@ -276,6 +381,11 @@ def record_outcome(
     recognised one — whatever the file type. Recorded here because this is the one write that
     already happens for every dispatched attachment, and because deciding it once at ingest is
     what keeps `spitfire_post` from paying for OCR again to answer "is this the proof?".
+
+    `grid_verdicts` is the same arrangement for the other question a reader answers on the way
+    past: is this document a record of goods arriving, or one of Premier's own worklists. Written
+    on every outcome, `extracted` included — the largest expediting reports produce records from
+    one sheet while another sheet is plainly a Spitfire export.
     """
     if ledger_id is None:
         return
@@ -289,6 +399,14 @@ def record_outcome(
             WHERE id = ?""",
         (disposition, detail, claimed_by, records_extracted, error_type, review, now, ledger_id),
     )
+    status_reason = status_report_verdict(grid_verdicts)
+    if status_reason:
+        conn.execute(
+            """UPDATE attachment_ledger
+                  SET is_status_report = 1, status_report_reason = ?
+                WHERE id = ?""",
+            (status_reason, ledger_id),
+        )
     if pod_document is not None:
         conn.execute(
             """UPDATE attachment_ledger
@@ -390,6 +508,25 @@ def list_silent_on_delivery_mail(conn: sqlite3.Connection) -> List[LedgerRow]:
     """, (EMPTY,))
 
 
+def status_reports(conn: sqlite3.Connection) -> Tuple[Dict[str, str], Dict[int, str]]:
+    """Every file judged one of Premier's own worklists, as `(by email_id, by ledger id)`.
+
+    Two indexes off one query because the queue needs both and asking per row would be thousands
+    of statements: the message-level rows want "does this mail carry one", and the attachment row
+    for the workbook itself wants its own sentence. Where a message carries several, the first by
+    id wins — they are near-always the same weekly report under two names.
+    """
+    by_email: Dict[str, str] = {}
+    by_ledger: Dict[int, str] = {}
+    for row in conn.execute(
+            "SELECT id, email_id, status_report_reason FROM attachment_ledger "
+            "WHERE is_status_report = 1 ORDER BY id"):
+        ledger_id, email_id, reason = row[0], row[1], (row[2] or "")
+        by_ledger[ledger_id] = reason
+        by_email.setdefault(email_id, reason)
+    return by_email, by_ledger
+
+
 def orphans(conn: sqlite3.Connection) -> List[LedgerRow]:
     """Rows still at `OBSERVED`. Always empty in a correct run — a non-empty result means an
     attachment slipped past the dispatcher without a verdict."""
@@ -412,3 +549,45 @@ def counts_by_kind(conn: sqlite3.Connection) -> Dict[str, int]:
             "SELECT sniffed_kind, COUNT(*) FROM attachment_ledger GROUP BY sniffed_kind"
         ).fetchall()
     }
+
+
+# --- naming a duplicate that should not have been one --------------------------------------------
+
+def filename_identifiers(filename: str) -> frozenset:
+    """The purchase orders, spec codes and tracking numbers a filename claims.
+
+    Senders name these files after what is inside them — `910634 - P. Kaufmann FedEx POD.pdf`,
+    `FedEx 884603885067  GR-350d-WTF 78 yards from Daniel Stuart.pdf`. That naming is the only
+    signal available *before* anything is parsed, and comparing two of them is what tells a
+    routine second copy apart from the wrong file attached.
+    """
+    from pipeline.parsing import tokens
+
+    stem = str(filename or "").rsplit(".", 1)[0]
+    # `parse_po_list`, not `find_po_numbers`: the latter wants a "PO" label near the digits, and
+    # nobody labels a filename — `910634 - P. Kaufmann FedEx POD.pdf` just leads with the number.
+    # A filename is an already-isolated slot, which is exactly what `parse_po_list` is for, and its
+    # strict six-digit shape keeps a twelve-digit tracking number out of the PO set.
+    return frozenset(
+        tokens.parse_po_list(stem)
+        + tokens.find_specs(stem)
+        + tokens.parse_tracking_numbers(stem)
+    )
+
+
+def duplicate_drop_hint(filename: str, first_filename: str, sha256: str) -> str:
+    """The drop hint for a byte-identical attachment — routine, or a mismatch worth a person.
+
+    Both copies are dropped either way. The difference is whether anybody is told: a sender who
+    attached the wrong file believes a proof was supplied, and nothing downstream can discover
+    that from the bytes, because the bytes are a perfectly valid POD for a different order.
+    """
+    mine = filename_identifiers(filename)
+    theirs = filename_identifiers(first_filename)
+    # Only when both sides actually name something and the two sets are disjoint. One unnamed file
+    # says nothing, and an overlap means they are describing the same delivery from two angles.
+    if mine and theirs and not (mine & theirs):
+        return (f"duplicate_mismatch:{sha256[:12]} — filename names "
+                f"{', '.join(sorted(mine))} but the bytes are those of "
+                f"{first_filename!r} ({', '.join(sorted(theirs))})")
+    return f"duplicate:{sha256[:12]}"

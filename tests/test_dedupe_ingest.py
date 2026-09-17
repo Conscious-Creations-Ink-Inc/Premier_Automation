@@ -12,7 +12,7 @@ import shutil
 import pytest
 
 from connectors.mailbox import LocalFolderMailbox
-from pipeline import ingest_orchestrator, state_db
+from pipeline import dedupe, ingest_orchestrator, state_db
 
 SAMPLE = "warehouse_inbound_239336.json"
 
@@ -140,3 +140,102 @@ def test_a_message_a_person_finished_stops_extraction_staging_more(tmp_path, mai
 
     assert counts(conn)[0] == 0, "extraction staged from a message a person had finished"
     assert staged_first > 0
+
+
+def _shared_record(ledger_id: int = 4242):
+    """One extracted line, stating no delivery date of its own.
+
+    `source_ledger_id` is set because that is what makes `_are_siblings_of_one_grid` treat a group
+    as rows of one document rather than as competing claims — the path that lets the same instance
+    through `reconcile_cross_source_duplicates` twice.
+    """
+    from pipeline.models import ExtractedRecord
+    return ExtractedRecord(
+        source_email_id="msg-shared", po_number="212696", shipment_number=None,
+        spec_code="STE-405-LT", parent_spec_code="STE-405-LT", sub_spec_suffix=None,
+        item_description="Table Lamp at End Table", vendor_name=None, carrier_name=None,
+        tracking_number=None, quantity_received=20.0, unit_of_measure="EA",
+        pod_stated_date=None, email_date="", delivery_location=None, comments=None,
+        extraction_source="docx", extraction_confidence=0.9, raw_snippet="20.00 | EA | Table Lamp",
+        source_ledger_id=ledger_id)
+
+
+def test_the_stored_delivery_key_describes_the_record_it_is_on(tmp_path):
+    """The invariant the duplicate bug broke, on the one record shape that broke it.
+
+    `delivery_key` used to be minted before `_fallback_delivery_date` filled in a missing
+    `pod_stated_date` — a field the key hashes — so the row was written carrying a key that
+    described a version of itself that no longer existed. Nothing could match it again, which is
+    how 160 duplicate records reached the live store across 43 purchase orders.
+
+    Staged singly, so this fails on the stale key itself rather than on the duplicate it goes on
+    to cause. A stored key that does not reproduce from its own row is the defect.
+    """
+    import sqlite3
+    conn = state_db.get_connection(tmp_path / "invariant.sqlite3")
+    conn.execute(
+        "INSERT INTO email_log (email_id, category, folder, processed_at, email_date) "
+        "VALUES ('msg-shared', 'surface', 'Inbox', '2026-09-05T00:00:00', '2026-09-05T09:00:00Z')")
+    conn.commit()
+
+    staged = ingest_orchestrator.stage_records(
+        conn, [_shared_record()], po_number="212696", delivery_ref="message:msg-shared",
+        delivery_rung="message", now="2026-09-05T00:00:00")
+    assert len(staged) == 1
+
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM extracted_records").fetchone()
+    assert row["pod_source"] == "email_received_date", "the fallback has to have fired"
+    assert dedupe.key_for_row(row) == row["delivery_key"], (
+        "delivery_key does not reproduce from its own row — it was minted before "
+        "pod_stated_date was filled in")
+
+
+def test_every_staged_record_carries_a_key_that_reproduces(tmp_path, mailbox_dir):
+    """The same invariant swept across a real ingest run, so a future source that mutates a
+    record late is caught here rather than in Premier's duplicate count."""
+    import sqlite3
+    conn = state_db.get_connection(tmp_path / "sweep.sqlite3")
+    run(conn, mailbox_dir)
+
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM extracted_records").fetchall()
+    assert rows, "the fixture must actually stage something"
+
+    stale = [(r["id"], r["pod_source"]) for r in rows
+             if dedupe.key_for_row(r) != r["delivery_key"]]
+    assert not stale, f"delivery_key does not reproduce from its own row: {stale}"
+
+
+def test_one_record_instance_staged_twice_becomes_one_row(tmp_path):
+    """The exact shape that produced the duplicates.
+
+    `evidence_cache.records_for` is keyed on the email, not the attachment, so every attachment
+    source on one message handed back the *same* `ExtractedRecord` instances — and this loop saw
+    the same object twice. That alone is harmless; it only staged a second row because the first
+    pass mutated the object's `pod_stated_date` after minting its key, so the second pass hashed
+    different content and the guard missed it.
+
+    The email_log row is what makes the fallback fire. Without a date to find there is no
+    mutation, the two passes agree, and this would pass even against the bug.
+    """
+    conn = state_db.get_connection(tmp_path / "shared.sqlite3")
+    conn.execute(
+        "INSERT INTO email_log (email_id, category, folder, processed_at, email_date) "
+        "VALUES ('msg-shared', 'surface', 'Inbox', '2026-09-05T00:00:00', '2026-09-05T09:00:00Z')")
+    conn.commit()
+
+    record = _shared_record()
+    assert record.pod_stated_date is None, "the fallback has to have something to do"
+
+    staged = ingest_orchestrator.stage_records(
+        conn, [record, record], po_number="212696", delivery_ref="message:msg-shared",
+        delivery_rung="message", now="2026-09-05T00:00:00")
+
+    assert len(staged) == 1, "the same record instance was staged twice"
+    assert conn.execute("SELECT COUNT(*) FROM extracted_records").fetchone()[0] == 1
+    # And the row that did land carries the fallback date, not a blank one.
+    row = conn.execute(
+        "SELECT pod_stated_date, pod_source FROM extracted_records").fetchone()
+    assert row[0] == "2026-09-05"
+    assert row[1] == "email_received_date"

@@ -8,12 +8,12 @@ read-back with no network at all.
 
 **This is not `tools/spitfire_capture_responses.py`.** That one sweeps the Swagger: GET-only, one
 call per endpoint *template* against a single sample GUID. It answers "what shape does `/items`
-return"; it cannot answer "what does PO 206725 hold". This tool is driven by the call sites — the
+return"; it cannot answer "what does PO 906725 hold". This tool is driven by the call sites — the
 six read operations `connectors/spitfire.py` exposes, for the purchase orders the pipeline has
 actually seen.
 
     python -m tools.spitfire_record_cassettes                 # the full sweep
-    python -m tools.spitfire_record_cassettes --po 206725     # one PO
+    python -m tools.spitfire_record_cassettes --po 906725     # one PO
     python -m tools.spitfire_record_cassettes --verify        # re-read live and diff vs the store
     python -m tools.spitfire_record_cassettes --promote       # scrubbed subset -> tests/fixtures
     python -m tools.spitfire_record_cassettes --status        # what is in the store
@@ -46,10 +46,10 @@ FIXTURES = ROOT / "tests" / "fixtures" / "spitfire"
 # cost us a bug. Anything else stays in the local store: the bodies carry real vendor names and
 # named Premier employees on approval routes, and this repo is pushed to GitHub.
 FIXTURE_POS = {
-    "206725": "six specs on six clean lines — the happy multi-line delivery",
-    "208491": "base/shade collapsing onto a parent line; Authority line numbers that are not Spitfire's",
-    "210635": "one spec (GR-350c-WTF) on two lines, settled only by unit of measure",
-    "207514": "one spec (LOB-900-SI) on 29 lines — the case no spec can resolve",
+    "906725": "six specs on six clean lines — the happy multi-line delivery",
+    "908491": "base/shade collapsing onto a parent line; Authority line numbers that are not Spitfire's",
+    "910635": "one spec (GR-350c-WTF) on two lines, settled only by unit of measure",
+    "907514": "one spec (LOB-900-SI) on 29 lines — the case no spec can resolve",
 }
 
 # Fields rewritten before a body is committed. Names, not data: spec codes, quantities, line
@@ -121,12 +121,13 @@ def sweep(pos: Sequence[str], source: str, quiet: bool = False) -> Sweep:
     # lapsed banks `false`, and every later offline session then dies on "the supplied sfPMSAuth
     # cookie has expired", which is a baffling thing to be told by a machine with no network. The
     # store would look full and be worthless. Better to refuse to write it.
+    if client.login_mode and spitfire_cassette.mode() != spitfire_cassette.REPLAY:
+        client.ensure_session()
     if not client.has_session():
         raise SystemExit(
             "Spitfire says this session is not live, so there is nothing worth recording. "
-            "Capture a fresh sfPMSAuth cookie (F12 -> Application -> Cookies -> sfPMSAuth), "
-            "put it in .env as SPITFIRE_SESSION_COOKIE, and run this again while it is "
-            "still valid.")
+            "Set SPITFIRE_UID/SPITFIRE_PW in .env (or capture a fresh sfPMSAuth cookie as "
+            "SPITFIRE_SESSION_COOKIE) and run this again.")
 
     say(f"recording into {settings.SPITFIRE_CASSETTE_DIR}")
     say(f"mode {spitfire_cassette.mode()}  ·  {len(pos)} purchase orders")

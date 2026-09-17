@@ -20,7 +20,7 @@ import pytest
 from pipeline import attachment_bytes, attachment_store, mail_cache, state_db
 
 NOW = "2026-08-13T00:00:00Z"
-CONTENT = b"%PDF-1.4 signed by Miguel C."
+CONTENT = b"%PDF-1.4 signed by Jordan T."
 EMAIL = "<pod@premier>"
 
 
@@ -166,3 +166,78 @@ def test_the_row_factory_is_left_as_it_was_found(conn):
     conn.row_factory = None
     attachment_bytes.resolve(conn, EMAIL, 0)
     assert conn.row_factory is None
+
+
+# --- the cache points at the store instead of copying it -----------------------------------------
+#
+# `mail_attachment.content` held a second physical copy of bytes the content-addressed store
+# already had: 205 rows, 41.8 MB, for 30.8 MB of distinct content, and 81 of its 83 hashes were on
+# disk. Inline images were duplicated 4.43x — Outlook mints a fresh random filename per message for
+# the same signature logo, so only the hash finds it.
+
+
+def test_bytes_the_store_already_has_are_not_copied_again(conn):
+    """The row keeps the digest and drops its copy — but only because the store confirmed it."""
+    attachment_store.put(CONTENT)
+    mail_cache.cache_mail(
+        conn, email_id=EMAIL, subject="s", sender="v@example.test", received_at=NOW,
+        body_html="", body_text="", source="graph", cached_at=NOW,
+        attachments=[dict(ordinal=0, filename="pod.pdf", content_type="application/pdf",
+                          kind="pdf", size_bytes=len(CONTENT), content=CONTENT)])
+
+    row = conn.execute("SELECT content, content_sha256 FROM mail_attachment").fetchone()
+    assert row["content"] is None, "the bytes were copied into SQLite as well"
+    assert row["content_sha256"], "and nothing recorded where they went"
+
+    found = attachment_bytes.resolve(conn, EMAIL, 0)
+    assert found is not None and found.content == CONTENT, "the pointer must round-trip"
+    assert found.source == "cache_store"
+
+
+def test_bytes_the_store_does_not_have_are_kept(conn):
+    """The rule, in the direction that matters: a byte is only dropped once its replacement is
+    confirmed present. A signature logo that `keeps_bytes` declined at ingest is not in the store,
+    and a cache that dropped it anyway would be destroying the only copy."""
+    logo = b"\x89PNG a logo ingest declined"
+    mail_cache.cache_mail(
+        conn, email_id=EMAIL, subject="s", sender="v@example.test", received_at=NOW,
+        body_html="", body_text="", source="graph", cached_at=NOW,
+        attachments=[dict(ordinal=0, filename="logo.png", content_type="image/png",
+                          kind="image", size_bytes=len(logo), content=logo, is_inline=True)])
+
+    row = conn.execute("SELECT content, content_sha256 FROM mail_attachment").fetchone()
+    assert row["content"] == logo, "the only copy was dropped"
+    found = attachment_bytes.resolve(conn, EMAIL, 0)
+    assert found is not None and found.content == logo
+
+
+def test_the_cache_never_puts_anything_in_the_store(conn):
+    """Ingest decides what is worth keeping. Since `attachment_ledger.keeps_bytes` started
+    declining signature logos, a cache that stored what it was handed would put every logo back the
+    first time somebody opened the message — undoing the gate through the UI."""
+    logo = b"\x89PNG another logo"
+    mail_cache.cache_mail(
+        conn, email_id=EMAIL, subject="s", sender="v@example.test", received_at=NOW,
+        body_html="", body_text="", source="graph", cached_at=NOW,
+        attachments=[dict(ordinal=0, filename="logo.png", content_type="image/png",
+                          kind="image", size_bytes=len(logo), content=logo, is_inline=True)])
+
+    import hashlib
+    assert not attachment_store.exists(hashlib.sha256(logo).hexdigest()), \
+        "the cache wrote to the content-addressed store"
+
+
+def test_a_pointer_row_counts_as_having_bytes(conn):
+    """`record_create.has_bytes` is a second copy of `resolve`'s ladder. If it misses this rung the
+    POD chooser badges a servable file "bytes not stored" and refuses to attach it to a receipt."""
+    from pipeline import record_create
+
+    attachment_store.put(CONTENT)
+    mail_cache.cache_mail(
+        conn, email_id=EMAIL, subject="s", sender="v@example.test", received_at=NOW,
+        body_html="", body_text="", source="graph", cached_at=NOW,
+        attachments=[dict(ordinal=0, filename="pod.pdf", content_type="application/pdf",
+                          kind="pdf", size_bytes=len(CONTENT), content=CONTENT)])
+
+    assert record_create.has_bytes(
+        conn, {"email_id": EMAIL, "ordinal": 0, "blob_sha256": None, "sha256": None}) is True

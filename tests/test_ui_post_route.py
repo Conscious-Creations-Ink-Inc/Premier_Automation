@@ -44,10 +44,16 @@ def a_record():
 @pytest.fixture(autouse=True)
 def never_really_post(monkeypatch):
     """A standing guard for this file. If a test forgets to patch, this raises rather than
-    creating a receipt on Premier's training instance."""
+    creating a receipt on Premier's training instance.
+
+    **Every entry point that writes must be named here.** The delivery pair was added on
+    2026-08-31; each creates a receipt carrying every item line of a delivery, so a test that
+    reached one would leave a bigger document behind than the per-record path ever could.
+    """
     def refuse(*args, **kwargs):
         raise AssertionError("a test reached the real post chain")
-    monkeypatch.setattr(spitfire_post, "post_pod", refuse)
+    for name in ("post_pod", "post_report", "post_delivery_pod", "post_delivery_report"):
+        monkeypatch.setattr(spitfire_post, name, refuse)
 
 
 def test_an_unknown_record_is_reported_not_posted(client):
@@ -102,7 +108,7 @@ def test_a_successful_post_says_it_is_not_routed(client, a_record, monkeypatch):
     monkeypatch.setattr(killswitch, "is_stopped", lambda: False)
     monkeypatch.setattr(ui_routes.spitfire_post, "post_pod", lambda conn, row: (
         spitfire_post.PostResult(ok=True, state="posted", message="posted to Spitfire as receipt 0007",
-                                 po_number="212614", receipt_doc_no="0007",
+                                 po_number="912614", receipt_doc_no="0007",
                                  steps=["receipt created", "POD attached"])))
     response = client.post(f"/ui/records/{a_record}/post-pod")
     assert "Posted" in response.text
@@ -156,7 +162,7 @@ class _Attempt:
 
 
 def _complete_row(**overrides):
-    row = {"id": 5, "po_number": "212614", "spec_code": "LT-03b",
+    row = {"id": 5, "po_number": "912614", "spec_code": "LT-03b",
            "item_description": "LT-03B Frosted", "vendor_name": "Archipelago",
            "quantity_received": 19.0, "unit_of_measure": "EA", "pod_stated_date": "2026-01-20",
            "received_by": "J Smith", "po_line_number": 1, "source_email_id": "mail-1"}
@@ -165,9 +171,34 @@ def _complete_row(**overrides):
 
 
 def test_no_post_button_without_a_proof_of_delivery():
-    cell = str(ui_routes._post_cell(None, _complete_row(), has_pod=False))
+    """No POD file and nothing in the mail either — the safety property, unchanged.
+
+    The fixture now clears `received_by` explicitly. It used to rely on `_complete_row()` and
+    passed for the wrong reason: that row carries a signer and a date, which is *body evidence*,
+    and Premier accepted on 2026-08-22 that such a delivery may post without a proof document. So
+    the record this test described as having no proof of delivery actually had one, and the assert
+    was holding a rule that had been superseded.
+    """
+    cell = str(ui_routes._post_cell(
+        None, _complete_row(received_by=None, carrier_name=None, tracking_number=None),
+        has_pod=False))
     assert "post-pod" not in cell
     assert "no POD" in cell
+
+
+def test_a_delivery_stated_in_the_mail_may_post_without_a_pod_file():
+    """The other half of the same rule, and the defect it was hiding.
+
+    A signer and a date, no attachment. `post_decision` gate 2 accepts this; the page used to draw
+    a "waive POD" prompt instead, so eleven records sat waiting for someone to waive a proof that
+    was never required. The tooltip must name what actually permits it rather than crediting a
+    waiver nobody gave.
+    """
+    cell = str(ui_routes._post_cell(None, _complete_row(), has_pod=False))
+
+    assert "post-pod/confirm" in cell
+    assert "signed for by J Smith" in cell
+    assert "accepted by" not in cell, "nobody waived this; do not put a name against it"
 
 
 def test_no_post_button_while_required_fields_are_missing():
@@ -252,10 +283,63 @@ def test_verify_pod_reaches_a_record_that_has_already_posted(client, monkeypatch
         conn.close()
 
     monkeypatch.setattr(ui_routes.spitfire_post, "verify_pod", lambda conn, row: (
-        spitfire_post.PostResult(ok=True, state="verified", po_number="212448",
+        spitfire_post.PostResult(ok=True, state="verified", po_number="912448",
                                  message="the bytes in Spitfire are the bytes we sent.",
                                  steps=["POD found on receipt 0001"])))
     response = client.post(f"/ui/records/{record_id}/verify-pod")
     assert response.status_code == 200
     assert "No such record" not in response.text
     assert "verified" in response.text.lower()
+
+
+# --- what the purchase order itself says -------------------------------------------------------
+#
+# Gates 5-8 read from `spitfire_mirror` rather than from Spitfire. The page used to skip them
+# entirely and count 330 rows as ready to post where 56 could: it offered a button on rows the
+# order had already received in full, and on rows matching no line at all. The three states below
+# are the whole point — `UNCHECKED` is not a refusal.
+
+def _verdict(state, reason="", line_number=1):
+    from pipeline import read_views
+    return read_views.LineVerdict(state=state, reason=reason, line_number=line_number)
+
+
+def test_a_line_the_order_refuses_says_why_instead_of_offering_a_button():
+    from pipeline import read_views
+    cell = str(ui_routes._post_cell(
+        None, _complete_row(), has_pod=True,
+        line_verdict=_verdict(read_views.BLOCKED,
+                              "purchase order 212696 shows nothing outstanding on this line")))
+    assert "nothing outstanding" in cell
+    assert "post-pod/confirm" not in cell, (
+        "a control whose only outcome is a refusal teaches people to ignore refusals")
+
+
+def test_an_unread_purchase_order_is_not_treated_as_a_refusal():
+    """`UNCHECKED` means nobody has read that order from Spitfire yet. Rendering it as a blocker
+    would tell a reviewer their delivery is wrong when nothing about it is known either way —
+    the trap `po_verify.mismatch_flags` carries the same warning about."""
+    from pipeline import read_views
+    cell = str(ui_routes._post_cell(
+        None, _complete_row(), has_pod=True,
+        line_verdict=_verdict(read_views.UNCHECKED,
+                              "purchase order 212696 has not been read from Spitfire yet",
+                              line_number=None)))
+    assert "post-pod/confirm" in cell and "Post POD" in cell
+
+
+def test_a_row_with_no_verdict_behaves_exactly_as_before():
+    """`line_verdict=None` is every existing caller and every test above."""
+    assert str(ui_routes._post_cell(None, _complete_row(), has_pod=True)) == str(
+        ui_routes._post_cell(None, _complete_row(), has_pod=True, line_verdict=None))
+
+
+def test_the_rest_of_a_delivery_block_gives_the_same_answer_as_its_head():
+    """Otherwise the first row of a block says the line is already received while its siblings
+    say "with delivery" about the same delivery."""
+    from pipeline import read_views
+    verdict = _verdict(read_views.BLOCKED, "no line on purchase order 212696 matched this delivery")
+    status = str(ui_routes._post_status(None, _complete_row(), has_pod=True,
+                                        line_verdict=verdict))
+    assert "matched this delivery" in status
+    assert "with delivery" not in status

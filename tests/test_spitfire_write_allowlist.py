@@ -20,7 +20,7 @@ RECEIPT_TYPE = "0c9a537a-3c41-4d16-ab9f-130ef69ea6c8"
 
 @pytest.mark.parametrize("method,path", [
     ("POST",  "/api/catalog/upload?xm=catalog"),
-    ("POST",  f"/api/document/{EMPTY_GUID}/{RECEIPT_TYPE}?forProject=P&forBatch=212614"),
+    ("POST",  f"/api/document/{EMPTY_GUID}/{RECEIPT_TYPE}?forProject=P&forBatch=912614"),
     ("PATCH", "/api/document/abc/Title"),
     ("POST",  "/api/document/abc/items"),
     ("POST",  "/api/document/abc/attachments"),
@@ -29,7 +29,7 @@ RECEIPT_TYPE = "0c9a537a-3c41-4d16-ab9f-130ef69ea6c8"
     ("GET",   "/api/document/abc/attachments"),
     ("GET",   "/api/catalog/key/versions"),
     ("GET",   "/api/session/who"),
-    ("POST",  "/api/project/MRC024PB100003/docs"),
+    ("POST",  "/api/project/PRJ001PB100003/docs"),
 ])
 def test_the_posting_chain_is_permitted(method, path):
     assert is_allowed(method, path), f"{method} {path} is part of the receipt chain"
@@ -80,20 +80,21 @@ def test_the_client_refuses_before_opening_a_socket():
         client._request("POST", "/api/document/abc/route/apply")
 
 
-def test_a_missing_cookie_is_named_rather_than_guessed_at(monkeypatch):
-    """Auth is a hand-copied browser ticket that lapses on idle. `POST /api/Account` would let this
-    class log in with a password instead — and must not: there is no service account, the
-    credential in .env belongs to a named human and carries AdminLevel 31, and silently
-    re-authenticating a *write* client turns an expiry into an unattended write."""
+def test_no_credentials_at_all_is_named_rather_than_guessed_at(monkeypatch):
+    """With neither an account nor a cookie configured the client refuses at construction, before
+    anything could be posted. (With an account it rides the shared login from
+    `connectors/spitfire_auth.py`; see tests/test_spitfire_auth.py.)"""
     monkeypatch.setattr(spitfire_write.settings, "SPITFIRE_SESSION_COOKIE", None)
+    monkeypatch.setattr(spitfire_write.settings, "SPITFIRE_UID", None)
+    monkeypatch.setattr(spitfire_write.settings, "SPITFIRE_PW", None)
     with pytest.raises(spitfire_write.SpitfireSessionExpired):
         spitfire_write.SpitfireWriteClient(base_url="https://example.invalid")
 
 
 def test_the_login_endpoint_is_not_reachable_from_the_write_connector():
-    """Belt and braces on the above. `POST /api/Account` is a real, working endpoint that the read
-    connector is allowed to call; here it is off the list, so even a caller that wanted to
-    re-authenticate mid-post cannot."""
+    """`POST /api/Account` is a real, working endpoint that the read connector is allowed to call;
+    here it is off the list, so the write client can only obtain a ticket from the shared login
+    before a chain, and a caller that wanted to re-authenticate mid-post cannot."""
     assert not is_allowed("POST", "/api/Account")
 
 
@@ -211,3 +212,150 @@ def test_nothing_is_sent_when_there_are_no_quantities(monkeypatch):
 
     client.set_line_quantity("abc", {})
     assert calls == []
+
+
+# --- signing our own route steps -----------------------------------------------------------------
+#
+# Measured on receipt 0002, 2026-09-17: sequence 1 was `Reached` and offered `A,H,P`, while
+# sequence 5 had no `Reached` timestamp and offered `C,D,P,G` — no `A`. Spitfire refuses a response
+# on a stop the route has not arrived at, and signing sequence 1 is what makes sequence 5 arrive.
+# So the client signs one stop, re-reads, and signs whatever became reachable. A single pass looks
+# like it worked and leaves sequence 5 Pending, which is the bug these hold.
+
+OUR_KEY = "bf4a2531-074a-43e9-9deb-9a589127ded9"
+THEIR_KEY = "4a533d19-42d1-4ea5-a389-e3a9f93a699b"
+
+_CAN_RESPOND = [{"CommandName": "CanEditRouteResponseCode", "Enabled": True}]
+
+
+def _step(sequence, *, user=OUR_KEY, status="P", reached="2026-09-16T11:24:29.647",
+          choices="A,H,P", commands=_CAN_RESPOND):
+    return {"Sequence": sequence, "UserKey": user, "Status": status, "Reached": reached,
+            "Choices": choices, "MenuCommands": commands,
+            "RouteID": f"route-{sequence}"}
+
+
+class _RouteServer:
+    """A Spitfire whose route advances only when a stop is signed, as the real one does."""
+
+    def __init__(self, steps):
+        self.steps = {s["Sequence"]: dict(s) for s in steps}
+        self.reads = 0
+        self.signed = []
+
+    def read_route(self, doc_key):
+        self.reads += 1
+        return [dict(s) for s in self.steps.values()]
+
+    def sign(self, route_id):
+        sequence = int(str(route_id).rsplit("-", 1)[1])
+        self.steps[sequence]["Status"] = "A"
+        self.signed.append(sequence)
+        # Signing ours is what lets the route reach the next stop — the behaviour the 2026-09-11
+        # dispatch showed when seq 10 gained a `Reached` timestamp after seq 5 was signed.
+        nxt = min((s for s in self.steps if s > sequence), default=None)
+        if nxt is not None:
+            self.steps[nxt]["Reached"] = "2026-09-17T09:00:00.000"
+            self.steps[nxt]["Choices"] = "A,H,P,R,B"
+
+
+def _client(server):
+    """A real `SpitfireWriteClient` with only its HTTP edges replaced."""
+    client = spitfire_write.SpitfireWriteClient.__new__(spitfire_write.SpitfireWriteClient)
+    client.session_user_key = lambda: OUR_KEY
+    client.read_route = lambda doc_key: server.read_route(doc_key)
+    client._release_session = lambda doc_key, session_id="": None
+    client._json_or_raise = lambda response, what: "s" * 36
+    client._request = lambda *a, **k: None
+
+    def _commit(doc_key, session_id, changes, *, note, failure):
+        for change in changes:
+            assert change["DataMember"] == "DocRoute", change
+            assert change["DataField"] == "Status", "only Status ever moves"
+            assert change["Data"] == "A"
+            server.sign(change["InstanceKey"])
+
+    client._commit_changes = _commit
+    return client
+
+
+def test_signing_seq_1_then_seq_5_when_5_was_not_reachable_at_first():
+    """Receipt 0002's exact shape: seq 1 actionable, seq 5 not reached and offering no `A`."""
+    server = _RouteServer([
+        _step(1),
+        _step(5, reached="", choices="C,D,P,G"),
+        _step(10, user=THEIR_KEY, reached="", choices="C,D,P,G"),
+    ])
+
+    signed = _client(server).sign_off_route_steps("doc-1")
+
+    assert server.signed == [1, 5], "one pass would have signed 1 and left 5 Pending"
+    assert signed == ["route step 1 signed off", "route step 5 signed off"]
+    assert server.reads > 1, "the route has to be read again for seq 5 to become reachable"
+
+
+def test_a_route_with_only_one_stop_of_ours_signs_once_and_stops():
+    server = _RouteServer([_step(1), _step(10, user=THEIR_KEY, reached="", choices="C,D,P,G")])
+
+    signed = _client(server).sign_off_route_steps("doc-1")
+
+    assert server.signed == [1]
+    assert signed == ["route step 1 signed off"]
+
+
+def test_a_stop_of_ours_the_route_has_not_reached_is_never_signed():
+    server = _RouteServer([_step(1, reached="", choices="C,D,P,G")])
+
+    assert _client(server).sign_off_route_steps("doc-1") == [
+        "no route step of ours is reached and unsigned"]
+    assert server.signed == []
+
+
+def test_the_sentinel_date_does_not_count_as_reached():
+    """Spitfire writes `0001-01-01T00:00:00` for never, and as a non-empty string it reads truthy.
+    Treating it as a real timestamp inverts the whole gate."""
+    server = _RouteServer([_step(1, reached="0001-01-01T00:00:00")])
+
+    assert _client(server).sign_off_route_steps("doc-1") == [
+        "no route step of ours is reached and unsigned"]
+    assert server.signed == []
+
+
+def test_somebody_elses_stop_is_never_signed_however_reachable():
+    server = _RouteServer([_step(10, user=THEIR_KEY)])
+
+    assert _client(server).sign_off_route_steps("doc-1") == [
+        "no route step of ours is reached and unsigned"]
+    assert server.signed == []
+
+
+def test_a_stop_spitfire_does_not_offer_is_left_alone():
+    """`CanEditRouteResponseCode` absent, or `A` missing from the choices. If the server does not
+    offer the capability we do not invent it."""
+    for step in (_step(1, commands=[]), _step(1, choices="C,D,P,G")):
+        server = _RouteServer([step])
+        assert _client(server).sign_off_route_steps("doc-1") == [
+            "no route step of ours is reached and unsigned"]
+        assert server.signed == []
+
+
+def test_an_already_signed_route_is_not_signed_again():
+    """Re-posting a receipt must not re-write an acted row."""
+    server = _RouteServer([_step(1, status="A"), _step(5, status="A")])
+
+    assert _client(server).sign_off_route_steps("doc-1") == [
+        "no route step of ours is reached and unsigned"]
+    assert server.signed == []
+
+
+def test_the_pass_limit_holds_if_the_server_never_records_the_signature():
+    """The loop's exit depends on the server moving `Status`. If it never does, the bound is what
+    stops this signing the same row for ever."""
+    server = _RouteServer([_step(1)])
+    server.sign = lambda route_id: server.signed.append(1)      # accepts, records nothing
+
+    client = _client(server)
+    signed = client.sign_off_route_steps("doc-1")
+
+    assert len(server.signed) == spitfire_write.SpitfireWriteClient.MAX_SIGN_PASSES
+    assert len(signed) == spitfire_write.SpitfireWriteClient.MAX_SIGN_PASSES

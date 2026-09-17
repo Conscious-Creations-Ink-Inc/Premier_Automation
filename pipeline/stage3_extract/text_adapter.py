@@ -2,7 +2,7 @@
 
 `KIND_TEXT` previously had no reader at all, which mattered most for **CSV** — the obvious
 substitute for the `.xlsx` trackers Premier already relies on, and one export away from being
-the format they actually send. A CSV of `Cameo Receivers.xlsx` holds identical data, so it
+the format they actually send. A CSV of `Property Receivers.xlsx` holds identical data, so it
 routes through the same `grid_reader` and yields identical records.
 
 One rule carries disproportionate weight here, in `_freetext_records`: **a record with no PO,
@@ -121,6 +121,7 @@ class TextAdapter(ExtractionAdapter):
         body_source = ExtractionSource(
             source_email_id=source.source_email_id, email_date=source.email_date,
             source_type="body", body_text=text,
+            ledger_id=source.ledger_id, known_po_numbers=source.known_po_numbers,
         )
         records = []
         for record in FreetextAdapter().extract(body_source):

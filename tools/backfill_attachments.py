@@ -30,9 +30,15 @@ def _now() -> str:
 
 
 def _emails_needing_backfill(conn) -> list:
+    # `blob_sha256 IS NULL` means "no bytes here" -- which is true of a gap *and* of an attachment
+    # whose bytes were released on purpose. Without the two exclusions below this would re-fetch
+    # every reclaimed signature logo from Outlook and `attachment_store.put()` it back, silently
+    # undoing `tools/reclaim_decorative_blobs.py` and spending ~24,000 Graph calls to do it.
     return [row["email_id"] for row in conn.execute(
         "SELECT email_id, COUNT(*) AS gaps FROM attachment_ledger "
         " WHERE blob_sha256 IS NULL AND sha256 <> '' AND size_bytes > 0 "
+        "   AND blob_reclaimed_at IS NULL "
+        "   AND disposition <> 'dropped_decorative' "
         " GROUP BY email_id ORDER BY MAX(first_seen_at) DESC"
     ).fetchall()]
 

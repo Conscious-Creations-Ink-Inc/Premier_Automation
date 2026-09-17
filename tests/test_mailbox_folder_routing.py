@@ -32,10 +32,10 @@ def test_dummy_emails_are_sorted_into_the_right_folders_after_one_pass(tmp_path)
     )
     write_email(
         tmp_path, email_id="msg-routed-1",
-        sender_address="marketing@wayfair.com", sender_domain="wayfair.com",
+        sender_address="marketing@example-retail.test", sender_domain="example-retail.test",
         subject="It's delivery day!", body_text="Your order is arriving today.",
     )
-    inbound = fx.inbound_email(email_id="msg-processed-1", po_numbers=("208491",))
+    inbound = fx.inbound_email(email_id="msg-processed-1", po_numbers=("908491",))
     write_email(
         tmp_path, email_id="msg-processed-1",
         sender_address=inbound.sender_address, sender_domain=inbound.sender_domain,
@@ -47,7 +47,7 @@ def test_dummy_emails_are_sorted_into_the_right_folders_after_one_pass(tmp_path)
     count = ingest_orchestrator.process_new_mail(mailbox, conn=c)
 
     assert count == 1
-    assert [r.record.po_number for r in extracted_records_store.get_pending(c)] == ["208491"]
+    assert [r.record.po_number for r in extracted_records_store.get_pending(c)] == ["908491"]
 
     assert not (tmp_path / "msg-hidden-1.json").exists()
     assert not (tmp_path / "msg-routed-1.json").exists()

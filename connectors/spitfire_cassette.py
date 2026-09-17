@@ -270,6 +270,14 @@ class CassetteAdapter(HTTPAdapter):
         path = self._api_path(split.path)
         method = (request.method or "GET").upper()
 
+        if method == "POST" and path.lower() == "/api/account":
+            # The login is never recorded or replayed. Its body carries the password, and its whole
+            # point is the `Set-Cookie` ticket, which a cassette does not store — a replayed login
+            # would "succeed" and authenticate nothing.
+            if current == REPLAY:
+                raise SpitfireOffline("cannot log in to Spitfire while replaying recorded responses")
+            return super().send(request, **kwargs)
+
         if current == REPLAY and is_write(method, path):
             raise SpitfireOffline(
                 f"{method} {path} writes to Spitfire, and this session is replaying recorded "

@@ -31,8 +31,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
-from config import settings
-from pipeline import completeness, dedupe, post_ledger, po_verify
+from pipeline import authorship, completeness, dedupe, post_ledger, po_verify
 
 POST = "post"
 FLAG = "flag"
@@ -43,7 +42,7 @@ OVER_RECEIPT_TOLERANCE = 0.0
 This used to be `QUANTITY_TOLERANCE`, compared against `qty_ordered` with an equality test, and
 that was wrong in a way that rejected most real traffic: it demanded every delivery satisfy the
 whole order in one go, so receiving 2 against 19 ordered was refused permanently with no way to
-accept it. Partial deliveries are ordinary — PO 212559's own lines are 4/4/2/2 across separate
+accept it. Partial deliveries are ordinary — PO 912559's own lines are 4/4/2/2 across separate
 shipments.
 
 The rule is now "anything from 1 up to what is outstanding", and this constant governs only the
@@ -51,6 +50,39 @@ other end: booking *more* than was ordered. Zero is a defensible default for tha
 never a defensible default for "is this the full order". An over-receipt is a real event — 202
 delivered against 196 ordered is in the corpus — but it is a conversation with the vendor, not
 something to book unattended.
+"""
+
+
+POD_DATE_FALLBACKS = ("email_received_date", "email_sent_date")
+"""`pod_source` values meaning *we* supplied the delivery date, because the document did not.
+
+`ingest_orchestrator._fallback_pod_date` stamps these under Premier's 2026-09-03 rule and says why
+they must not be trusted on their own: *"This is an estimate standing in for a fact, so the caller
+records which one it used, and posting still wants a linked proof of delivery, a `pod_waived_by`
+waiver, or body evidence - a fallback date cannot smuggle anything into Spitfire on its own."*
+
+`document_evidence` is that sentence enforced. Measured on the live store, 58 of the 185 records on
+the Records page carry a fallback date; without this exclusion every one of them would post on a
+date that is only the day the email landed.
+"""
+
+DELIVERY_DOCUMENT_SOURCES = ("pdf", "ocr", "docx",
+                             "authority_delivered", "authority_inbound")
+"""`extraction_source` families that are a delivery document rather than a worklist about one.
+
+Matched on the part before the first colon, so `pdf:text` counts and `excel:Hoja1` does not.
+
+**The exclusions are the point.** Every `excel:*` source in this store is an expediting or
+confirmation worklist - `excel:Expediting`, `excel:qPOExpeditor`, `excel:Combined Forecast`,
+`excel:Hoja1` - and a worklist asks whether goods arrived rather than saying they did. Measured
+2026-09-10: admitting them would have passed 32 records read out of one message whose subject is
+literally *"Delivery Confirmation Required"*, forwarded into the mailbox and so externally authored.
+That is the failure `body_evidence`'s own docstring recorded as `excel:Hoja1 0/57`, and the
+authorship gate cannot catch it - the message really did come from outside.
+
+`freetext`, `html*` and `manual` are left out for the same reason in weaker form: none of them is a
+document asserting a delivery. A manually created record already chose a proof or waived one at
+creation, so it has no need of this route.
 """
 
 
@@ -84,9 +116,9 @@ class Decision:
     existing: Optional[post_ledger.PostAttempt] = None
 
     body_evidence: str = ""
-    """Which signal in the email body stood in for a proof document, when there is none.
+    """Which signal stood in for a proof document, when there is none.
 
-    `"signer+date"` or `"carrier+tracking+date"` — see `body_evidence()`. Empty whenever a POD
+    `"signer+date"`, `"carrier+tracking+date"` or `"document+date"` — see `body_evidence()`. Empty whenever a POD
     exists, and empty on a record that reached POST through a person's waiver instead, so the two
     routes past gate 2 are always distinguishable in the ledger and in the confirm dialog."""
 
@@ -109,7 +141,7 @@ def _flag(record_id: int, reason: str, **extra: Any) -> Decision:
     return Decision(record_id=record_id, verdict=FLAG, reason=reason, **extra)
 
 
-def body_evidence(row: Any) -> str:
+def body_evidence(row: Any, *, origin_sender: Optional[str] = None) -> str:
     """The delivery evidence carried in the email body itself, or "" when there is none.
 
     Premier's decision, 2026-08-22: a delivery whose particulars are all stated in the mail may
@@ -117,7 +149,7 @@ def body_evidence(row: Any) -> str:
     it is deliberately narrower than "the record is complete".
 
     Completeness alone would be the wrong test. 57 of the 92 records in the corpus come from
-    `Public Space - Pending Receipt Confirmation Orders.xlsx` and `Cameo Receivers.xlsx` — Premier's
+    `Public Space - Pending Receipt Confirmation Orders.xlsx` and `Property Receivers.xlsx` — Premier's
     own worklists of goods *awaiting* delivery. They are complete, they carry quantities and dates,
     and nothing has arrived. Posting them would assert receipt of goods still in transit.
 
@@ -137,6 +169,11 @@ def body_evidence(row: Any) -> str:
 
     Read only from fields the parsers extracted, never from prose. A signal this returns is a fact
     the extraction already committed to, which is what makes it auditable after the fact.
+
+    **A third route was added 2026-09-11** — see `document_evidence`, tried last. The two tests
+    above are a 2026-08-22 proxy for "somebody outside Premier said so", and the confirmation gate
+    added on 2026-09-07 now asks that directly. The measurement above still holds under it: the 57
+    `excel:Hoja1` worklist rows are refused there too, by source rather than by silence.
     """
     if not str(_get(row, "pod_stated_date") or "").strip():
         return ""
@@ -145,6 +182,152 @@ def body_evidence(row: Any) -> str:
     if (str(_get(row, "carrier_name") or "").strip()
             and str(_get(row, "tracking_number") or "").strip()):
         return "carrier+tracking+date"
+    return document_evidence(row, origin_sender=origin_sender)
+
+
+def document_evidence(row: Any, *, origin_sender: Optional[str] = None) -> str:
+    """`"document+date"` where a delivery *document* from outside Premier states the date, else `""`.
+
+    **Why this was added, 2026-09-11.** The signer/carrier tests above were written on 2026-08-22 as
+    a proxy for one question: did somebody outside Premier say these goods arrived. They were the
+    only instrument available, and they are a poor one - measured on the live store, 89 of 4,717
+    records name a signer and 97 name a carrier, so the proxy refuses about 96% of the corpus
+    including every delivery note that simply does not print a name.
+
+    Since 2026-09-07 that question is asked directly and far better, one layer up:
+    `read_views._awaits_confirmation` withholds every record read out of Premier's own mail until a
+    person confirms it, keyed on `email_log.origin_sender` - the oldest hop of the thread, not the
+    envelope, because every message here is forwarded. All 185 records on the Records page have
+    already cleared it. Requiring the old proxy *as well* was asking the same question twice and
+    taking the worse answer.
+
+    So this route replaces the proxy with the three things that actually have to be true:
+
+    1. **Somebody outside Premier wrote it.** Not merely "not resolvably internal" - the origin has
+       to be known and external. `authorship.authored_internally` treats an unresolvable sender as
+       external on purpose, so that a message we know nothing about is not silently withheld from a
+       *queue*; that default is right there and wrong here, where the answer permits a write to an
+       ERP. Unknown fails closed.
+    2. **The date is stated, not supplied by us.** See `POD_DATE_FALLBACKS`.
+    3. **It came off a delivery document, not a worklist.** See `DELIVERY_DOCUMENT_SOURCES`.
+
+    Measured before and after on the Records page: 54 records passed `body_evidence`, 128 pass it
+    now, and the 32 "Delivery Confirmation Required" spreadsheet rows are refused by rule 3 while
+    the 58 fallback-dated rows are refused by rule 2. Those still need a person - which is what the
+    waiver is for, and why it must stay reachable.
+
+    Read only from stored fields, like the rest of this module: a signal returned here is a fact
+    extraction already committed to, which is what makes it auditable afterwards.
+    """
+    if not str(_get(row, "pod_stated_date") or "").strip():
+        return ""
+
+    sender = origin_sender if origin_sender is not None else _get(row, "origin_sender")
+    sender = str(sender or "").strip()
+    if not sender or authorship.authored_internally(sender):
+        return ""
+
+    if str(_get(row, "pod_source") or "").strip() in POD_DATE_FALLBACKS:
+        return ""
+
+    source = str(_get(row, "extraction_source") or "").strip().lower()
+    if "quantity_conflict" in source:
+        return ""
+    if source.split(":", 1)[0] not in DELIVERY_DOCUMENT_SOURCES:
+        return ""
+    return "document+date"
+
+
+def can_post_offline(row: Any, *, has_pod_bytes: bool,
+                     origin_sender: Optional[str] = None) -> str:
+    """Why this record may be posted without asking Spitfire anything, or `""` if it may not.
+
+    Gate 2 of `decide`, asked as a question rather than answered as a refusal — because a *list*
+    needs the same answer and cannot pay for the network. Returns the reason (`"pod"`, `"waived"`,
+    `"signer+date"`, `"carrier+tracking+date"`, `"document+date"`) so a screen can say which of the
+    four routes applies, rather than only that something is allowed.
+
+    `origin_sender` is threaded through for `document_evidence`, which needs to know who wrote the
+    message. Left None it is read off the row — `read_views._records_pending` projects it, so the
+    Records page needs to pass nothing. A projection without the column (`deliveries_store.lines_for`
+    is `SELECT *` over `extracted_records`, which has no such column) answers `""` for that route
+    rather than guessing, so `decide` resolves it explicitly and the two cannot drift.
+
+    **This exists because the Records page had its own, different test.** It asked whether the
+    email carried anything that could be a POD (`_emails_with_a_possible_pod`) and, when it did
+    not, drew a "waive POD" prompt. That test does not know about `body_evidence` — Premier's
+    2026-08-22 route for a delivery stated entirely in the mail — so 11 records that this gate
+    would have accepted were sitting behind a prompt asking someone to waive a proof that was
+    never required. A second definition of a rule is a second answer to it.
+
+    `has_pod_bytes` is a parameter rather than a ledger read: the page resolves it for every row in
+    one query, and looking it up per row here would reintroduce the N+1 that query exists to avoid.
+
+    Deliberately *offline* and deliberately only gate 2. Gates 3 and 4 — already posted, and the
+    live purchase-order comparison — need I/O, and a list view that paid for them would cost about
+    145 seconds. A row this returns a reason for is one the Post button will offer; whether it
+    lands is still the confirm dialog's live question to answer.
+    """
+    if has_pod_bytes:
+        return "pod"
+    if str(_get(row, "pod_waived_by") or "").strip():
+        return "waived"
+    return body_evidence(row, origin_sender=origin_sender)
+
+
+def line_refusal(check: Any, po_number: str) -> str:
+    """Gates 5-8 against one matched purchase-order line: the reason to refuse, or empty.
+
+    Split out of `decide` so a *list* view can ask the same question. `decide` reads the order
+    live; the Records page reads `spitfire_mirror`, which costs 0.04s for 385 rows where a live
+    read of the same rows costs about 145 seconds. Both then rule on the result here, so the
+    count on the page and the verdict on the button cannot drift apart — the same drift
+    `can_post_offline` was written to end, one gate further down.
+
+    `check` is `po_verify.verify_record(...).matched`. It says nothing about whether a proof of
+    delivery exists (gate 2) or whether this delivery already posted (gate 3); those are asked
+    elsewhere and are deliberately not re-asked here.
+    """
+    # 5. The line must have been resolved by its spec code — or chosen by a person.
+    #    A fuzzy description match is a weaker claim than anything writing to an ERP should rest
+    #    on. A reviewer picking a line from the alternatives table is a *stronger* one, and
+    #    refusing it as "matched on description alone" was both a block on the only recovery path
+    #    there is and a false statement about what happened.
+    if not (check.spec_resolved or check.reviewer_chose):
+        return (f"the line was matched on description alone, not on a spec code — "
+                f"{check.description[:60] or 'this line'} needs a person to confirm it")
+
+    # 6. A line with nothing left. Checked before the quantity comparison so the sentence names
+    #    the actual situation — "this line is already fully received" is what a reviewer needs to
+    #    read, not "you would over-receive by 19", which is technically true and unhelpful.
+    #    Spitfire's own numbers lag until approval, so this is a weak signal that only ever fires
+    #    when the ERP is certain; our ledger is what stops the repeat it cannot see.
+    if check.qty_outstanding <= 0:
+        return (f"purchase order {po_number} shows nothing outstanding on this line "
+                f"({po_verify.fmt_qty(check.qty_received)} of "
+                f"{po_verify.fmt_qty(check.qty_ordered)} already received)")
+
+    # 7. Quantities, measured against what is still owed rather than against the whole order.
+    #    A delivery of part of a line is an ordinary receipt, not a discrepancy: it books what
+    #    arrived and leaves the rest outstanding for the next shipment.
+    if check.record_quantity is None:
+        return "the email states no quantity to receive"
+    if check.record_quantity <= 0:
+        return (f"the email states a quantity of "
+                f"{po_verify.fmt_qty(check.record_quantity)} — there is nothing to receive")
+    if check.record_quantity > check.qty_outstanding + OVER_RECEIPT_TOLERANCE:
+        return (f"this would over-receive: the email says "
+                f"{po_verify.fmt_qty(check.record_quantity)} {check.record_uom or ''}".rstrip()
+                + f" and only {po_verify.fmt_qty(check.qty_outstanding)} "
+                  f"{check.unit_of_measure} of the "
+                  f"{po_verify.fmt_qty(check.qty_ordered)} ordered is still outstanding")
+
+    # 8. Units. `uom_agrees` is None when either side is silent, which is not disagreement —
+    #    but a stated unit that contradicts the order is, and 19 EA against 19 CS is not the
+    #    same delivery.
+    if check.uom_agrees is False:
+        return (f"the email says {check.record_uom} and the purchase order says "
+                f"{check.unit_of_measure}")
     return ""
 
 
@@ -172,6 +355,14 @@ def decide(conn: sqlite3.Connection, row: Any,
     """
     record_id = int(_get(row, "id") or 0)
     po_number = str(_get(row, "po_number") or "").strip()
+    # Resolved here, once, and passed explicitly into every gate-2 question below. Not left to be
+    # read off `row`: the Records page passes rows from `read_views._records_pending`, which
+    # projects `origin_sender`, while the grouped post passes rows from
+    # `deliveries_store.lines_for` (`SELECT *` over `extracted_records`), which cannot. Reading it
+    # off the row would make the same delivery answer differently depending on which screen asked —
+    # the button offering a line the gate then refuses, which is the drift `can_post_offline` was
+    # written to end.
+    origin_sender = _origin_sender(conn, row)
 
     # 1. Completeness. The standing instruction from completeness.py, and the cheapest check.
     gaps = completeness.gaps(row)
@@ -196,13 +387,16 @@ def decide(conn: sqlite3.Connection, row: Any,
     #    null on every row that existed before the column. Nothing infers it, and nothing sets it
     #    in bulk. See `waiver_of` below and `api/ui/routes.py::waive_pod`.
     if not pod_md5:
-        waived_by = str(_get(row, "pod_waived_by") or "").strip()
         # Premier's decision, 2026-08-22: a delivery whose particulars are all stated in the mail
         # may post without a proof document. `body_evidence` is deliberately narrower than "the
         # record is complete" — it requires a signer or a carrier reference, which is what
         # separates a delivery notification from a row on a pending-confirmation spreadsheet. The
         # objection above still stands for everything it does not admit.
-        if not (waived_by or body_evidence(row)):
+        #
+        # Asked through `can_post_offline` so the Records page asks the identical question. It
+        # used to ask its own, narrower one and hid the Post button on 11 records this gate would
+        # have accepted.
+        if not can_post_offline(row, has_pod_bytes=False, origin_sender=origin_sender):
             # `pod_reason` distinguishes the two cases the caller can tell apart and this module
             # cannot: an email that carried nothing usable, versus an attachment whose bytes were
             # never stored. They need different fixes — one is a data problem at Premier's end, the
@@ -217,7 +411,7 @@ def decide(conn: sqlite3.Connection, row: Any,
     #    Asked of the *delivery*, not of this record. The idempotency key includes the record id,
     #    which changes for reasons that have nothing to do with the goods — reprocessing a mail
     #    re-extracts it under a new id, and so does a corrected extraction — so keying the question
-    #    on it let the same delivery post again under a new number. PO 212559 collected eight
+    #    on it let the same delivery post again under a new number. PO 912559 collected eight
     #    receipts that way. (PO, line, POD hash) is what "the same delivery" actually means.
     existing = post_ledger.find_delivery(conn, po_number, line_hint, evidence_key or pod_md5)
     if existing:
@@ -242,9 +436,18 @@ def decide(conn: sqlite3.Connection, row: Any,
         return _flag(record_id, f"Spitfire could not be read: {verification.error}",
                      po_number=po_number, verification=verification)
     if not verification.po_found:
+        # Spitfire answered and holds no such purchase order — `po_verify.read` turns a lookup
+        # that could not complete into `verification.error` above, so reaching here means this is
+        # their data and not our connection. Said plainly for that reason: the old wording named
+        # our three configured project ids, which described our configuration to somebody who can
+        # do nothing about either.
+        #
+        # No receipt can be created without a `forProject`, so this is refused like any other
+        # blocked record — but it is not work anybody can finish, and `read_views` keeps it off
+        # the queue of records a person is asked to correct.
         return _flag(record_id,
-                     f"purchase order {po_number} was not found in the projects this connector "
-                     f"can search ({', '.join(settings.SPITFIRE_PROJECT_IDS)})",
+                     f"Spitfire has no purchase order {po_number} — the delivery is recorded and "
+                     f"appears on the receiver report, but there is no order to receive it against",
                      po_number=po_number, verification=verification)
 
     check = verification.matched
@@ -253,57 +456,12 @@ def decide(conn: sqlite3.Connection, row: Any,
                      f"no line on purchase order {po_number} matched this delivery",
                      po_number=po_number, verification=verification)
 
-    # 5. The line must have been resolved by its spec code — or chosen by a person.
-    #    A fuzzy description match is a weaker claim than anything writing to an ERP should rest
-    #    on. A reviewer picking a line from the alternatives table is a *stronger* one, and
-    #    refusing it as "matched on description alone" was both a block on the only recovery path
-    #    there is and a false statement about what happened.
-    if not (check.spec_resolved or check.reviewer_chose):
-        return _flag(record_id,
-                     f"the line was matched on description alone, not on a spec code — "
-                     f"{check.description[:60] or 'this line'} needs a person to confirm it",
-                     po_number=po_number, verification=verification)
-
-    # 6. A line with nothing left. Checked before the quantity comparison so the sentence names
-    #    the actual situation — "this line is already fully received" is what a reviewer needs to
-    #    read, not "you would over-receive by 19", which is technically true and unhelpful.
-    #    Spitfire's own numbers lag until approval, so this is a weak signal that only ever fires
-    #    when the ERP is certain; our ledger is what stops the repeat it cannot see.
-    if check.qty_outstanding <= 0:
-        return _flag(record_id,
-                     f"purchase order {po_number} shows nothing outstanding on this line "
-                     f"({po_verify.fmt_qty(check.qty_received)} of "
-                     f"{po_verify.fmt_qty(check.qty_ordered)} already received)",
-                     po_number=po_number, verification=verification)
-
-    # 7. Quantities, measured against what is still owed rather than against the whole order.
-    #    A delivery of part of a line is an ordinary receipt, not a discrepancy: it books what
-    #    arrived and leaves the rest outstanding for the next shipment.
-    if check.record_quantity is None:
-        return _flag(record_id, "the email states no quantity to receive",
-                     po_number=po_number, verification=verification)
-    if check.record_quantity <= 0:
-        return _flag(record_id,
-                     f"the email states a quantity of "
-                     f"{po_verify.fmt_qty(check.record_quantity)} — there is nothing to receive",
-                     po_number=po_number, verification=verification)
-    if check.record_quantity > check.qty_outstanding + OVER_RECEIPT_TOLERANCE:
-        return _flag(record_id,
-                     f"this would over-receive: the email says "
-                     f"{po_verify.fmt_qty(check.record_quantity)} {check.record_uom or ''}".rstrip()
-                     + f" and only {po_verify.fmt_qty(check.qty_outstanding)} "
-                       f"{check.unit_of_measure} of the "
-                       f"{po_verify.fmt_qty(check.qty_ordered)} ordered is still outstanding",
-                     po_number=po_number, verification=verification)
-
-    # 8. Units. `uom_agrees` is None when either side is silent, which is not disagreement —
-    #    but a stated unit that contradicts the order is, and 19 EA against 19 CS is not the
-    #    same delivery.
-    if check.uom_agrees is False:
-        return _flag(record_id,
-                     f"the email says {check.record_uom} and the purchase order says "
-                     f"{check.unit_of_measure}",
-                     po_number=po_number, verification=verification)
+    # 5-8. The line itself: resolved, still owed, the quantity, the unit. Asked through
+    #      `line_refusal` so a list view can ask the identical question against the mirror
+    #      without holding a second copy of these rules.
+    refusal = line_refusal(check, po_number)
+    if refusal:
+        return _flag(record_id, refusal, po_number=po_number, verification=verification)
 
     project_code = _project_of(conn, po_number)
     if not project_code:
@@ -322,7 +480,7 @@ def decide(conn: sqlite3.Connection, row: Any,
         verification=verification,
         pod_waived_by="" if pod_md5 else str(_get(row, "pod_waived_by") or "").strip(),
         body_evidence="" if (pod_md5 or str(_get(row, "pod_waived_by") or "").strip())
-                      else body_evidence(row))
+                      else body_evidence(row, origin_sender=origin_sender))
 
 
 def _describe_existing(attempt: post_ledger.PostAttempt) -> str:
@@ -343,6 +501,28 @@ def _describe_existing(attempt: post_ledger.PostAttempt) -> str:
         return (f"a previous post on {when} half-completed and needs a person — receipt "
                 f"{attempt.receipt_doc_no or attempt.receipt_key[:8]} exists but was not finished")
     return f"a post claimed on {when} is still in flight"
+
+
+def _origin_sender(conn: sqlite3.Connection, row: Any) -> str:
+    """Who *wrote* this record's message, for `document_evidence`.
+
+    Taken from the row where the projection carries it and read from `email_log` otherwise, so
+    every caller gets the same answer for the same record whatever query it arrived through.
+
+    `origin_sender`, never `sender`: every message in this mailbox is forwarded, so the envelope
+    says `premierpm.com` on a warehouse receiving report too. `pipeline/authorship.py` carries the
+    full reasoning, and `read_views._awaits_confirmation` keys on the same column.
+    """
+    carried = _get(row, "origin_sender")
+    if carried is not None:
+        return str(carried or "").strip()
+
+    email_id = str(_get(row, "source_email_id") or "").strip()
+    if not email_id:
+        return ""
+    found = conn.execute("SELECT COALESCE(origin_sender, '') FROM email_log WHERE email_id = ?",
+                         (email_id,)).fetchone()
+    return str(found[0] or "").strip() if found else ""
 
 
 def _project_of(conn: sqlite3.Connection, po_number: str) -> str:

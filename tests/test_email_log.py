@@ -17,8 +17,8 @@ def route_email(email_id="msg-route"):
     return make_email(
         email_id=email_id,
         subject="Your order has shipped!",
-        sender_address="marketing@wayfair.com",
-        sender_domain="wayfair.com",
+        sender_address="marketing@example-retail.test",
+        sender_domain="example-retail.test",
         body_text="Thanks for shopping with us. Track your package in your account.",
     )
 
@@ -35,8 +35,8 @@ def hide_email(email_id="msg-hide"):
 
 
 def test_every_exit_path_writes_exactly_one_row(monkeypatch):
-    surface = fx.inbound_email(email_id="msg-surface", notice="239475",
-                               po_numbers=("208491",), shipment="50052 : 1")
+    surface = fx.inbound_email(email_id="msg-surface", notice="939475",
+                               po_numbers=("908491",), shipment="90052 : 1")
     boom = make_email(email_id="msg-boom", subject="detonates in triage")
 
     real_triage = ingest_orchestrator.triage
@@ -92,7 +92,7 @@ def test_routed_email_with_no_attachments_is_still_visible():
 def test_every_row_states_why():
     c = new_conn()
     mailbox = FakeMailbox([
-        fx.inbound_email(email_id="msg-1", notice="239475", po_numbers=("208491",), shipment="50052 : 1"),
+        fx.inbound_email(email_id="msg-1", notice="939475", po_numbers=("908491",), shipment="90052 : 1"),
         route_email(),
         hide_email(),
     ])

@@ -122,6 +122,128 @@ def test_the_stamp_alone_does_not_hide_an_unprocessed_message(conn):
     assert mail_arrivals.pending_count(conn) == 1
 
 
+# ------------------------------------------------- Graph's 255-character truncation --
+#
+# Microsoft Graph returns `internetMessageId` cut to 255 characters unless `$select` asks for the
+# message body. The arrival watch is metadata-only by design — that is what makes a fifteen-second
+# poll affordable — so it stores the cut id, while the pipeline selects the body and stores the full
+# one. Nothing in this suite exercised ids that long, so every test passed either way while the live
+# Mail page reported 26 already-processed messages as unread and the by-id recovery declared all 26
+# deleted from a mailbox they were sitting in.
+#
+# Synthetic ids only. The real ones are Premier's mail.
+
+def long_id(total_len):
+    """A well-formed Message-ID of exactly `total_len` characters."""
+    tail = "@example-pm.test>"
+    return "<" + "a" * (total_len - len(tail) - 1) + tail
+
+
+def test_a_truncated_arrival_matches_its_full_verdict(conn):
+    """**The regression test for the whole class.** The watch's id is the pipeline's id cut at 255,
+    so the two must still be recognised as one message."""
+    full = long_id(259)
+    truncated = full[:mail_arrivals.ID_MATCH_LEN]
+    assert len(truncated) == 255 and not truncated.endswith(">")
+
+    mail_arrivals.record(conn, [arrival(truncated)], now="x")
+    assert mail_arrivals.pending_count(conn) == 1, "unread before the pipeline reads it"
+
+    log_verdict(conn, full)
+    assert mail_arrivals.pending_count(conn) == 0, "the verdict must clear the truncated arrival"
+    assert mail_arrivals.pending(conn) == []
+    assert mail_arrivals.unreachable(conn, 10) == [],         "a settled message must never be handed to the by-id recovery"
+
+
+def test_a_truncated_arrival_with_no_verdict_is_still_pending(conn):
+    """The converse, and the direction that loses mail. Matching on a prefix must not become
+    matching on anything — an unread message that quietly stops being pending is gone for good."""
+    mail_arrivals.record(conn, [arrival(long_id(259)[:255])], now="x")
+    log_verdict(conn, "<somebody-else@example-pm.test>")
+    assert mail_arrivals.pending_count(conn) == 1
+
+
+def test_marking_enriched_reaches_a_truncated_arrival(conn):
+    """`mark_enriched` is called by the pipeline, holding the full id, against a row the watch
+    wrote holding the cut one. With a plain `=` it updated zero rows and said nothing."""
+    full = long_id(259)
+    mail_arrivals.record(conn, [arrival(full[:255])], now="x")
+    mail_arrivals.mark_enriched(conn, full, "2026-08-13 09:05:00")
+    assert mail_arrivals.get(conn, full[:255]).enriched_at == "2026-08-13 09:05:00"
+
+
+def test_clearing_enrichment_reaches_a_truncated_arrival(conn):
+    """`forget_emails` passes pipeline ids; the rows hold watch ids. A forget that matched nothing
+    left the message stamped as read after being scheduled for reprocessing."""
+    full = long_id(259)
+    mail_arrivals.record(conn, [arrival(full[:255])], now="x")
+    mail_arrivals.mark_enriched(conn, full, "2026-08-13 09:05:00")
+    assert mail_arrivals.clear_enrichment(conn, [full]) == 1
+    assert mail_arrivals.get(conn, full[:255]).enriched_at is None
+
+
+def test_match_key_leaves_an_ordinary_id_alone(conn):
+    """Every real Message-ID is far shorter than the cut, so this must be the identity function for
+    all but the pathological ones."""
+    assert mail_arrivals.match_key("<a@x>") == "<a@x>"
+    assert mail_arrivals.match_key("") == ""
+    assert mail_arrivals.match_key(long_id(255)) == long_id(255)
+    assert mail_arrivals.match_key(long_id(259)) == long_id(259)[:255]
+
+
+def test_a_lost_message_can_be_written_off_and_then_stops_counting(conn):
+    """The only way this queue can reach zero. No run can read a message the mailbox no longer
+    has, so without a person's decision the count is permanent — and a number that cannot reach
+    zero stops being read, which is the failure mode `recoverable_count` exists to avoid."""
+    mail_arrivals.record(conn, [arrival()], now="x")
+    mail_arrivals.mark_missing(conn, ["<a@x>"], "2026-09-03T13:51:11Z")
+    assert mail_arrivals.pending_count(conn) == 1, "still shown while nobody has accepted the loss"
+
+    assert mail_arrivals.acknowledge(conn, "<a@x>", "2026-09-05 20:00:00") == 1
+    assert mail_arrivals.pending_count(conn) == 0
+    assert mail_arrivals.pending(conn) == []
+
+
+def test_writing_off_is_only_offered_for_mail_that_is_actually_gone(conn):
+    """"I accept this one is gone", not "hide this from me". A message still in the mailbox is
+    going to be read by the next run; letting it be dismissed would turn a row that clears itself
+    into one that is invisible for ever."""
+    mail_arrivals.record(conn, [arrival()], now="x")
+    assert mail_arrivals.acknowledge(conn, "<a@x>", "2026-09-05 20:00:00") == 0
+    assert mail_arrivals.pending_count(conn) == 1
+
+
+def test_writing_off_the_same_message_twice_changes_nothing(conn):
+    """Two presses of one button, or a refresh of the POST. The second must be a no-op rather than
+    re-stamping a later date over the moment the decision was actually taken."""
+    mail_arrivals.record(conn, [arrival()], now="x")
+    mail_arrivals.mark_missing(conn, ["<a@x>"], "2026-09-03T13:51:11Z")
+    assert mail_arrivals.acknowledge(conn, "<a@x>", "2026-09-05 20:00:00") == 1
+    assert mail_arrivals.acknowledge(conn, "<a@x>", "2026-09-06 09:00:00") == 0
+    assert mail_arrivals.get(conn, "<a@x>").acknowledged_at == "2026-09-05 20:00:00"
+
+
+def test_a_written_off_message_is_never_fetched_again(conn):
+    """It is gone and a person has said so. Handing it back to the by-id recovery would spend a
+    Graph request per run for ever on a message nobody expects to find."""
+    mail_arrivals.record(conn, [arrival()], now="x")
+    mail_arrivals.mark_missing(conn, ["<a@x>"], "2026-09-03T13:51:11Z")
+    mail_arrivals.acknowledge(conn, "<a@x>", "2026-09-05 20:00:00")
+    assert mail_arrivals.unreachable(conn, 10) == []
+
+
+def test_the_pending_join_is_indexed(conn):
+    """A plan test, because the difference is not subtle: joining on `substr(email_id, 1, 255)`
+    without `ix_email_log_id_key` makes SQLite scan `email_log` once per arrival row — measured on
+    the live store at **925ms against 0.7ms**, on the query `/ui/version` runs every ten seconds in
+    every open tab."""
+    plan = " ".join(
+        row[3] for row in
+        conn.execute(f"EXPLAIN QUERY PLAN SELECT COUNT(*) {mail_arrivals._PENDING_WHERE}"))
+    assert "SEARCH e" in plan, plan
+    assert "SCAN e" not in plan, plan
+
+
 def test_enrichment_is_not_re_stamped(conn):
     """The pipeline can process a message more than once. The first read is when it stopped being
     unread, and moving the stamp later would misreport how long it waited."""
@@ -170,16 +292,51 @@ def test_the_arrival_poll_has_its_own_watermark(conn):
     metadata and writes no verdict. If it advanced the ingest watermark, the pipeline's next
     listing would start *after* mail the pipeline had never read, and that mail would never be
     processed by anything. Silently."""
-    state_db.advance_arrivals_watermark(conn, "2026-08-13T12:00:00Z")
-    assert state_db.get_arrivals_watermark(conn) == "2026-08-13T12:00:00Z"
+    state_db.advance_arrivals_watermark(conn, "inbox", "2026-08-13T12:00:00Z")
+    assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-13T12:00:00Z"
     assert state_db.get_watermark(conn) is None
     assert state_db.ARRIVALS_WATERMARK_KEY != state_db.WATERMARK_KEY
 
 
 def test_the_arrival_watermark_never_moves_backwards(conn):
-    state_db.advance_arrivals_watermark(conn, "2026-08-13T12:00:00Z")
-    state_db.advance_arrivals_watermark(conn, "2026-08-01T00:00:00Z")
-    assert state_db.get_arrivals_watermark(conn) == "2026-08-13T12:00:00Z"
+    state_db.advance_arrivals_watermark(conn, "inbox", "2026-08-13T12:00:00Z")
+    state_db.advance_arrivals_watermark(conn, "inbox", "2026-08-01T00:00:00Z")
+    assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-13T12:00:00Z"
+
+
+def test_each_folder_keeps_its_own_watermark(conn):
+    """One marker per folder, never one shared.
+
+    `_list` fetches a single un-paginated page per folder, so a folder that fills its page has mail
+    below the cut that was never listed. A shared marker advanced to the max across folders would
+    step over that mail the moment any *other* folder returned something newer.
+    """
+    state_db.advance_arrivals_watermark(conn, "inbox", "2026-08-24T11:42:03Z")
+    assert state_db.get_arrivals_watermark(conn, "junkemail") is None, \
+        "a folder we have not listed must start from None, not from another folder's progress"
+
+    state_db.advance_arrivals_watermark(conn, "junkemail", "2026-08-24T11:28:30Z")
+    assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-24T11:42:03Z"
+    assert state_db.get_arrivals_watermark(conn, "junkemail") == "2026-08-24T11:28:30Z"
+
+
+def test_only_the_inbox_inherits_the_legacy_watermark(conn):
+    """The legacy `arrivals_watermark` described the Inbox and nothing else.
+
+    Letting Junk inherit it is not a cosmetic mistake. When Junk was added the legacy marker stood
+    at 11:42:03Z and the one message in Junk — an Authority Inbound Notification for a live PO —
+    had arrived at 11:28:30Z. Inheriting would have put the very mail that prompted the change
+    permanently behind the window, and the poll would have reported success while listing nothing.
+    """
+    state_db.set_ingest_state(conn, state_db.ARRIVALS_WATERMARK_KEY, "2026-08-24T11:42:03Z")
+
+    assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-24T11:42:03Z"
+    assert state_db.get_arrivals_watermark(conn, "junkemail") is None
+
+    # And once the folder has its own marker, the legacy value stops mattering to it entirely.
+    state_db.advance_arrivals_watermark(conn, "inbox", "2026-08-25T00:00:00Z")
+    assert state_db.get_ingest_state(conn, state_db.arrivals_watermark_key("inbox")) \
+        == "2026-08-25T00:00:00Z"
 
 
 def test_the_listing_window_is_backdated(conn):
@@ -204,13 +361,29 @@ class _FakeResponse:
         return self._payload
 
 
-def _graph_returning(monkeypatch, value, seen):
+def _graph_returning(monkeypatch, value, seen, per_folder=None):
+    """Stub Graph's listing. `seen` keeps the last call *and* every call.
+
+    `seen["calls"]` is a list because the poll now makes one GET per source folder, and a helper
+    that only remembered the last one could not tell "both folders were listed" from "the second
+    folder was listed twice" — which is the whole thing worth asserting here.
+
+    `per_folder` maps a folder name to its own payload, for the tests that need the two folders to
+    return different mail. Without it every folder returns `value`.
+    """
     import requests
+
+    seen.setdefault("calls", [])
 
     def fake_get(url, headers=None, params=None, timeout=None):
         seen["url"] = url
         seen["params"] = params
-        return _FakeResponse({"value": value})
+        seen["calls"].append({"url": url, "params": params})
+        payload = value
+        if per_folder is not None:
+            folder = url.rsplit("/mailFolders/", 1)[-1].split("/")[0]
+            payload = per_folder.get(folder, [])
+        return _FakeResponse({"value": payload})
 
     monkeypatch.setattr(requests, "get", fake_get)
     monkeypatch.setattr(arrivals.inbox_reader, "_token", lambda: "token")
@@ -221,14 +394,14 @@ def test_a_poll_records_what_it_lists_and_advances_only_its_own_watermark(tmp_pa
     _graph_returning(monkeypatch, [{
         "internetMessageId": "<live@premier>",
         "receivedDateTime": "2026-08-13T09:00:00Z",
-        "subject": "PO 208491 delivered",
+        "subject": "PO 908491 delivered",
         "from": {"emailAddress": {"address": "wh@vendor.com"}},
         "hasAttachments": True,
     }], seen)
     monkeypatch.setattr(arrivals.settings, "GRAPH_TENANT_ID", "t", raising=False)
     monkeypatch.setattr(arrivals.settings, "GRAPH_CLIENT_ID", "c", raising=False)
     monkeypatch.setattr(arrivals.settings, "GRAPH_CLIENT_SECRET", "s", raising=False)
-    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@premierpm.com",
+    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@example-pm.test",
                         raising=False)
 
     db = tmp_path / "live.sqlite3"
@@ -238,10 +411,10 @@ def test_a_poll_records_what_it_lists_and_advances_only_its_own_watermark(tmp_pa
     conn = state_db.get_connection(db)
     try:
         row = mail_arrivals.get(conn, "<live@premier>")
-        assert row.subject == "PO 208491 delivered"
+        assert row.subject == "PO 908491 delivered"
         assert row.has_attachments is True
         assert row.enriched_at is None
-        assert state_db.get_arrivals_watermark(conn) == "2026-08-13T09:00:00Z"
+        assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-13T09:00:00Z"
         assert state_db.get_watermark(conn) is None, "the ingest watermark must not move"
     finally:
         conn.close()
@@ -254,13 +427,110 @@ def test_a_poll_asks_for_metadata_only_and_one_page(tmp_path, monkeypatch):
     _graph_returning(monkeypatch, [], seen)
     for name in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET"):
         monkeypatch.setattr(arrivals.settings, name, "x", raising=False)
-    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@premierpm.com",
+    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@example-pm.test",
                         raising=False)
 
     arrivals.poll_once(db_path=tmp_path / "live.sqlite3")
     assert "body" not in seen["params"]["$select"]
-    assert seen["params"]["$top"] == arrivals.PAGE_SIZE
-    assert "/mailFolders/Inbox/messages" in seen["url"]
+    # Per folder, not shared: a busy Inbox must not be able to crowd Junk out of its own page.
+    assert all(call["params"]["$top"] == arrivals.PAGE_SIZE for call in seen["calls"])
+
+    listed = [call["url"] for call in seen["calls"]]
+    assert len(listed) == len(arrivals.settings.MAILBOX_SOURCE_FOLDERS)
+    for folder in arrivals.settings.MAILBOX_SOURCE_FOLDERS:
+        assert any(f"/mailFolders/{folder}/messages" in url for url in listed), \
+            f"{folder} was never listed"
+
+
+def test_a_poll_reads_junk_and_says_where_each_message_came_from(tmp_path, monkeypatch):
+    """Exchange junked an Authority Inbound Notification for PO 912614 on 2026-08-24 and the
+    pipeline could not see it: both readers named `Inbox` in their URLs, so the message left no row
+    anywhere at all.
+
+    Recording *which* folder is half the point. Pulling Junk in silently would fix this pipeline
+    and leave nobody able to see that Premier's tenant files warehouse mail as spam — which is
+    where the real fix belongs.
+    """
+    seen = {}
+    _graph_returning(monkeypatch, None, seen, per_folder={
+        "inbox": [{
+            "internetMessageId": "<clean@premier>",
+            "receivedDateTime": "2026-08-24T11:29:59Z",
+            "subject": "249305 - Inbound Notification - 906993",
+            "from": {"emailAddress": {"address": "wh@vendor.com"}},
+            "hasAttachments": True,
+        }],
+        "junkemail": [{
+            "internetMessageId": "<junked@premier>",
+            "receivedDateTime": "2026-08-24T11:28:30Z",
+            "subject": "249304 - Inbound Notification - 912614",
+            "from": {"emailAddress": {"address": "wh@vendor.com"}},
+            "hasAttachments": False,
+        }],
+    })
+    for name in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET"):
+        monkeypatch.setattr(arrivals.settings, name, "x", raising=False)
+    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@example-pm.test",
+                        raising=False)
+
+    db = tmp_path / "live.sqlite3"
+    outcome = arrivals.poll_once(db_path=db)
+    assert outcome.ok and outcome.new == 2 and outcome.listed == 2
+
+    conn = state_db.get_connection(db)
+    try:
+        assert mail_arrivals.get(conn, "<clean@premier>").source_folder == "inbox"
+        assert mail_arrivals.get(conn, "<junked@premier>").source_folder == "junkemail"
+        # Each folder's own progress, not one shared marker taking the newer of the two.
+        assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-24T11:29:59Z"
+        assert state_db.get_arrivals_watermark(conn, "junkemail") == "2026-08-24T11:28:30Z"
+    finally:
+        conn.close()
+
+
+def test_one_folder_failing_does_not_cost_the_others(tmp_path, monkeypatch):
+    """Junk was added to a watch that had read the Inbox reliably for weeks.
+
+    Letting a permissions error on the new folder take the Inbox down with it would make the change
+    strictly worse than not making it — so a folder that raises is reported and the rest still run.
+    """
+    import requests
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if "/mailFolders/junkemail/" in url:
+            raise RuntimeError("ErrorAccessDenied")
+        return _FakeResponse({"value": [{
+            "internetMessageId": "<clean@premier>",
+            "receivedDateTime": "2026-08-24T11:29:59Z",
+            "subject": "249305 - Inbound Notification - 906993",
+            "from": {"emailAddress": {"address": "wh@vendor.com"}},
+            "hasAttachments": True,
+        }]})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(arrivals.inbox_reader, "_token", lambda: "token")
+    for name in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET"):
+        monkeypatch.setattr(arrivals.settings, name, "x", raising=False)
+    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@example-pm.test",
+                        raising=False)
+
+    db = tmp_path / "live.sqlite3"
+    outcome = arrivals.poll_once(db_path=db)
+
+    assert outcome.ok, "the Inbox answered, so the poll is not a total failure"
+    assert outcome.new == 1
+    # The error still travels: a watch quietly reading one folder fewer than it is configured for
+    # is exactly the silence this change exists to end.
+    assert "junkemail" in outcome.error and "ErrorAccessDenied" in outcome.error
+
+    conn = state_db.get_connection(db)
+    try:
+        assert mail_arrivals.get(conn, "<clean@premier>") is not None
+        # The failed folder's marker must not move — it listed nothing.
+        assert state_db.get_arrivals_watermark(conn, "junkemail") is None
+        assert state_db.get_arrivals_watermark(conn, "inbox") == "2026-08-24T11:29:59Z"
+    finally:
+        conn.close()
 
 
 def test_a_message_without_a_stable_id_is_skipped(tmp_path, monkeypatch):
@@ -271,7 +541,7 @@ def test_a_message_without_a_stable_id_is_skipped(tmp_path, monkeypatch):
                      seen)
     for name in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET"):
         monkeypatch.setattr(arrivals.settings, name, "x", raising=False)
-    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@premierpm.com",
+    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@example-pm.test",
                         raising=False)
 
     outcome = arrivals.poll_once(db_path=tmp_path / "live.sqlite3")
@@ -290,7 +560,7 @@ def test_a_poll_that_cannot_reach_graph_reports_instead_of_raising(tmp_path, mon
     monkeypatch.setattr(arrivals.inbox_reader, "_token", lambda: "token")
     for name in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET"):
         monkeypatch.setattr(arrivals.settings, name, "x", raising=False)
-    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@premierpm.com",
+    monkeypatch.setattr(arrivals.settings, "GRAPH_MAILBOX_ADDRESS", "r@example-pm.test",
                         raising=False)
 
     outcome = arrivals.poll_once(db_path=tmp_path / "live.sqlite3")
@@ -445,12 +715,12 @@ def test_an_arrival_shows_on_the_mail_page_before_anything_has_read_it(mail_page
     path, client = mail_page
     conn = state_db.get_connection(path)
     try:
-        mail_arrivals.record(conn, [arrival(subject="PO 208491 delivered")], now="x")
+        mail_arrivals.record(conn, [arrival(subject="PO 908491 delivered")], now="x")
     finally:
         conn.close()
 
     body = client.get("/ui/mails").text
-    assert "PO 208491 delivered" in body
+    assert "PO 908491 delivered" in body
     assert "not read yet" in body
     assert "arrived and not yet read by the pipeline" in body
 
@@ -461,14 +731,17 @@ def test_an_arrival_the_pipeline_has_read_stops_being_listed_as_waiting(mail_pag
     path, client = mail_page
     conn = state_db.get_connection(path)
     try:
-        mail_arrivals.record(conn, [arrival(subject="PO 208491 delivered")], now="x")
+        mail_arrivals.record(conn, [arrival(subject="PO 908491 delivered")], now="x")
         log_verdict(conn)
     finally:
         conn.close()
 
     body = client.get("/ui/mails").text
     assert "not read yet" not in body
-    assert "Nothing unprocessed" in body
+    # "waiting to be read", not "unprocessed": the headline counts what the automation still has to
+    # do. Mail that has left the mailbox is not waiting for anything, and counting it there made a
+    # figure that could never reach zero.
+    assert "Nothing waiting to be read" in body
 
 
 def test_the_mail_page_is_searchable_over_an_arrival(mail_page):

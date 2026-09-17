@@ -34,7 +34,7 @@ hand-written JSON fixtures only.
   the Spitfire receipt from carrier/tracking. Every real record would flag "missing POD date"
   and stage a receipt with no carrier/PRO.
 - **C4 [NEW] `PO_TOKEN_REGEX` is case-sensitive and format-brittle**
-  (`config/settings.py:27`): `po 213987`, `PO# 213987`, `P.O. 213987`, `PO: 213987` all miss →
+  (`config/settings.py:27`): `po 913987`, `PO# 913987`, `P.O. 913987`, `PO: 913987` all miss →
   fall through to rule 6 → exception route.
 - **C5 [NEW] Graph folder-scoped `id` used as the dedupe key** (`connectors/mailbox.py:132`)
   instead of `internetMessageId` (not even in `$select`). Moving a message changes its id →

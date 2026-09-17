@@ -1,0 +1,64 @@
+PROPRIETARY AND CONFIDENTIAL
+
+Copyright (c) 2026 Ashford Inc. and its affiliated companies, including Premier.
+All rights reserved.
+
+-------------------------------------------------------------------------------
+ENTITY NAME REQUIRES CONFIRMATION BEFORE MERGE
+-------------------------------------------------------------------------------
+The copyright holder above is stated as Ashford Inc. and its affiliates because
+the Ashford GitHub Repository and Developer Standards v1.5 establish that Ashford
+owns the GitHub organization while individual companies own their solutions, and
+because the escalation address of record is AshfordIT@Ashfordinc.com. No legal
+entity name is recorded anywhere in this repository.
+
+Confirm the correct registered entity with Legal, and with Ayotunde Gibbs or
+Henry Noel, before this file is merged. A licence naming the wrong holder is
+worse than no licence at all. This notice is removed once the entity is
+confirmed.
+-------------------------------------------------------------------------------
+
+This software and its accompanying documentation are the confidential and
+proprietary property of the copyright holder. They are made available solely to
+authorised employees, contractors and approved partners for the purpose of
+operating and maintaining the Premier receiver-automation solution.
+
+No part of this repository may be copied, reproduced, modified, published,
+distributed, sublicensed, sold, disclosed to any third party, or used to create
+a derivative work, in whole or in part, by any means, without the prior written
+permission of the copyright holder.
+
+Access to this repository does not grant any licence, right, title or interest in
+the software, in any trademark, or in any other intellectual property of the
+copyright holder, whether by implication, estoppel or otherwise.
+
+Contributors assign all right, title and interest in their contributions to the
+copyright holder. Contributions are governed by CONTRIBUTING.md and by the
+Ashford GitHub Repository and Developer Standards.
+
+This repository is classified Risk Tier: Critical, Data Classification:
+Confidential. It integrates with systems that hold confidential business and
+financial information. Handling obligations are set out in SECURITY.md and in
+docs/data-handling.md, and they survive termination of employment or engagement.
+
+THIRD-PARTY COMPONENTS
+
+This software depends on third-party open-source packages that remain subject to
+their own licences. Those licences are not superseded by this notice and are
+documented, with each package's purpose, in the project technology-stack record.
+
+Two dependencies carry copyleft terms and require legal review before this
+software is distributed outside the copyright holder and its affiliates:
+
+  extract-msg   GNU General Public License v3.0
+  RTFDE         GNU Lesser General Public License v3.0
+
+All other current dependencies are under permissive licences (MIT, BSD-3-Clause,
+Apache-2.0 or MIT-CMU).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

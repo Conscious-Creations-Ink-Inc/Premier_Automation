@@ -10,12 +10,12 @@ answer. The corpus has FedEx Freight PODs; the field grammar below is written fr
     Service type: FedEx Freight Priority
     Tracking number: 7497809572     Ship Date: Sep 5, 2025
     Weight: 392.0 LB/177.97 KG
-    Purchase Order 31457971,210634,49985 : 1
+    Purchase Order 91457971,910634,99985 : 1
 
 That last line is the trap and the prize. It is labelled "Purchase Order" but holds three
-different identifiers comma-joined — the carrier's own reference, the **PO** (210634), and the
-Authority shipment number with its leg suffix (49985 : 1). Taking the field at its label gives
-`31457971` as the PO; taking the six-digit token gives the right answer *and* the shipment
+different identifiers comma-joined — the carrier's own reference, the **PO** (910634), and the
+Authority shipment number with its leg suffix (99985 : 1). Taking the field at its label gives
+`91457971` as the PO; taking the six-digit token gives the right answer *and* the shipment
 number that ties this POD to the notification that announced it.
 
 Values sit on the same line as their label and several labels share a line, so each field is
@@ -50,7 +50,7 @@ _CARRIER_PATTERNS = [
     (re.compile(r"\bold\s*dominion\b", re.IGNORECASE), "Old Dominion"),
     (re.compile(r"\bestes\b", re.IGNORECASE), "Estes"),
     (re.compile(r"\bglobaltranz\b", re.IGNORECASE), "GlobalTranz"),
-    (re.compile(r"\bnolan\s+transportation\b", re.IGNORECASE), "Nolan Transportation"),
+    (re.compile(r"\bnolan\s+transportation\b", re.IGNORECASE), "Example Freight"),
 ]
 
 
@@ -114,7 +114,7 @@ def parse_pod(text: str) -> Optional[PodDocument]:
     tracking = _field(text, "tracking number")
     document.tracking_numbers = tokens.parse_tracking_numbers(tracking)
 
-    # "Purchase Order 31457971,210634,49985 : 1" — split rather than trusted whole.
+    # "Purchase Order 91457971,910634,99985 : 1" — split rather than trusted whole.
     reference = _field(text, "purchase order") or _field(text, "reference") or _field(text, "po number")
     document.po_numbers, document.other_references = tokens.split_reference_field(reference)
 

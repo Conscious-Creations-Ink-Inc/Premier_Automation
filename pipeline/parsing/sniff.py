@@ -2,11 +2,11 @@
 
 Two facts from the real corpus force this:
 
-1. `.msg` attachments frequently carry `mimetype=None` (e.g. `Cameo Receivers.xlsx` and the
+1. `.msg` attachments frequently carry `mimetype=None` (e.g. `Property Receivers.xlsx` and the
    3 MB `IMG_2479.jpeg` phone photos both arrive with no content type at all), so a
    content-type-only dispatch — what stage3 did before — silently drops them.
 2. Filenames lie. `5star Fabric Verification Response.msg` carries two PDFs,
-   `210634 - P. Kaufmann FedEx POD.pdf` and
+   `910634 - P. Kaufmann FedEx POD.pdf` and
    `FedEx 884603885067  GR-350d-WTF 78 yards from Daniel Stuart.pdf`, that are byte-identical
    (20535 bytes each) — one of the two names is simply wrong.
 

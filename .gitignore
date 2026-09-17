@@ -10,6 +10,9 @@ venv/
 .env.*.local
 *.log
 .pytest_cache/
+/tiers.json
+/fn_candidates.json
+
 
 # Editors
 .vscode/
@@ -30,3 +33,40 @@ state/spitfire_cassettes/
 # The real values behind docs/ACCESS.md. .env stays the only file the code reads; this one exists
 # so a person has somewhere to look them all up at once.
 ACCESS.local.md
+
+# --- Added for the Ashford handover (Standards v1.5 §9) ----------------------
+# The whole state tree, not just attachments. It holds real client proof-of-delivery
+# documents, recovered mail bodies and the pipeline databases. Several gigabytes of
+# confidential client data. Never `git add -f` anything under here.
+state/
+!state/.gitkeep
+
+# Generated reports and internal delivery artifacts. These are Conscious Creations
+# working documents, not source, and some name Premier staff and access posture.
+dev_reports/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# The local-only corpus harness. It runs Premier's real .msg mail through the real pipeline and
+# therefore names real messages to select them; it cannot be committed and could never run in CI.
+# See tests/local_corpus/README.md.
+tests/local_corpus/
+
+# The corpus runner belongs with the local harness: its EXPECTED table encodes the real PO numbers
+# and filenames of Premier's actual mail, message by message. Anonymising it makes the harness
+# score against values the corpus never returns. See tests/local_corpus/README.md.
+tools/run_corpus.py

@@ -159,7 +159,7 @@ def main() -> int:
     args = ap.parse_args()
 
     env = load_env()
-    base = env.get("SPITFIRE_BASE_URL", "https://training.remingtonhotels.com/Training")
+    base = env.get("SPITFIRE_BASE_URL", "https://spitfire-host.test/instance")
     cookie = env.get("SPITFIRE_SESSION_COOKIE", "")
     out = Path(args.out) if args.out else ROOT.parent / "dev_reports" / "spitfire_capture"
     out.mkdir(parents=True, exist_ok=True)

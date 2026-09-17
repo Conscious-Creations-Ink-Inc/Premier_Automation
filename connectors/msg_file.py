@@ -15,7 +15,7 @@ Three things the corpus forced:
   Notification `.msg`, which carries the two FedEx POD PDFs. Losing the recursion loses the PODs.
 * **Null-terminated filenames.** `extract_msg` hands back `"image.png\\x00"`; left alone, the
   null propagates into filenames, logs and JSON.
-* **Missing MIME types.** `Cameo Receivers.xlsx` and the phone photos arrive with
+* **Missing MIME types.** `Property Receivers.xlsx` and the phone photos arrive with
   `mimetype=None`, so the content type is filled in from a byte sniff instead.
 """
 
@@ -27,7 +27,7 @@ from typing import List, Optional, Set
 import extract_msg
 
 from connectors.mailbox import Mailbox
-from pipeline import attachment_store
+from pipeline import attachment_ledger, attachment_store
 from pipeline.models import Attachment, RawEmail
 from pipeline.parsing import sniff
 
@@ -183,7 +183,7 @@ class MsgFileMailbox(Mailbox):
         self,
         message,
         depth: int,
-        seen_digests: Optional[set] = None,
+        seen_digests: Optional[dict] = None,
         container_path: str = "",
     ) -> List[Attachment]:
         """Flatten the attachment tree into one list.
@@ -203,7 +203,7 @@ class MsgFileMailbox(Mailbox):
         same bytes.
         """
         if seen_digests is None:
-            seen_digests = set()
+            seen_digests = {}
 
         if depth > MAX_NESTING_DEPTH:
             _logger.warning("nesting deeper than %s at %r — stopping recursion",
@@ -262,14 +262,20 @@ class MsgFileMailbox(Mailbox):
             # saved under different names. The duplicate is still reported so the ledger shows
             # both slots and which one was actually read.
             if attachment.drop_hint is None and result.sha256 in seen_digests:
-                attachment.drop_hint = f"duplicate:{result.sha256[:12]}"
+                # Compared by name before it is dropped. The drop is right either way; the question
+                # is whether anyone hears about it. See `attachment_ledger.duplicate_drop_hint`.
+                attachment.drop_hint = attachment_ledger.duplicate_drop_hint(
+                    filename, seen_digests[result.sha256], result.sha256)
 
             if attachment.drop_hint is None:
-                seen_digests.add(result.sha256)
+                seen_digests[result.sha256] = filename
             else:
                 # Kept before it is released, for the reason set out in `GraphMailbox._to_attachment`:
-                # a decorative misclassification must not be able to destroy a photographed POD.
-                attachment_store.put(attachment.content_bytes)
+                # a misclassification must not be able to destroy a photographed POD. `keeps_bytes`
+                # carves out the one case where that is not worth the disk -- a signature logo --
+                # and `PREMIER_STORE_DECORATIVE=1` takes the carve-out back.
+                if attachment_ledger.keeps_bytes(attachment.drop_hint):
+                    attachment_store.put(attachment.content_bytes)
                 attachment.content_bytes = b""   # metadata is enough for a dropped attachment
 
             collected.append(attachment)
@@ -303,7 +309,7 @@ class MsgFileMailbox(Mailbox):
 
 
 def _extract_address(raw: str) -> str:
-    """`'"Gutierrez, Maria" <MariaGutierrez@premierpm.com>'` -> the address, lowercased."""
+    """`'"Rivera, Alex" <ARivera@example-pm.test>'` -> the address, lowercased."""
     if not raw:
         return ""
     if "<" in raw and ">" in raw:

@@ -9,10 +9,24 @@ _COLUMNS = (
     "quantity_received", "unit_of_measure", "pod_stated_date", "email_date", "delivery_location",
     "comments", "extraction_source", "extraction_confidence", "raw_snippet",
     "po_line_number", "received_by", "package_quantity", "package_uom", "notification_number",
+    "quantity_ordered",
+    # Which attachment the record was read from. Stored so the document can be attached to the
+    # receipt as its proof when no carrier POD resolves — see `spitfire_post._pod_for`.
+    "source_ledger_id",
 )
 # Every field on ExtractedRecord must appear here — a field the record carries but the store
 # does not is silently lost between Stage 3 and Stage 4. `test_models.py` asserts the two stay
 # in step so adding a model field without a column fails loudly instead of quietly.
+
+_NOT_PERSISTED = frozenset({
+    # A model field is either stored, or listed here with the reason it is not — the parity check
+    # in `test_models.py` holds either way.
+    #
+    # Set when a more accurate copy of the same document superseded this record. It is written to
+    # the row's `status`, not to a column of its own.
+    "superseded_by_ledger_id",
+})
+"""Model fields deliberately kept in memory. Adding to this set is a decision, not a shortcut."""
 
 
 # Row metadata a caller may set at insert time. These are *not* extraction facts and so are
@@ -23,12 +37,36 @@ _EXTRA_COLUMNS = frozenset({
     "origin", "created_by", "manual_note",
     "pod_ledger_id", "pod_source", "pod_waived_by", "pod_waived_at",
     "delivery_key",
+    # Which delivery this item line arrived on — `deliveries.id`. Row metadata rather than a field
+    # of `ExtractedRecord`, for the same reason `origin` is: an adapter reads an item off a
+    # document and cannot know which delivery the orchestrator will attribute it to.
+    "delivery_id",
 })
 
 
+SUPERSEDED = "superseded"
+"""Staged, kept, and not offered as work.
+
+A message routinely carries the same document twice — Atlas sends the receiving report its system
+generated *and* a scan of the signed copy, and both are read. The scan's read is the poorer one:
+handwriting, checkbox tokens, the freight bill and packing slip bound in behind it. Both used to
+stage records, so a clean four-line parse arrived on the page beside a set of mangled twins and a
+person had to tell them apart by eye.
+
+The lower-fidelity records are not deleted — they are evidence that a second document said
+something, and the file behind them may still be the proof of delivery. They are staged with this
+status, which keeps them out of the manual queue and out of the ready set, and their `comments`
+name the copy that superseded them.
+"""
+
+
 def write_pending(conn: sqlite3.Connection, record: ExtractedRecord, now: str,
-                  extra: Optional[Mapping[str, object]] = None) -> int:
+                  extra: Optional[Mapping[str, object]] = None,
+                  status: str = "pending") -> int:
     """Inserts one ExtractedRecord as a 'pending' row — the Stage 3/4 hand-off. Returns the new row id.
+
+    `status` is almost always the default. `SUPERSEDED` is the exception: a record read from a
+    less accurate copy of a document another attachment on the same message states better.
 
     `extra` carries row metadata alongside the record's own fields, in exactly the way `status` and
     `created_at` already are: written here, not modelled on `ExtractedRecord`. An unknown key is a
@@ -48,8 +86,8 @@ def write_pending(conn: sqlite3.Connection, record: ExtractedRecord, now: str,
     placeholders = ", ".join(["?"] * len(columns))
     cursor = conn.execute(
         f"INSERT INTO extracted_records ({', '.join(columns)}, status, created_at) "
-        f"VALUES ({placeholders}, 'pending', ?)",
-        tuple(values) + (now,),
+        f"VALUES ({placeholders}, ?, ?)",
+        tuple(values) + (status, now),
     )
     conn.commit()
     return cursor.lastrowid

@@ -1,16 +1,19 @@
+import re
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from rapidfuzz import fuzz
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from config import settings
 from connectors.mailbox import Mailbox
 from pipeline import (
-    attachment_ledger, dedupe, email_log, evidence, extracted_records_store, mail_arrivals,
+    attachment_ledger, dedupe, deliveries_store, email_log, evidence, extracted_records_store,
+    mail_arrivals,
     stage2_accumulate, state_db)
 from pipeline.models import DeliveryEvent, ExtractedRecord, TriageCategory
 from pipeline.stage1_ingest import fetch_new_emails
-from pipeline.parsing import text
+from pipeline.parsing import confirmation, items, text
 from pipeline.stage1_triage import triage
 from pipeline.stage3_extract import containers, dispatch
 from pipeline.stage3_extract.base import ExtractionAdapter, ExtractionSource
@@ -116,6 +119,8 @@ def _log_email(conn, email, triaged, folder: str, now: str, *, evidence=None, er
             folder=folder,
             error_type=type(error).__name__ if error else None,
             processed_at=now,
+            source_folder=getattr(email, "source_folder", "") or "",
+            not_a_delivery=bool(triaged.not_a_delivery) if triaged else False,
         )
     except Exception as e:
         _log(f"email_log write failed for {email.email_id}: {e}")
@@ -235,13 +240,13 @@ def run_adapters(source: ExtractionSource, adapters: Optional[List[ExtractionAda
     return []
 
 
-def _sources_for_delivery_event(event: DeliveryEvent) -> List[ExtractionSource]:
+def _sources_for_delivery_event(event: DeliveryEvent, evidence_cache=None) -> List[ExtractionSource]:
     """Body + every attachment, independently — each bundled email in the event contributes
     its own sources (see ORCHESTRATOR_DESIGN.md).
 
     Every source carries the event's PO in `only_po`, plus the email's sender and subject. The
-    PO filter is what stops a multi-PO document being staged once per PO: notice 239260 covers
-    206725 and 207665, releases as two events, and without the filter each event staged all
+    PO filter is what stops a multi-PO document being staged once per PO: notice 939260 covers
+    906725 and 907665, releases as two events, and without the filter each event staged all
     thirteen of its lines (finding C1). Sender and subject are what let a vendor parser
     recognise the format at all.
     """
@@ -256,8 +261,13 @@ def _sources_for_delivery_event(event: DeliveryEvent) -> List[ExtractionSource]:
             "only_po": event.key.po_number,
         }
         if email.body_html or email.body_text:
+            # The body is where confirmation grids live, and a grid row may only be called received
+            # when something outside the grid says so. The orchestrator is the one layer holding
+            # both the message and its attachment ledger, so it is where "a proof of delivery names
+            # this PO" can be answered; the adapter reads the thread's own sentences itself.
             sources.append(ExtractionSource(
-                source_type="body", body_html=email.body_html, body_text=email.body_text, **common,
+                source_type="body", body_html=email.body_html, body_text=email.body_text,
+                receipt_evidence=_receipt_evidence_for(evidence_cache, email.email_id), **common,
             ))
         for att in email.attachments:
             if att.drop_hint:
@@ -270,22 +280,154 @@ def _sources_for_delivery_event(event: DeliveryEvent) -> List[ExtractionSource]:
     return sources
 
 
-def _belongs_to_event(record: ExtractedRecord, event: DeliveryEvent) -> bool:
-    """Second line of defence behind `only_po`.
+def _receipt_evidence_for(evidence_cache, email_id: str):
+    """The proof-of-delivery verdicts already recorded for this message, as `ReceiptEvidence`.
 
-    Adapters that cannot filter by PO themselves — a carrier POD names a PO but a free-text
-    pass may name none — still hand back records that must not be attributed to the wrong
-    delivery. A record with no PO is adopted by the event (it is evidence *for* this delivery,
-    which is why it was in the bundle) and stamped with the event's PO; a record naming a
-    different PO is dropped, because that PO has its own event.
+    `None` when there is no cache to ask — which the grid reader treats as "nothing is proven",
+    not as "anything goes". Under-claiming queues a mail for a person; over-claiming posts a
+    receiver for goods nobody received, and only one of those is recoverable.
     """
-    if not record.po_number:
-        record.po_number = event.key.po_number
-        return True
-    return record.po_number == event.key.po_number
+    bundle = evidence_cache.get(email_id) if evidence_cache is not None else None
+    if bundle is None:
+        return None
+    return confirmation.ReceiptEvidence(
+        pod_po_numbers=frozenset(bundle.pod_po_numbers or ()),
+    )
+
+
+def _pod_ledger_id_for(evidence_cache, record: ExtractedRecord):
+    """The `attachment_ledger` row of the proof of delivery naming this record's purchase order.
+
+    Read off the verdict the extraction pass already wrote, so the POD that identified the
+    delivery and the POD linked to its receipt are the same file by construction. `None` when
+    nothing on the message read as proof — which is a real and common state, and one the page must
+    be able to show as itself.
+    """
+    if evidence_cache is None or not record.po_number:
+        return None
+    bundle = evidence_cache.get(record.source_email_id)
+    if bundle is None:
+        return None
+    return bundle.pod_ledger_ids.get(record.po_number)
+
+
+def _candidate_pos_for_event(event: DeliveryEvent, evidence_cache) -> Set[str]:
+    """Every purchase order the messages behind this event could be talking about.
+
+    Both halves matter. The triage hints are what Stage 2 released events for; the purchase orders
+    the extracted records themselves name are what the *documents* say, and the two disagree
+    exactly when this goes wrong — the receiving report for RR 211373-29 prints two orders and its
+    covering mail hinted at one.
+    """
+    candidates: Set[str] = {event.key.po_number} if event.key.po_number else set()
+    for triaged in event.emails or []:
+        for hint in getattr(triaged, "extracted_po_hints", None) or []:
+            if hint:
+                candidates.add(hint)
+        email_id = getattr(getattr(triaged, "email", None), "email_id", None)
+        bundle = evidence_cache.get(email_id) if (evidence_cache and email_id) else None
+        for record in (getattr(bundle, "records", None) or []):
+            if record.po_number:
+                candidates.add(record.po_number)
+    return candidates
+
+
+def _record_for_event(record: ExtractedRecord, event: DeliveryEvent,
+                      candidate_pos: Set[str]) -> Optional[ExtractedRecord]:
+    """The record as it should be staged against this delivery, or None if it is not ours.
+
+    Second line of defence behind `only_po`. Adapters that cannot filter by PO themselves — a
+    carrier POD names a PO but a free-text pass may name none — still hand back records that must
+    not be attributed to the wrong delivery. A record naming a different PO is dropped, because
+    that PO has its own event.
+
+    **A record naming no PO is adopted only when the message has exactly one purchase order to
+    adopt it.** With two, adoption is a coin toss dressed up as a fact: the first event to run
+    claimed every unattributed line, so attribution depended on iteration order. On the receiving
+    report for RR 211373-29 that put seven item lines belonging to one order onto another — and
+    because the losing order never had an event at all, it received nothing. `tools/reextract.py`
+    and `tools/replay_parse.py` have always refused to guess here; this is the same rule, finally
+    in the live path. A refused line is left unstaged and surfaces on the queue as a message that
+    yielded nothing, which is recoverable; a receipt against the wrong purchase order is not.
+
+    Returns a **copy** when it stamps a PO. The evidence cache hands the same `ExtractedRecord`
+    instances to every event, so mutating one here rewrote what the next event would see.
+    """
+    if record.po_number:
+        return record if record.po_number == event.key.po_number else None
+    if len(candidate_pos) > 1:
+        return None
+    return replace(record, po_number=event.key.po_number)
 
 
 DESCRIPTION_MATCH_THRESHOLD = 85   # rapidfuzz token_set_ratio
+
+# Deciding two rows of ONE document are different items is a different question from the one above
+# and uses `parsing/items.py`, which owns that comparison. `record_completion` resolves a purchase
+# order line with the same helper, and the two must agree: a pair kept apart here and then resolved
+# onto one line afterwards would produce the double receipt this grouping exists to prevent.
+#
+# The threshold above keeps `token_set_ratio` on purpose — there the question is whether a
+# Delivered notice's terser wording names the Inbound's item, and "Custom Accessory Pocket" must
+# still find "Accessory Pocket" (100 by set, only 82 by sort).
+
+
+def _descriptions_conflict(left: ExtractedRecord, right: ExtractedRecord) -> bool:
+    """True only when one document names two different items under the same spec.
+
+    Two conditions, and both matter for a different reason.
+
+    **Same document.** Differing wording only means differing lines when it comes from one
+    document. Across sources it means nothing: the Authority notice calls line STE-402-LT-B
+    "BASE, Floor Lamp 2 (Linen Drum Shade) at Sectional" while the tracker spreadsheet beside it
+    calls the same line "Throw Pillow". Splitting on that would stage one physical line as two
+    receipts, which is the failure this whole grouping exists to prevent.
+
+    **Both stated.** A Delivered notice frequently names no item at all and must still collapse
+    onto the Inbound that does, so a missing description never separates anything.
+
+    Two distinct documents of the same kind share an `extraction_source` and so are treated as one
+    here. That errs toward routing to a person rather than toward silently merging two lines.
+    """
+    if (left.extraction_source or "") != (right.extraction_source or ""):
+        return False
+    if not items.normalise(left.item_description) or not items.normalise(right.item_description):
+        return False
+    return not items.same_item(left.item_description, right.item_description)
+
+
+def _place_in_spec_group(groups: Dict[Tuple, List[ExtractedRecord]],
+                         record: ExtractedRecord, spec: str) -> None:
+    """File a record under its spec, splitting the spec when descriptions say it is several lines.
+
+    A spec code is not always a line identity. PO 907514 carries **29 lines that all read
+    `LOB-900-SI`** — a signage package whose lines differ only by description ("Restroom Door
+    Placard", "Common Room ID", "Exit"). Grouping on `(PO, spec)` alone put all 23 delivered items
+    in one group, and `reconcile_cross_source_duplicates` — correctly refusing to choose between 12
+    different quantities for what it believed was one line — flagged every one of them
+    `+quantity_conflict`. Those 23, plus 21 more on PO 907249, were 35% of every record in the
+    store and the largest single category of manual work.
+
+    Measured against the mirror afterwards, 22 of those 23 matched a distinct Spitfire line by
+    description at a score of 100 *and* agreed with that line's ordered quantity. The refusal was
+    right; the grouping that provoked it was not.
+
+    A record joins the first sub-group holding nothing it contradicts, so records that genuinely
+    describe one line still meet. A record naming no item joins the first sub-group — it cannot
+    discriminate, and collapsing is the behaviour worth preserving when there is no evidence
+    either way.
+    """
+    ordinal = 0
+    while True:
+        key = ("spec", record.po_number, spec, ordinal)
+        members = groups.get(key)
+        if members is None:
+            groups[key] = [record]
+            return
+        if not any(_descriptions_conflict(record, member) for member in members):
+            members.append(record)
+            return
+        ordinal += 1
 
 
 def _group_records(records: List[ExtractedRecord]) -> Dict[Tuple, List[ExtractedRecord]]:
@@ -311,7 +453,7 @@ def _group_records(records: List[ExtractedRecord]) -> Dict[Tuple, List[Extracted
         # lookup; it is not an identity.
         spec = record.spec_code or record.parent_spec_code
         if spec:
-            groups.setdefault(("spec", record.po_number, spec), []).append(record)
+            _place_in_spec_group(groups, record, spec)
             continue
 
         description = (record.item_description or "").strip().lower()
@@ -355,6 +497,20 @@ def reconcile_cross_source_duplicates(records: List[ExtractedRecord]) -> List[Ex
         if len(group) == 1:
             result.append(group[0])
             continue
+        if _are_siblings_of_one_grid(group):
+            # Rows of one grid, not claims about one line. An Atlas receiving report lists
+            # GR-905-EQ three times — 210, 75 and 65 — because the item arrived on three skids;
+            # the fourth row is STE-901-EQ at 23, and the four sum to 373, exactly what the packing
+            # slip bound in behind them states was delivered. Reading those three numbers as a
+            # disagreement and flagging all of them was wrong twice over: nothing disagreed, and it
+            # put three rows in front of a person who had nothing to decide. 58 of the 66 flagged
+            # groups in the live store are one document like this.
+            #
+            # They are kept apart rather than summed. Whether three skids of one spec are one
+            # receipt line or three is a question about the receipt, not about the document, and it
+            # is settled downstream where the purchase-order line is known.
+            result.extend(group)
+            continue
         quantities = {r.quantity_received for r in group if r.quantity_received is not None}
         if len(quantities) <= 1:
             best = max(group, key=lambda r: r.extraction_confidence)
@@ -363,11 +519,267 @@ def reconcile_cross_source_duplicates(records: List[ExtractedRecord]) -> List[Ex
                 _log(f"discarded {len(discarded)} duplicate record(s) for {key}, kept source={best.extraction_source}")
             result.append(best)
         else:
+            # Disagreement. Where one side is delivery evidence and the other is a body grid, the
+            # evidence wins — but the row is still flagged, because the disagreement is the whole
+            # point. PO 910634 was staged at 196 from Premier's request table while the carrier's
+            # POD and the Authority notice both said 202; the thread itself explains the gap as
+            # "6 yards of overage". Keeping 196 silently is how a receiver goes out wrong, and
+            # keeping both rows puts two receipts on the page for one delivery.
+            evidenced = [r for r in group if _is_delivery_evidence(r)]
+            grid_only = [r for r in group if _is_confirmation_grid(r)]
+            if evidenced and grid_only:
+                best = max(evidenced, key=lambda r: r.extraction_confidence)
+                others = sorted({r.quantity_received for r in grid_only
+                                 if r.quantity_received is not None})
+                _log(f"quantity conflict for {key}: evidence says {best.quantity_received}, "
+                     f"grid says {others} — keeping the evidence, flagged for review")
+                best.extraction_source = best.extraction_source + "+quantity_conflict"
+                best.comments = "; ".join(part for part in (
+                    best.comments,
+                    f"quantity conflict: the request grid states {', '.join(str(q) for q in others)}"
+                ) if part)
+                result.append(best)
+                continue
             _log(f"quantity conflict across sources for {key}: {sorted(quantities)} — routing all, not guessing")
             for r in group:
-                r.extraction_source = r.extraction_source + "+quantity_conflict"
+                # Appended at most once. `EvidenceCache.records_for` hands back the *same* record
+                # objects every time it is asked, so an email whose mail fires several delivery
+                # events is reconciled several times over one object — and an unguarded concatenation
+                # wrote `ocr+quantity_conflict+quantity_conflict+quantity_conflict+quantity_conflict`
+                # into the live store. Every reader uses `in`, so it never changed a verdict, but it
+                # is a record of how many times a thing happened that only happened once.
+                if "quantity_conflict" not in (r.extraction_source or ""):
+                    r.extraction_source = r.extraction_source + "+quantity_conflict"
             result.extend(group)
-    return result
+    return _fold_pod_only_records(result)
+
+
+def _are_siblings_of_one_grid(group: List[ExtractedRecord]) -> bool:
+    """Whether these records are rows of a single grid on a single document.
+
+    Two records disagree only if they are two *claims*. Rows of one table are not claims about
+    each other — they are a list — and `reconcile_cross_source_duplicates` exists to settle
+    disagreement between sources, not to audit a document against itself.
+
+    `source_ledger_id` is what makes the distinction available: it names the attachment a record
+    was read from, so records sharing one came off the same read of the same file. A group where
+    it is unknown (a body grid, a hand-built record) is not treated as siblings — silence is not
+    evidence of sameness, and the cautious answer is the existing one.
+    """
+    ledger_ids = {r.source_ledger_id for r in group}
+    return len(ledger_ids) == 1 and None not in ledger_ids
+
+
+def _is_pod_only(record: ExtractedRecord) -> bool:
+    """A record that proves a delivery happened but names no line on it.
+
+    `records_from_pod` builds exactly this: a POD states a date, a signature, a carrier and a
+    tracking number, and deliberately no spec and no quantity, because it is evidence about a
+    *delivery* and not about which purchase-order lines were on the truck.
+    """
+    return (record.spec_code is None and record.quantity_received is None
+            and not (record.item_description or "").strip())
+
+
+_POD_EVIDENCE_FIELDS = ("pod_stated_date", "received_by", "carrier_name", "tracking_number",
+                        "delivery_location")
+
+
+def _fold_pod_only_records(records: List[ExtractedRecord]) -> List[ExtractedRecord]:
+    """Move a POD's evidence onto the lines it is evidence *for*, instead of staging it beside them.
+
+    A notification email carrying its own POD produced two records for one delivery: the line
+    (spec, quantity, description — complete, postable) and a POD-only twin with those three fields
+    null. `_group_records` keys the first on its spec and the second on an empty description, so
+    they never met, and the twin could never be completed from the document it came from.
+
+    The visible cost was worse than a spare row. The twin's gap list —
+    `missing: spec code, description, quantity` — was rendered against the *message* on the manual
+    queue, so PO 908705 read as unparsed on screen while its real record sat in Spitfire as a
+    posted receipt. Somebody looking at that page would reasonably conclude the parser cannot read
+    an Authority line table, which it does perfectly.
+
+    So the evidence fields are filled into the lines that lack them and the twin is dropped —
+    **only** when a line for the same PO actually exists. A POD arriving with no line to attach to
+    is the sole evidence there is and still stages on its own.
+    """
+    lines_by_po: Dict[str, List[ExtractedRecord]] = {}
+    for record in records:
+        if not _is_pod_only(record):
+            lines_by_po.setdefault(record.po_number or "", []).append(record)
+
+    kept: List[ExtractedRecord] = []
+    for record in records:
+        lines = lines_by_po.get(record.po_number or "") if _is_pod_only(record) else None
+        if not lines:
+            kept.append(record)
+            continue
+        for line in lines:
+            for field_name in _POD_EVIDENCE_FIELDS:
+                if not getattr(line, field_name, None):
+                    setattr(line, field_name, getattr(record, field_name, None))
+        _log(f"folded POD evidence for {record.po_number} into {len(lines)} line record(s) "
+             f"instead of staging a line-less twin")
+    return kept
+
+
+_DELIVERY_EVIDENCE_SOURCES = ("authority_", "pdf:carrier_pod", "ocr")
+"""Sources that report what a carrier or the originating warehouse actually handled."""
+
+
+def _is_delivery_evidence(record: ExtractedRecord) -> bool:
+    source = (record.extraction_source or "").lower()
+    return any(source.startswith(prefix) for prefix in _DELIVERY_EVIDENCE_SOURCES)
+
+
+def _is_confirmation_grid(record: ExtractedRecord) -> bool:
+    """A row read out of a request/tracker grid — what somebody *wrote down*, not what shipped.
+
+    Deliberately narrow. Only this loses to delivery evidence, because only this is known to
+    carry an ordered quantity in a column a reader takes for a received one. A packing slip, a
+    generic table, an OCR'd BOL are all real shipping paperwork, and where one of those disagrees
+    with a notice the difference is a genuine fact — overage, a split part shipment — that must be
+    staged and looked at, never resolved by preferring one document a priori.
+    """
+    return "confirmation_grid" in (record.extraction_source or "").lower()
+
+
+def _fallback_delivery_date(conn, email_id: str):
+    """`(date, source)` to stand in for a delivery date the document never stated, else `None`.
+
+    **Premier's rule, stated 2026-09-03: if the document gives a delivery date, that is the date.
+    If it does not, the date the mail was received is the date.** Nothing else. The caller applies
+    the first half by only reaching here when `pod_stated_date` is empty and no POD is linked; this
+    function is the second half.
+
+    `pod_stated_date` is one of the five fields `completeness` requires and the only one no other
+    system holds, so a document that omits it strands an otherwise complete receipt. The mail
+    bounds when the delivery happened: it cannot have been reported before it occurred.
+
+    This previously preferred `origin_sent_at` — when the message was *written* — on the reasoning
+    that a thread forwarded to Premier days later still describes the delivery its author saw, so
+    the received date would push that delivery late. It is a good argument and it is not the rule
+    we were given; on 48 of 1,642 messages the two fall on different days, and on every one of
+    those it stamped a date Premier did not ask for. Do not reinstate it without Premier changing
+    the rule: the point of a stated business rule is that it does not quietly vary by message.
+
+    This is an estimate standing in for a fact, so the caller records which one it used
+    (`pod_source`), and posting still wants a linked proof of delivery, a `pod_waived_by` waiver,
+    or body evidence — a fallback date cannot smuggle anything into Spitfire on its own.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(email_date, '') FROM email_log WHERE email_id = ?", (email_id,)).fetchone()
+    if not row:
+        return None
+    received = (row[0] or "").strip()
+    if received:
+        return received[:10], "email_received_date"
+    return None
+
+
+def stage_records(
+    conn,
+    records: List[ExtractedRecord],
+    *,
+    po_number: str,
+    delivery_ref: str,
+    delivery_rung: str,
+    now: str,
+    pod_ledger_id_of=None,
+) -> List[int]:
+    """Stage extracted records against the delivery they describe. Returns the new record ids.
+
+    The staging half of `process_new_mail`, lifted out so anything that re-reads an attachment
+    after the fact — `tools/reextract.py` recovering from an OCR outage — stages through exactly
+    these guards rather than its own copy of them. A second implementation would drift, and the
+    two rules below are the ones that stop a delivery being counted twice.
+
+    `pod_ledger_id_of` resolves the proof-of-delivery row for a record; the orchestrator answers it
+    from the evidence cache it already built, a re-read answers it from the ledger. `None` means
+    nothing on the message read as proof, which is a real and common state.
+    """
+    delivery_id = None
+    staged_ids: List[int] = []
+
+    # Records read from a less accurate copy of a document another attachment states better. They
+    # are kept — the file may still be the proof of delivery, and what it said is evidence — but
+    # they are not work, so they never reach reconciliation, never claim a delivery key, and never
+    # create a delivery row. Reconciling them against the good read is precisely the mistake this
+    # avoids: two copies of one report disagree in the way only OCR disagrees, and every such
+    # disagreement would come back as a quantity conflict for a person to settle by hand.
+    superseded = [r for r in records if r.superseded_by_ledger_id is not None]
+    records = [r for r in records if r.superseded_by_ledger_id is None]
+
+    for record in superseded:
+        if dedupe.is_handled_manually(conn, record.source_email_id):
+            continue
+        extracted_records_store.write_pending(
+            conn, record, now, status=extracted_records_store.SUPERSEDED)
+
+    for record in reconcile_cross_source_duplicates(records):
+        # A person already built a record from this message, so staging more from it would
+        # put two rows on the page for one delivery. Scoped to the one message — never to
+        # its thread or its purchase order, because the next mail on the same thread may be
+        # a genuinely separate delivery and suppressing that would hide a real receipt.
+        if dedupe.is_handled_manually(conn, record.source_email_id):
+            _log(f"skipped {record.po_number}: a person already recorded "
+                 f"{record.source_email_id} by hand")
+            continue
+
+        # Point the record at the file that proves it, where one exists. Records used to
+        # carry a POD's date and signature with no link back to the document they came
+        # from, which made "backed by a carrier's proof" and "nobody has confirmed this"
+        # look identical on the page — records 131-133 all showed a POD date and all had
+        # `pod_ledger_id` null, and only one of the three had any proof at all.
+        pod_fields: Dict[str, object] = {}
+        pod_ledger_id = pod_ledger_id_of(record) if pod_ledger_id_of is not None else None
+        if pod_ledger_id is not None:
+            pod_fields["pod_ledger_id"] = pod_ledger_id
+            pod_fields["pod_source"] = "attachment"
+
+        # Only once the document has had its say, and never over a real proof of delivery: a
+        # linked POD already owns `pod_source`, and overwriting it would lose which file proved
+        # the receipt.
+        #
+        # **Before the delivery key is minted, not after.** This line mutates
+        # `record.pod_stated_date`, which `dedupe.key_for_row` hashes. Minting the key first and
+        # filling the date in afterwards wrote a row whose stored `delivery_key` described a
+        # version of itself that no longer existed — so the guard below could never match it
+        # again. Combined with one record instance reaching this loop twice, that staged 160
+        # duplicate records across 43 purchase orders, every one of them a line that then
+        # collided with its own twin in `spitfire_post._refuse_line_collisions` and could never
+        # post. The key must be the last thing computed before the write.
+        if not record.pod_stated_date and pod_ledger_id is None:
+            fallback = _fallback_delivery_date(conn, record.source_email_id)
+            if fallback:
+                record.pod_stated_date, pod_fields["pod_source"] = fallback
+
+        # And the same delivery read twice from two different messages. Deliberately after
+        # `reconcile_cross_source_duplicates`, which dedupes *within* one email; this asks
+        # the store, so it also catches a re-extraction after a reprocess.
+        key = dedupe.key_for_row(record)
+        existing = dedupe.find_by_delivery_key(conn, key)
+        if existing:
+            _log(f"skipped {record.po_number}: already staged as record "
+                 f"#{existing[0]['id']}")
+            continue
+
+        if delivery_id is None:
+            # Deferred to the first line that actually survives the guards above. Creating
+            # it eagerly would leave an empty delivery behind every time an event turned
+            # out to be entirely duplicate — a row asserting goods arrived, with nothing
+            # under it saying what.
+            delivery_id = deliveries_store.upsert(
+                conn, po_number=po_number, delivery_ref=delivery_ref,
+                delivery_rung=delivery_rung, now=now, facts=record)
+
+        extra = {"delivery_key": key, "delivery_id": delivery_id, **pod_fields}
+        staged_ids.append(extracted_records_store.write_pending(conn, record, now, extra=extra))
+
+    if delivery_id is not None:
+        _log(f"delivery #{delivery_id}: PO {po_number} "
+             f"({delivery_ref}) carrying {len(staged_ids)} item line(s)")
+    return staged_ids
 
 
 def process_new_mail(
@@ -533,7 +945,17 @@ def process_new_mail(
             break
         try:
             raw_records: List[ExtractedRecord] = []
-            for src in _sources_for_delivery_event(event):
+            # `_sources_for_delivery_event` yields one source per attachment, but
+            # `evidence_cache.records_for` is keyed on the *email* — it ignores `src` entirely
+            # and hands back the same `ExtractedRecord` instances for every attachment on that
+            # message. Appending them once per source staged each line as many times as the
+            # message had attachments. Identity, not equality: these are literally the same
+            # objects, and two genuine rows that merely look alike must still both be kept.
+            seen_records: Set[int] = set()
+            # Asked once per event: how many purchase orders could an unattributed line on this
+            # message belong to? More than one and nothing is adopted — see `_record_for_event`.
+            candidate_pos = _candidate_pos_for_event(event, evidence_cache)
+            for src in _sources_for_delivery_event(event, evidence_cache):
                 if src.source_type == "attachment":
                     # Already read during the evidence pass, before triage — re-reading it
                     # would duplicate the work and, for images, the OCR spend.
@@ -543,34 +965,31 @@ def process_new_mail(
                         conn, src, adapters, budget=containers.Budget.fresh(), now=_now_iso(),
                     )
                 for record in produced:
-                    if not _belongs_to_event(record, event):
+                    # Identity is checked on the instance the cache handed back, before
+                    # `_record_for_event` may hand us a copy of it — otherwise a copied record
+                    # carries a new id and the same line stages once per attachment again.
+                    if id(record) in seen_records:
                         continue
-                    record.shipment_number = record.shipment_number or event.key.shipment_number
-                    raw_records.append(record)
+                    seen_records.add(id(record))
+                    mine = _record_for_event(record, event, candidate_pos)
+                    if mine is None:
+                        continue
+                    mine.shipment_number = mine.shipment_number or event.key.shipment_number
+                    raw_records.append(mine)
 
-            for record in reconcile_cross_source_duplicates(raw_records):
-                # A person already built a record from this message, so staging more from it would
-                # put two rows on the page for one delivery. Scoped to the one message — never to
-                # its thread or its purchase order, because the next mail on the same thread may be
-                # a genuinely separate delivery and suppressing that would hide a real receipt.
-                if dedupe.is_handled_manually(conn, record.source_email_id):
-                    _log(f"skipped {record.po_number}: a person already recorded "
-                         f"{record.source_email_id} by hand")
-                    continue
-
-                # And the same delivery read twice from two different messages. Deliberately after
-                # `reconcile_cross_source_duplicates`, which dedupes *within* one email; this asks
-                # the store, so it also catches a re-extraction after a reprocess.
-                key = dedupe.key_for_row(record)
-                existing = dedupe.find_by_delivery_key(conn, key)
-                if existing:
-                    _log(f"skipped {record.po_number}: already staged as record "
-                         f"#{existing[0]['id']}")
-                    continue
-
-                extracted_records_store.write_pending(conn, record, _now_iso(),
-                                                      extra={"delivery_key": key})
-                staged_count += 1
+            # The delivery these lines arrived on, created once per event rather than implied N
+            # times by N rows that happen to share a purchase order. `event.key` already carries
+            # the ref Stage 2 accumulated under, so the parent and the accumulation agree on what
+            # "this delivery" means by construction rather than by a second guess.
+            staged_ids = stage_records(
+                conn, raw_records,
+                po_number=event.key.po_number,
+                delivery_ref=event.key.delivery_ref,
+                delivery_rung=event.key.delivery_rung,
+                now=_now_iso(),
+                pod_ledger_id_of=lambda r: _pod_ledger_id_for(evidence_cache, r),
+            )
+            staged_count += len(staged_ids)
         except Exception as e:
             _log(f"failed to extract for delivery {event.key}: {e}")
             continue

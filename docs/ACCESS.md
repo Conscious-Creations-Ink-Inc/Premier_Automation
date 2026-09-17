@@ -15,7 +15,7 @@ in the row; **not provisioned** = asked for, not yet granted.
 
 | | |
 |---|---|
-| what | App-only token for `receiver@premierpm.com`; the source of every email the pipeline reads |
+| what | App-only token for `receiver@example-pm.test`; the source of every email the pipeline reads |
 | env | `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`, `GRAPH_MAILBOX_ADDRESS` |
 | granted by | Conscious Creations Azure tenant, app registration "Conscious Creations" |
 | scope | `Mail.ReadWrite` — verified live 2026-07-28 (list folders, read bodies, list attachments, move) |
@@ -51,7 +51,7 @@ those columns rather than re-reading the file — `record_completion._pod_facts`
 |---|---|
 | what | Training instance, sfPMS 2023.0.9692.36214 |
 | env | `SPITFIRE_BASE_URL` |
-| host | `https://training.remingtonhotels.com/Training` |
+| host | `https://spitfire-host.test/instance` |
 | status | **working, office IP only** |
 
 `GET /api/system/version` and `/api/system/branding` answer anonymously from outside Premier's
@@ -61,28 +61,28 @@ Only `v23` is served; v1 and v18–v25 all return 500. The Swagger has no versio
 `securitySchemes`, and declares **no business enums at all** — doc-type keys, statuses, UOMs and
 date-type names exist only in live responses, which is what §7 exists to capture.
 
-### 3a. Session cookie — how we authenticate today
+### 3a. Account login — how we authenticate (since 2026-09-15)
 
 | | |
 |---|---|
-| env | `SPITFIRE_SESSION_COOKIE` |
+| env | `SPITFIRE_UID`, `SPITFIRE_PW` (+ `SPITFIRE_BASE_URL`) — one pair per environment |
+| what | `POST /api/Account` with `SiteLogin {UID, PW, IsHashed:false, tzOffset}`; Spitfire answers with the `sfPMSAuth` ticket cookie, and every later call carries it |
+| code | `connectors/spitfire_auth.py` — one ticket shared process-wide; read client logs in and renews on lapse; write client takes the ticket and renews only in `whoami()` before a posting chain, never mid-chain |
+| renew | automatic. A changed password: edit `.env` — it is re-read on every login; restart to apply immediately |
+| production | same code; only `SPITFIRE_BASE_URL` / `SPITFIRE_UID` / `SPITFIRE_PW` differ (from `.env`, or injected env vars where there is no `.env`) |
+| status | **working on Training** — 2026-09-15, login OK, identity `Conscious Creations <api@consciouscreations.ai>` |
+
+When UID/PW are set they win over any `SPITFIRE_SESSION_COOKIE`. The login is never recorded to or
+replayed from a cassette (its body carries the password, and a replay would issue no ticket).
+
+### 3b. Session cookie — development fallback
+
+| | |
+|---|---|
+| env | `SPITFIRE_SESSION_COOKIE` — used only when `SPITFIRE_UID`/`SPITFIRE_PW` are blank |
 | what | The value of the browser's `sfPMSAuth` cookie. Not `sfSession`, which is only a session id |
-| renew | Log into Spitfire in a browser → F12 → Application → Cookies → `sfPMSAuth` → copy the value |
-| lifetime | **Short.** Forms tickets lapse and Spitfire enforces an idle timeout |
-| without it | every read fails; every write fails with `SpitfireSessionExpired` |
-| status | **partial — hand-captured, so nothing runs unattended** |
-
-Everything read or written is attributed to whoever owns that session. This is the single largest
-gap between "the mechanics work" and "the automation runs".
-
-### 3b. Service account — the real answer, not yet provisioned
-
-| | |
-|---|---|
-| env | `SPITFIRE_UID`, `SPITFIRE_PW` |
-| what | `svc-receiver-automation`. `POST /api/Account` takes a `SiteLogin {UID, PW, IsHashed, tzOffset}` body and mints the same ticket a browser gets, onto a plain `requests.Session` |
-| granted by | Premier (Joe) |
-| status | **not provisioned** |
+| lifetime | **Short.** Lapses on idle and cannot be renewed by the code |
+| status | **dev only** — reads and writes are attributed to whoever's browser it came from |
 
 `IsHashed` must stay false for a plaintext password. `SPITFIRE_TZ_OFFSET` is sent on login and
 Spitfire stamps server-side dates against it — a wrong value shifts received dates by hours, which
@@ -96,7 +96,7 @@ Read + Insert + Update + Delete + Blanket. Read-only is currently enforced clien
 
 | env | what | source |
 |---|---|---|
-| `SPITFIRE_PROJECT_IDS` | `MRC024PB100003`, `MRC024PB100002`, `MRC026PB100002` — where the corpus POs live | read from `TrainingsfDocSys.dbo.xsfDocHeader`; needed because this account cannot enumerate projects (`POST /api/projects` returns zero rows, `GET` is 405) |
+| `SPITFIRE_PROJECT_IDS` | `PRJ001PB100003`, `PRJ001PB100002`, `PRJ002PB100002` — where the corpus POs live | read from `TrainingsfDocSys.dbo.xsfDocHeader`; needed because this account cannot enumerate projects (`POST /api/projects` returns zero rows, `GET` is 405) |
 | `SPITFIRE_PO_DOC_TYPE_KEY` | PO document type, `ff1975fd-…` | `dev_reports/Stored_Procedures/czx_TPICreate_ReceiptDoc.sql` (`@PODTK`) |
 | `SPITFIRE_RECEIPT_DOC_TYPE_KEY` | Receipt document type, `0c9a537a-…` | the same `.sql` (`@RDTK`), confirmed 10 Aug against 76,414 documents whose `DocTypeKey_dv` reads "Receipt" |
 
@@ -143,7 +143,7 @@ GET /api/contact/3DA6B772-2AF4-49FE-8D72-5DA8C8939EA3
 ```
 
 `FederatedIdentityInfo` is a human-readable summary of that contact's linked identities, capped
-at 50 chars. Sampled across the routees of PO 207030 it reads `"ID;  last used Feb 02 "` or
+at 50 chars. Sampled across the routees of PO 907030 it reads `"ID;  last used Feb 02 "` or
 `"Profile Picture and  2 linked identities;  last used Aug 27, 2025 "` for people who actually
 log in, and `"No linked accounts"` for the `Spitfire` system account and for vendor contacts who
 never do. `Receiving Automation` reads **"No linked accounts"**.
@@ -246,7 +246,7 @@ offline, no posted receipt can be built from replayed data — and a replayed re
 
 | # | ask | blocks |
 |---|---|---|
-| 1 | Provision `svc-receiver-automation`, **Read scope only** (§3b) | anything unattended |
+| 1 | ~~Provision an automation account~~ done (§3a). Still open: scope it below AdminLevel 31, and confirm the password does not expire | least privilege |
 | 2 | Who approves an automated receiver? Creating one auto-stages three real employees at sequence 10 | dispatching a receipt |
 | 3 | Does production have the same office-IP restriction as training? | deployment |
 | 4 | Does `cost/committed` populate in production? `GET /api/xts/state` says *"ERP peer not configured"*, and `po_date` reads `1900-01-01` on all 1,726 training rows | committed-cost reporting |

@@ -64,12 +64,12 @@ def line_factory():
 
 
 def make_record(**overrides) -> ExtractedRecord:
-    """A record that matches the seeded PO line 212456/STE-402-LT on all three signals. Override
+    """A record that matches the seeded PO line 912456/STE-402-LT on all three signals. Override
     a field to build the failure case under test."""
     values = dict(
-        source_email_id="em-test", po_number="212456", shipment_number=None,
+        source_email_id="em-test", po_number="912456", shipment_number=None,
         spec_code="STE-402-LT", parent_spec_code=None, sub_spec_suffix=None,
-        item_description="Steelcase 402 Low Table, walnut", vendor_name="Peerless-AV",
+        item_description="Meridian 402 Low Table, walnut", vendor_name="Northgate Supply",
         carrier_name="FedEx", tracking_number="TRACK-1", quantity_received=2.0,
         unit_of_measure="EA", pod_stated_date="2026-07-14",
         email_date="2026-07-14T00:00:00+00:00", delivery_location=None, comments=None,
@@ -81,11 +81,11 @@ def make_record(**overrides) -> ExtractedRecord:
 
 def make_line(line_id: int = 1, **overrides) -> POLineRow:
     values = dict(
-        po_number="212456", line_number=1, line_key="key-1", spec_code="STE-402-LT",
-        description="Steelcase 402 Low Table, walnut", vendor_name="Peerless-AV",
+        po_number="912456", line_number=1, line_key="key-1", spec_code="STE-402-LT",
+        description="Meridian 402 Low Table, walnut", vendor_name="Northgate Supply",
         unit_of_measure="EA", qty_ordered=12.0, qty_received=0.0, cost_code="1100",
-        project_code="MRC-024", project_name="Hilton LXR", line_status="Open",
-        expected_date="2026-07-18", ship_to="LXR Cameo", assigned_agent="T. Turner",
+        project_code="MRC-024", project_name="Hilton EXH", line_status="Open",
+        expected_date="2026-07-18", ship_to="Example Hotel", assigned_agent="T. Turner",
         pay_terms="Net 30",
     )
     values.update(overrides)

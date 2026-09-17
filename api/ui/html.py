@@ -45,15 +45,39 @@ def tag(name: str, *children, **attrs) -> Raw:
     That trailing-underscore rule is also how you write an attribute whose name collides with this
     function's own first parameter: `tag("input", name_="enabled")` renders `name="enabled"`.
     """
-    rendered_attrs = "".join(
-        f' {key.rstrip("_").replace("_", "-")}="{esc(value)}"'
-        for key, value in attrs.items()
-        if value is not None
-    )
+    if attrs:
+        rendered_attrs = "".join(
+            f' {_ATTR_NAMES[key]}="{esc(value)}"'
+            for key, value in attrs.items()
+            if value is not None
+        )
+    else:
+        rendered_attrs = ""
     if name in _VOID:
         return Raw(f"<{name}{rendered_attrs}>")
-    body = "".join(esc(child) for child in children)
+    # One child is overwhelmingly the common case — a cell holding a string, a span holding a word
+    # — and going through `str.join` for it costs a generator and an iterator for nothing. This is
+    # called 94,338 times to render `/ui/mails`, so the constant factor is the whole cost.
+    if len(children) == 1:
+        return Raw(f"<{name}{rendered_attrs}>{esc(children[0])}</{name}>")
+    body = "".join([esc(child) for child in children])
     return Raw(f"<{name}{rendered_attrs}>{body}</{name}>")
+
+
+class _AttributeNames(dict):
+    """`class_` -> `class`, `data_mail_id` -> `data-mail-id`, worked out once per spelling.
+
+    A `dict` subclass with `__missing__` rather than a function with a cache, so the lookup on the
+    hot path is a plain subscript. The same twenty-odd attribute names are rendered on every row of
+    every table — `rstrip` and `replace` ran 168,419 times on one page to produce twenty answers.
+    """
+
+    def __missing__(self, key: str) -> str:
+        self[key] = name = key.rstrip("_").replace("_", "-")
+        return name
+
+
+_ATTR_NAMES = _AttributeNames()
 
 
 def badge(text: str, kind: str = "") -> Raw:
@@ -97,6 +121,35 @@ def textarea(name: str, label: str, value="", *, hint: str = "", rows: int = 3) 
                class_="field")
 
 
+def note_presets(field: str, options, *, label: str = "Common reasons") -> Raw:
+    """Chips that fill a textarea, for a field whose answers repeat.
+
+    The same trick as `_date_presets`: pressing one writes into the box the form already submits,
+    rather than being a second way of saying the thing. The textarea stays editable and stays the
+    only thing that is read — so a preset is a shortcut for typing, never a separate value the
+    server has to know about, and a reason nobody anticipated is still just typed.
+
+    `options` is `(chip label, the sentence it writes)`. They differ because the button has to be
+    scannable at a glance and the stored reason has to still make sense to somebody reading it back
+    months later with none of this screen around it.
+
+    Toggling, not filling: pressing a lit chip takes its sentence back out, and two chips write two
+    clauses joined by `; `. Most of these messages are set aside for more than one reason at once —
+    an advert with no PO in it is both — and a control that could only ever say one of them would be
+    the reason people went on typing.
+
+    The pressed chip is `.sel` and never `.on`, which is reserved for the active sidebar entry and
+    counted across the whole document by `test_the_active_nav_entry_is_marked_on_every_page`.
+    """
+    chips = [tag("button", text, type="button", class_="chip", aria_pressed="false",
+                 data_preset=phrase, data_preset_for=f"f-{field}")
+             for text, phrase in options]
+    return tag("div",
+               tag("span", label, class_="preset-label"),
+               tag("div", *chips, class_="chips chips-wrap", role="group", aria_label=label),
+               class_="presets")
+
+
 def radio(name: str, value: str, label, *, checked: bool = False, hint="") -> Raw:
     """One option in a group. `label` may be built markup — the POD chooser puts a whole row of
     filename, type, badges and an Open control inside its labels."""
@@ -118,8 +171,16 @@ def form(action: str, *children, submit: str = "Save", cancel: str = "",
     """
     buttons = [tag("button", submit, type="submit", class_="btn")]
     if cancel:
-        buttons.append(tag("a", cancel_label, href=cancel, class_="btn ghost"))
-    return tag("form", *children, tag("div", *buttons, class_="form-actions"),
+        # `data-back-to` lets the script make this a history step when the previous entry really is
+        # that page, so Cancel hands back the queue exactly as it was left — filter, page and scroll
+        # — instead of fetching a fresh one. The href is what happens without a script.
+        buttons.append(tag("a", cancel_label, href=cancel, class_="btn ghost", data_back_to=cancel))
+    return tag("form", *children,
+               # Where to go once this is recorded. Filled in by the script as the form leaves, and
+               # validated by the server, which never redirects anywhere a page merely asked for.
+               # Empty here, so a submission with no script lands on the route's own destination.
+               tag("input", type="hidden", name_="return_to", value=""),
+               tag("div", *buttons, class_="form-actions"),
                method="post", action=action, class_="uform")
 
 
@@ -183,8 +244,18 @@ def table(headers: Sequence[str], rows: Iterable[Sequence], *, empty: str = "Not
           no_sort: Sequence[str] = (), date_column: Optional[str] = None,
           choice_column: Optional[str] = None, pane: bool = False,
           num_columns: Sequence[str] = (), select_ids: Optional[Sequence] = None,
-          select_noun: str = "row", choice_values: Optional[Sequence] = None) -> Raw:
+          sort_urls: Optional[dict] = None, sorted_by: Sequence = ("", ""),
+          select_noun: str = "row", choice_values: Optional[Sequence] = None,
+          reason_values: Optional[Sequence] = None,
+          po_values: Optional[Sequence] = None,
+          email_ids: Optional[Sequence] = None,
+          group_keys: Optional[Sequence] = None,
+          ) -> Raw:
     """Rows can be made clickable two ways, and both end up as one thing.
+
+    `email_ids` — one per row — says which message the row came from, without making it a link.
+    That is what lets a verdict taken in the popup clear every row of that message from the table
+    it is sitting over.
 
     `mail_ids` — one entry per row, an `email_id` or an `(email_id, reason)` pair — opens that
     message. `frag_urls` names a fragment URL outright, which is how the Records page opens a
@@ -231,6 +302,11 @@ def table(headers: Sequence[str], rows: Iterable[Sequence], *, empty: str = "Not
     A row's value may be **several space-separated words**, and an option matches if it names any
     of them. A state is not always exclusive: an attachment can be a signature logo *and* a file
     nothing could read, and it has to be found under either.
+
+    `reason_values` is the second such dimension, for `reason_filter()`. Two are needed rather than
+    one because the queue is narrowed two independent ways at once — what kind of thing this is,
+    and why it is here — and folding them into one control would make picking a reason silently
+    clear the kind.
     """
     numeric = {header for header in num_columns}
     if numeric - set(headers):
@@ -240,6 +316,18 @@ def table(headers: Sequence[str], rows: Iterable[Sequence], *, empty: str = "Not
     if select_ids is not None and not table_id:
         raise ValueError("select_ids needs a table_id — the controls that read the selection find "
                          "it by the table's id")
+
+    # Materialised because the total is read twice — once to stamp `data-row-total`, once by the
+    # pager — and `rows` may be a generator that can only be walked once.
+    #
+    # There is no cap here any more. This used to send only the newest 500 rows and print a note
+    # saying so, with a "Load all" link under the table. Every table now ships every row it stands
+    # for, so the browser's search, its filters and its sort all cover the whole set rather than a
+    # slice of it. What the cap was really guarding — the weight of the response — is handled where
+    # it belongs: gzip (`api/main.py`), and server-side paging for the one table too large to send
+    # at all (`read_views.attachments`, which has taken `q`/`limit`/`offset` all along).
+    rows = list(rows)
+    total = len(rows)
 
     body_rows = []
     for index, row in enumerate(rows):
@@ -260,11 +348,33 @@ def table(headers: Sequence[str], rows: Iterable[Sequence], *, empty: str = "Not
             title = "Open this message"
         value = (choice_values[index] if choice_values is not None and index < len(choice_values)
                  else None)
+        why = (reason_values[index] if reason_values is not None and index < len(reason_values)
+               else None)
+        # `data-group` makes every row of one delivery a single unit to the client: searching a
+        # purchase order brings back its whole block rather than the one line the digits sat on,
+        # and a page boundary cannot fall between an item and the delivery it arrived on. The
+        # receipt sheet has grouped this way since it was written; this threads it through
+        # `table()` so an ordinary table can do it too.
+        group = (group_keys[index] if group_keys is not None and index < len(group_keys) else None)
+        # `data-po` is what a bare number in the search box is matched against, instead of the
+        # row's text. One email's subject can name seven purchase orders — the property confirmation
+        # names 907505, 907514, 912559, 907249, 908705, 912560 and 912614 — so searching `912614`
+        # returned 46 rows on the queue and **not one of them was that PO**. Every row still
+        # carried its own PO in its own column; the search was reading the subject.
+        po = (po_values[index] if po_values is not None and index < len(po_values) else None)
+        # Which message this row came from — not a link, an identity. A message set aside in the
+        # popup takes its rows off the page in place, and without this the only way to find out
+        # which rows those were is to fetch the whole page again, which is the reload the popup
+        # exists to avoid. Distinct from `data-mail`, which is a URL to open.
+        mail_of = (email_ids[index] if email_ids is not None and index < len(email_ids) else None)
         if url:
             body_rows.append(tag("tr", *cells, class_="clickable", tabindex="0",
-                                 data_frag=url, title=title, data_choice_value=value))
+                                 data_frag=url, title=title, data_choice_value=value,
+                                 data_reason=why, data_group=group, data_po=po,
+                                 data_mail_id=mail_of))
         else:
-            body_rows.append(tag("tr", *cells, data_choice_value=value))
+            body_rows.append(tag("tr", *cells, data_choice_value=value, data_reason=why,
+                                 data_group=group, data_po=po, data_mail_id=mail_of))
     if not body_rows:
         return tag("p", empty, class_="empty")
     if date_column is not None and date_column not in headers:
@@ -283,6 +393,21 @@ def table(headers: Sequence[str], rows: Iterable[Sequence], *, empty: str = "Not
                                    aria_label=f"Select every {select_noun} on this page"),
                          class_="pick"))
     for index, header in enumerate(headers):
+        if sort_urls is not None:
+            # Server-sorted: the heading is a link, because the order is decided by the query
+            # string and not by rearranging rows the browser happens to hold. A heading with no
+            # entry in `sort_urls` is a column there is no sensible ORDER BY for -- the PO cell is
+            # three different kinds of evidence stitched together -- and stays plain text.
+            url = sort_urls.get(header)
+            column, way = (list(sorted_by) + ["", ""])[:2]
+            state = ("ascending" if way == "asc" else "descending") if header == column else "none"
+            cells.append(tag(
+                "th",
+                tag("a", header, tag("span", "", class_="sort-arrow"), href=url,
+                    class_="sort-btn") if url else header,
+                class_="num" if header in numeric else None,
+                aria_sort=state if url else None))
+            continue
         if not table_id or header in no_sort:
             cells.append(tag("th", header, class_="num" if header in numeric else None,
                              data_date="1" if header == date_column else None,
@@ -297,15 +422,132 @@ def table(headers: Sequence[str], rows: Iterable[Sequence], *, empty: str = "Not
             data_date="1" if header == date_column else None,
             data_choice="1" if header == choice_column else None,
         ))
-    return scroll_block(
+    block = scroll_block(
         tag("table", Raw(str(tag("thead", tag("tr", *cells)))
                          + str(tag("tbody", *body_rows)))),
         table_id=table_id, page_size=page_size, pane=pane,
+        unit="group" if group_keys is not None else "row",
+        total=total,
     )
+    return block
+
+
+SERVER_PAGE_SIZES = (25, 50, 100, 250)
+"""What a server-paged table offers. No "All": this control exists for the one table that cannot
+be sent whole -- 29,766 rows is 25 MB of HTML -- and an All that re-creates exactly that is a
+button whose only function is to hang the tab."""
+
+
+def query_string(params: dict) -> str:
+    """`?a=b&c=d` from the values that are actually set, in a stable order.
+
+    Stable because these end up as hrefs all over one page: two links that mean the same thing
+    should be the same string, or the browser treats them as different places and the back button
+    starts retracing steps nobody took.
+    """
+    pairs = [(key, str(value)) for key, value in sorted(params.items())
+             if value not in (None, "", 0)]
+    return ("?" + "&".join(f"{quote(k)}={quote(v)}" for k, v in pairs)) if pairs else ""
+
+
+def server_search(action: str, value: str, params: dict, *, table_id: str,
+                  placeholder: str = "Search…", label: str = "Search") -> Raw:
+    """A search box that asks the server, for a table the browser was never sent in full.
+
+    `search_box()` is the other one, and the difference is the whole point of this pair: that one
+    filters rows already in the document, which is only honest when every row is there. This one
+    submits, so what it searches is the table, not the slice.
+
+    A plain `<form method="get">`, so it works with the keyboard, with the back button, and with
+    JavaScript off. The other filters ride along as hidden fields: searching must not silently
+    drop the view you were looking at.
+    """
+    hidden = [tag("input", type="hidden", name_=key, value=str(val))
+              for key, val in sorted(params.items()) if val not in (None, "", 0) and key != "q"]
+    return tag(
+        "form",
+        *hidden,
+        tag("label", label, for_=f"q-{table_id}", class_="sr-only"),
+        tag("span", _SEARCH_ICON, class_="search-icon"),
+        # `data-server-filter` is how the sweep in `test_every_paged_table_is_also_searchable`
+        # recognises this as the searchable half of a paged table, exactly as `data-filter` marks
+        # the client-side one.
+        tag("input", type="search", id=f"q-{table_id}", name_="q", value=value or "",
+            placeholder=placeholder, class_="filter", data_server_filter=table_id,
+            autocomplete="off"),
+        tag("button", "Search", type="submit", class_="btn small"),
+        method="get", action=action, class_="search server-search")
+
+
+def server_pager(action: str, params: dict, *, table_id: str, page: int, size: int,
+                 total: int, unit: str = "row") -> Raw:
+    """Which slice of the table this is, and the way to the rest -- as links, not script.
+
+    Says the honest total in its own first sentence. That is what makes this different from the
+    cap note it replaces: "Showing 1-25 of 29,766" is a position, and "the 500 most recent of
+    29,766 are loaded" was an apology. Nothing here is hidden from the search box beside it,
+    because that box asks the server too.
+
+    Real `<a href>`s throughout, so every page of this table can be linked to, opened in a new tab
+    and reached with JavaScript off.
+    """
+    pages = max(1, -(-total // size)) if size else 1
+    page = min(max(1, page), pages)
+    first = (page - 1) * size + 1 if total else 0
+    last = min(page * size, total)
+
+    def link_to(target: int, text, extra: str = "") -> Raw:
+        if target == page:
+            return tag("span", text, class_="pager-num on", aria_current="page")
+        return tag("a", text, href=action + query_string({**params, "page": target}),
+                   class_=("pager-num " + extra).strip())
+
+    numbers = []
+    for number in _page_window(page, pages):
+        numbers.append(Raw("…") if number is None else link_to(number, str(number)))
+
+    sizes = [tag("span", str(choice), class_="size on") if choice == size
+             else tag("a", str(choice),
+                      href=action + query_string({**params, "size": choice, "page": 1}),
+                      class_="size")
+             for choice in SERVER_PAGE_SIZES]
+
+    return tag(
+        "div",
+        tag("span",
+            (f"Showing {first:,}–{last:,} of {total:,} {unit}{'' if total == 1 else 's'}"
+             if total else f"No {unit}s"),
+            class_="pager-count"),
+        tag("span",
+            link_to(max(1, page - 1), Raw("&lsaquo;"), "prev") if page > 1 else Raw(""),
+            *numbers,
+            link_to(min(pages, page + 1), Raw("&rsaquo;"), "next") if page < pages else Raw(""),
+            class_="pager-nums"),
+        tag("span", "Rows ", *sizes, class_="pager-size-links"),
+        class_="pager server-pager", data_server_pager_for=table_id)
+
+
+def _page_window(page: int, pages: int):
+    """First, last, and a few either side of where you are; `None` where a gap is elided.
+
+    1,191 pages of attachments cannot all be links. Always showing the first and the last means
+    "go back to the beginning" and "how deep does this go" stay one click away.
+    """
+    if pages <= 9:
+        return list(range(1, pages + 1))
+    window = {1, pages}
+    window.update(n for n in range(page - 2, page + 3) if 1 <= n <= pages)
+    out, previous = [], 0
+    for number in sorted(window):
+        if number - previous > 1:
+            out.append(None)
+        out.append(number)
+        previous = number
+    return out
 
 
 def scroll_block(content: Raw, *, table_id: str = "", page_size: int = 0, unit: str = "row",
-                 plain: bool = False, pane: bool = False) -> Raw:
+                 plain: bool = False, pane: bool = False, total: Optional[int] = None) -> Raw:
     """A table in its horizontal scroller, with a pager under it if one was asked for.
 
     Split out of `table()` because the receiver report sheet is not built by `table()` — it comes
@@ -320,11 +562,19 @@ def scroll_block(content: Raw, *, table_id: str = "", page_size: int = 0, unit: 
     it: the heading row stays put, and the pager under it stays on screen instead of being fifty
     rows below the fold. Both scrollbars then belong to the same box, which is why a short page
     still shows the box at its full height rather than collapsing onto the rows it happens to hold.
+
+    `total` is how many rows the table stands for. Stamped as `data-row-total` so the count is
+    readable from the document itself rather than only from the prose under it.
+
+    Only on a table that has an id. A table with no id is one nothing can search, page or point at,
+    and `test_a_table_without_an_id_is_unchanged` holds those to exactly `<div class="scroll">` —
+    an attribute they have no use for is still an attribute they gained.
     """
     classes = "scroll plain" if plain else "scroll"
     if pane:
         classes += " pane"
-    block = tag("div", content, class_=classes, id=table_id or None)
+    block = tag("div", content, class_=classes, id=table_id or None,
+                data_row_total=str(total) if total is not None and table_id else None)
     if not (table_id and page_size > 0):
         return block
     return Raw(str(block) + str(pager(table_id, page_size, unit=unit)))
@@ -558,6 +808,42 @@ _STAR_ICON = Raw(
 )
 
 
+def reason_filter(target, counts: Sequence[tuple], *, label: str = "Reason") -> Raw:
+    """One chip per stated reason, each carrying how many rows give it.
+
+    A dropdown would have hidden the shape of the queue behind a click. The whole point of this row
+    is that "4 need OCR and 1 is corrupt" is readable without touching anything — the filtering is
+    what you do *after* the counts have told you where the work is.
+
+    Single-select: pressing one narrows to it, pressing it again clears. Not multi-select, because
+    two reasons at once is a question nobody on this page has asked, and the chips would then need
+    a way to say "none of these" that is different from "all of these".
+
+    A reason nothing carries is still shown, greyed and unpressable. `Unreadable · 0` is worth
+    saying: it means that class of failure is not happening, which a missing chip cannot say.
+
+    The counts are of the whole queue, not of what the other controls have left — said so on hover,
+    because a number that changed as you typed in the search box would be a third thing to track.
+
+    They do not sum to the number of rows, and are not meant to. One row can give several reasons —
+    a message standing for itself and for four attachments nobody could read gives two — and it is
+    counted under each, because the count has to answer "how much work is of this kind" for the
+    press that follows it.
+    """
+    targets = " ".join([target] if isinstance(target, str) else list(target))
+    chips = [
+        tag("button", text, tag("span", str(n), class_="pill-n"),
+            type="button", class_="pill" if n else "pill off",
+            disabled="disabled" if not n else None,
+            aria_pressed="false", data_reason=value, data_reason_for=targets,
+            title=(f"{n} rows in the queue give this reason" if n
+                   else "nothing in the queue gives this reason"))
+        for value, text, n in counts
+    ]
+    return tag("div", tag("span", f"{label}:", class_="reason-label"), *chips,
+               class_="reason-bar", role="group", aria_label=f"{label} filter")
+
+
 def stats(pairs: Sequence[tuple]) -> Raw:
     """The header strip: one figure per pair, label underneath, each in its own card.
 
@@ -685,7 +971,14 @@ _PROGRESS_LABELS = {
 }
 
 
-def progress_ring(phase: str, done: int, total: int, note: str = "") -> Raw:
+def progress_label(phase: str) -> str:
+    """The human name for a pipeline phase. `/ui/run-progress` sends this rather than the raw key,
+    so the wording lives in one place instead of being duplicated in JavaScript."""
+    return _PROGRESS_LABELS.get(phase, "Working")
+
+
+def progress_ring(phase: str, done: int, total: int, note: str = "",
+                  hidden: bool = False) -> Raw:
     """Where the run has got to: a ring, what it is doing, and the count behind it.
 
     Two states, and the difference is honest rather than cosmetic. With a `total` the ring is a
@@ -693,27 +986,45 @@ def progress_ring(phase: str, done: int, total: int, note: str = "") -> Raw:
     and it is most of a run's elapsed time — it spins instead, because a determinate bar frozen at
     0%% reads as stalled, which is the opposite of the truth.
 
-    No JavaScript. The percentage is a CSS custom property on a conic-gradient, and the page's
-    meta-refresh is what advances it; `/ui` spends exactly one inline script and it is not for a
-    progress bar. `test_pages_carry_exactly_one_first_party_script_and_nothing_else` holds that.
+    **This is server-rendered once and then advanced from the browser**, by the ticker in `_JS`
+    against `/ui/run-progress`. It used to say "No JavaScript … the page's meta-refresh is what
+    advances it", and that was true until the refresh was removed — after which nothing advanced it
+    at all and the ring sat frozen for the whole of a multi-minute run. The `data-` hooks below are
+    what the ticker writes into; the markup and the wording stay here, so the script sets values
+    rather than composing sentences.
+
+    Still no second script and no library: `test_pages_carry_exactly_one_first_party_script_and_
+    nothing_else` is unaffected, because the ticker lives in the one inline block that already
+    exists.
+
+    `hidden` renders the whole block ready but not shown, for a page drawn while nothing is running.
+    A run started from another tab can then be revealed in place instead of needing a reload.
     """
-    label = _PROGRESS_LABELS.get(phase, "Working")
+    label = progress_label(phase)
     if total > 0:
         percent = max(0, min(100, round(done * 100 / total)))
-        ring = tag("div", tag("b", f"{percent}%"), class_="ring", style=f"--pct:{percent}")
+        ring = tag("div", tag("b", f"{percent}%", data_prog_pct="1"), class_="ring",
+                   style=f"--pct:{percent}", data_prog_ring="1")
         detail = f"{done} of {total}"
     else:
         # `aria-hidden` on the ring, not the text: a spinner announces nothing useful, and the
         # phase beside it is the part worth reading aloud.
-        ring = tag("div", class_="ring spin", aria_hidden="true")
-        detail = "no count yet — this step is one call"
+        ring = tag("div", tag("b", "", data_prog_pct="1"), class_="ring spin",
+                   aria_hidden="true", data_prog_ring="1")
+        # Reading used to be one call with nothing to count. The connector now reports each Graph
+        # call as it returns, so what can be said honestly is how many have come back — a number
+        # that moves on a slow read and stands still on a hung one.
+        detail = (f"{done} mailbox call{'' if done == 1 else 's'} so far" if done
+                  else "connecting to the mailbox")
     if note:
         detail = f"{detail} · {note}"
     return tag(
         "div",
         ring,
-        tag("div", tag("div", label, class_="prog-what"), tag("div", detail, class_="prog-detail")),
-        class_="prog",
+        tag("div",
+            tag("div", label, class_="prog-what", data_prog_what="1"),
+            tag("div", detail, class_="prog-detail", data_prog_detail="1")),
+        class_="prog", data_prog="1", hidden="hidden" if hidden else None,
     )
 
 
@@ -747,18 +1058,36 @@ def modal(modal_id: str, title: str, body) -> Raw:
 
 
 def button_form(action: str, label: str, *, method: str = "post", cls: str = "btn",
-                style: str = "", glyph: str = "") -> Raw:
+                style: str = "", glyph: str = "", busy_label: str = "",
+                hidden_fields: Optional[dict] = None, disabled: bool = False,
+                title: str = "") -> Raw:
     """A one-button form. Anything that changes state is a POST, so it cannot be a link — a link
     would let a prefetch or a crawler press it.
 
     `glyph` gives the button a one-character alternative shown only when the sidebar is collapsed.
     Without it "Stop automation" overflows a 58px rail, and the control an operator reaches for in
     a hurry is the last one that should be hard to read.
+
+    `busy_label` is what the button says once pressed, while the request is in flight. For a button
+    whose work is measured in milliseconds this is noise; for "Check now", which reaches Microsoft
+    and can take twenty seconds, its absence was the whole complaint — the page sat unchanged and
+    the only honest reading was that the click had not registered. `_JS` also disables the button,
+    so the second and third presses that silence invited cannot start a second mailbox walk.
     """
     children = [tag("span", label, class_="lbl")]
     if glyph:
         children.append(tag("span", glyph, class_="glyph", aria_hidden="true"))
-    return tag("form", tag("button", *children, type="submit", class_=cls, title=label),
+    # Escaped by `tag()` like any other attribute, which is what lets a Message-ID — 255 characters
+    # of angle brackets and `@`, chosen by whoever sent the mail — be carried safely.
+    fields = [tag("input", type="hidden", name_=name, value=str(value))
+              for name, value in (hidden_fields or {}).items()]
+    # The same empty field `form()` carries: the script writes the page this was pressed from into
+    # it, and the handler validates it before redirecting anywhere. A handler that does not read it
+    # is unaffected — an unread form field costs nothing.
+    fields.append(tag("input", type="hidden", name_="return_to", value=""))
+    button = tag("button", *children, type="submit", class_=cls, title=title or label,
+                 data_busy_label=busy_label or None, disabled="disabled" if disabled else None)
+    return tag("form", *fields, button,
                method=method, action=action, class_="inline-form", style=style or None)
 
 
@@ -978,9 +1307,16 @@ _NAV = (
         # ledger — the mail dialog shows one message's attachments and cannot show that the same
         # bytes arrived twice under two names.
         ("/ui/attachments", "Attachments"),
+        # Under Mail and pointedly not under "Needs action": nothing on this page is queued, and
+        # filing it as work would contradict the only claim the page makes about itself.
+        ("/ui/not-deliveries", "Not deliveries"),
     )),
     ("Needs action", (
         ("/ui/manual", "Needs a human"),
+        # Beside the manual queue because it is the same kind of thing — a list somebody works
+        # through — and not under Operations, which is where automated work lives. Nothing on this
+        # page is automated: the purchase-order update it asks for is made in Spitfire by a person.
+        ("/ui/cancellations", "Cancellations"),
     )),
     ("Operations", (
         ("/ui/automation", "Automation"),
@@ -1012,8 +1348,16 @@ _ICONS = {
     # A paperclip, which is what every mail client has used for this for thirty years.
     "/ui/attachments": _icon(
         '<path d="M10.5 6 6 10.5a2 2 0 0 0 2.8 2.8l5-5a3.5 3.5 0 0 0-5-5l-5 5a5 5 0 0 0 7 7L14 11"/>'),
+    # The Mail envelope, struck through. Derived from it rather than given an icon of its own so the
+    # relationship reads on the collapsed rail, where the icon is the whole label.
+    "/ui/not-deliveries": _icon(
+        '<rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="m2 4.5 6 4 6-4"/>'
+        '<path d="M2.5 13.5 13.5 2.5"/>'),
     # A flag, not an alert circle: this is a queue someone works through, not a fault to clear.
     "/ui/manual": _icon('<path d="M3.6 14.5V1.8M3.6 2.6h8.6l-1.7 2.9 1.7 2.9H3.6z"/>'),
+    # A document with a line struck through it: an order that was placed and then withdrawn.
+    "/ui/cancellations": _icon(
+        '<path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/><path d="M5 10.5h6"/>'),
     "/ui/automation": _icon('<circle cx="8" cy="8" r="6.2"/><path d="m6.5 5.5 4 2.5-4 2.5z"/>'),
     "/ui/report": _icon('<path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3M5.5 8h5M5.5 11h3"/>'),
 }
@@ -1021,6 +1365,30 @@ _ICONS = {
 # Must not contain the sequence "</style>" — that is the one injection hole a constant CSS
 # block can have, and it is why the CSS lives here as a constant rather than being composed.
 _CSS = """
+/* The rest of a conversation, offered with the decision that is about to be taken. */
+.thread-offer { margin:14px 0 4px; padding:12px 14px; border:1px solid var(--line); border-radius:8px;
+  background:#fbfaf7; }
+.thread-head { margin:0 0 8px; font-weight:600; font-size:13px; }
+.thread-list { list-style:none; margin:0; padding:0; max-height:280px; overflow-y:auto; }
+.thread-row { padding:6px 0; border-top:1px solid var(--line); }
+.thread-row:first-child { border-top:0; }
+.thread-row label { display:flex; gap:9px; align-items:flex-start; cursor:pointer; }
+.thread-row.held { opacity:.66; display:flex; gap:10px; justify-content:space-between; }
+.thread-text { min-width:0; }
+.thread-subject { display:block; font-size:13px; overflow-wrap:anywhere; }
+.thread-meta, .thread-held { display:block; font-size:11.5px; color:var(--ink-soft); }
+.toast-undo { font:inherit; font-size:12px; padding:2px 10px; margin-left:2px; cursor:pointer;
+  border:1px solid #6d6a63; border-radius:999px; background:transparent; color:#fdfcf9; }
+.toast-undo:hover { background:#3d3a35; }
+/* A filter this page restored rather than one the reader just typed. It sits beside the count,
+   because that readout is where someone looks when a table shows less than they expected. */
+.place-clear { font:inherit; font-size:12px; margin-left:8px; padding:2px 8px; cursor:pointer;
+  border:1px solid var(--line); border-radius:999px; background:#fff; color:var(--ink-soft); }
+.place-clear:hover { border-color:var(--gold); color:var(--ink); }
+/* What just happened, on the page you land on rather than the one you left. */
+.toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:60;
+  max-width:min(560px, 92vw); padding:10px 16px; border-radius:8px; font-size:13px;
+  background:#2c2a26; color:#fdfcf9; box-shadow:0 6px 20px rgba(0,0,0,.28); }
 /* Spitfire is the reference, not the ceiling. What is borrowed: the dark rail on the left, the
    warm palette, the dense grid. What is deliberately not: Spitfire puts its gold on the sidebar
    AND the table headers AND the page ground, so every surface competes and its own status colours
@@ -1054,12 +1422,21 @@ body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-se
    This replaced `height:calc(100vh - 400px)` on the pane, which could only ever be right for one
    window height: the 400px was measured against a 908px-tall window, so on a 642px laptop the
    table fell to its minimum and showed three and a half rows. Nothing here counts pixels. */
-.shell:has(.scroll.pane) { height:100vh; }
-.content:has(.scroll.pane) { display:flex; flex-direction:column; height:100vh; min-height:0; }
-main:has(.scroll.pane) { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
+/* `> section:only-child` and not just `.scroll.pane`: a page whose table is the only thing on it
+   can give that table the whole window, but a page with more sections underneath cannot. Needs a
+   human has five — the queue, then what is awaiting a report, posted, blocked, and the line
+   pointing at the mail set aside — and with the chain matching on the pane alone all five shared
+   the viewport between them, which left the queue two rows tall and the headings below it
+   overlapping its own pager. */
+.shell:has(main > section:only-child .scroll.pane) { height:100vh; }
+.content:has(main > section:only-child .scroll.pane) { display:flex; flex-direction:column;
+    height:100vh; min-height:0; }
+main:has(> section:only-child .scroll.pane) { flex:1 1 auto; min-height:0; display:flex;
+    flex-direction:column; }
 /* `min-height:0` on both, twice over: a flex item's floor is its content, so without it the table
    pushes the column taller than the viewport instead of scrolling inside itself. */
-main:has(.scroll.pane) > section { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; }
+main:has(> section:only-child .scroll.pane) > section { flex:1 1 auto; min-height:0; display:flex;
+    flex-direction:column; }
 
 .side { flex:0 0 var(--rail); width:var(--rail); align-self:stretch; position:sticky; top:0;
     height:100vh; background:var(--nav); color:var(--nav-fg); display:flex; flex-direction:column; }
@@ -1083,8 +1460,42 @@ main:has(.scroll.pane) > section { flex:1 1 auto; min-height:0; display:flex; fl
 .nav a:hover { background:var(--nav-2); color:#fff; }
 .nav a.on { background:var(--nav-2); color:var(--nav-on); border-left-color:var(--gold);
     font-weight:600; }
+/* The clicked entry, lit by the script the instant it is pressed rather than when the next document
+   arrives. These pages are server-rendered, so a click leaves the OLD page fully painted with the
+   OLD entry still highlighted for the whole render — which reads as a click that did not register,
+   and is what made people press twice. `.going` is a separate class from `.on` on purpose: `.on` is
+   the server's statement of where you are, and `test_the_active_nav_entry_is_marked_on_every_page`
+   counts that string across the document. This one is only ever added at runtime. */
+.nav a.going { background:var(--nav-2); color:var(--nav-on); border-left-color:var(--gold);
+    font-weight:600; }
+/* And the entry being LEFT gives the highlight up while that is happening. Without this both are
+   lit identically mid-navigation — the page you are on and the page you are going to — which says
+   "one of these two" rather than "this one", and is barely better than lighting neither. */
+html.nav-busy .nav a.on:not(.going) { background:transparent; border-left-color:transparent;
+    color:var(--nav-fg); font-weight:400; }
+html.nav-busy .nav a.on:not(.going) .ico { opacity:.85; }
 .nav a .ico { flex:0 0 16px; opacity:.85; }
-.nav a.on .ico { opacity:1; }
+.nav a.on .ico, .nav a.going .ico { opacity:1; }
+/* Rides the top edge of the whole window, not the content column, so it is visible wherever the eye
+   happens to be. Indeterminate by necessity: a server render has no progress to report, and a bar
+   that pretended otherwise would be inventing one. */
+.load-bar { position:fixed; top:0; left:0; right:0; height:2px; z-index:60; background:transparent;
+    overflow:hidden; pointer-events:none; }
+/* Explicit, for the same reason `.live-pill[hidden]` is: this rule sets other properties on the
+   element, and relying on the user agent's `[hidden]` alone is one added `display` away from a bar
+   that never turns off. */
+.load-bar[hidden] { display:none; }
+.load-bar::after { content:""; position:absolute; top:0; left:0; height:100%; width:40%;
+    background:var(--gold); animation:load-slide 1.1s ease-in-out infinite; }
+@keyframes load-slide {
+    0%   { transform:translateX(-100%); }
+    100% { transform:translateX(350%); }
+}
+/* Someone who has asked for less motion still needs to know the click landed; the lit nav entry
+   already says that, so the bar simply holds still rather than disappearing. */
+@media (prefers-reduced-motion: reduce) {
+    .load-bar::after { animation:none; width:100%; opacity:.55; }
+}
 .nav a .lbl { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .nav a .count { margin-left:auto; background:var(--gold); color:#3A3014; font-size:10.5px;
     font-weight:700; border-radius:20px; padding:0 6px; min-width:18px; text-align:center; }
@@ -1101,6 +1512,25 @@ main:has(.scroll.pane) > section { flex:1 1 auto; min-height:0; display:flex; fl
 .side-alert .lbl span { display:block; font-size:11px; color:var(--nav-muted); }
 .side-alert .count { margin-left:auto; background:var(--gold); color:#3A3014; font-size:10.5px;
     font-weight:700; border-radius:20px; padding:0 6px; min-width:18px; text-align:center; }
+.side-foot .signed-in { display:flex; flex-direction:column; gap:3px; margin-top:9px; }
+.side-foot .signed-in .who { font-size:10.5px; color:var(--nav-muted); overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.side-foot .signed-in .sign-out { background:none; border:0; padding:0; font:inherit;
+  font-size:10.5px; color:var(--nav-muted); text-align:left; cursor:pointer;
+  text-decoration:underline; }
+.side-foot .signed-in .sign-out:hover { color:var(--nav-on); }
+/* Collapsed rail: the name goes, the way out stays. */
+.rail .side-foot .signed-in .who { display:none; }
+.server-search { display:flex; align-items:center; gap:6px; }
+.server-pager { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.server-pager .pager-num, .server-pager .size { padding:2px 7px; border-radius:5px;
+  text-decoration:none; color:var(--muted); }
+.server-pager .pager-num:hover, .server-pager .size:hover { background:var(--zebra);
+  color:var(--fg); }
+.server-pager .pager-num.on, .server-pager .size.on { background:var(--accent); color:#fff; }
+.server-pager .pager-size-links { margin-left:auto; color:var(--muted); font-size:.78rem; }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
+  clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 .side-foot { border-top:1px solid rgba(255,255,255,.11); padding:10px 12px; }
 .side-foot .btn { width:100%; justify-content:center; }
 .side-foot .kill-note { display:block; font-size:11px; color:var(--nav-muted); margin-top:7px;
@@ -1170,6 +1600,17 @@ button, .btn { font:inherit; display:inline-flex; align-items:center; gap:7px; p
 button:hover, .btn:hover { border-color:var(--gold-deep); color:var(--gold-deep); }
 .btn.ghost { background:transparent; }
 .btn.small { padding:4px 10px; font-size:12px; }
+/* A control that is present, explains itself, and does nothing. `aria-disabled` rather than
+   the `disabled` attribute on purpose: a disabled button is not focusable and browsers
+   suppress its tooltip, and on the Records page the tooltip is the whole message — it says
+   which receipt already exists. The `:hover` rule is needed because the shared
+   `button:hover` above would otherwise light it gold as though it were live. */
+.btn[aria-disabled="true"] { opacity:.45; cursor:not-allowed; }
+.btn[aria-disabled="true"]:hover { border-color:var(--line); color:inherit; }
+/* An unbulleted, unindented list for prose rows — the edit form's correction history. */
+.plain-list { list-style:none; margin:0; padding:0; }
+.plain-list li { padding:3px 0; border-bottom:1px solid var(--line); font-size:12.5px; }
+.plain-list li:last-child { border-bottom:0; }
 .btn.danger { border-color:#d8b6ae; color:var(--danger); background:#fdf4f1; }
 .btn.danger:hover { background:var(--danger); border-color:var(--danger); color:#fff; }
 .side-foot .btn { background:transparent; border-color:rgba(255,255,255,.22); color:var(--nav-fg); }
@@ -1242,7 +1683,11 @@ input[type=number], select { font:inherit; padding:6px 9px; border:1px solid var
    shell. A browser without `:has()` gets no flex parent, so this falls back to a table at its
    natural height and a page that scrolls: the behaviour from before the pane existed, not a
    broken layout. */
-.scroll.pane { overflow:auto; flex:1 1 0; min-height:150px; }
+/* On a page with sections below it the pane cannot fill the window, so it takes a bounded share
+   of it and the page scrolls past — still a box with its own scrollbars, still a pager that does
+   not sit fifty rows down. The single-section pages override the cap and flex instead. */
+.scroll.pane { overflow:auto; min-height:150px; max-height:62vh; }
+main:has(> section:only-child .scroll.pane) .scroll.pane { flex:1 1 0; max-height:none; }
 .scroll.pane thead th { position:sticky; top:0; z-index:2; }
 /* One row, one line. A pane already scrolls sideways, so a cell holding a button and a badge — or
    a purchase order and the envelope beside it — should claim the width it needs rather than wrap
@@ -1323,6 +1768,12 @@ input.pick:focus-visible, input.pick-all:focus-visible { outline:2px solid var(-
 .controls .filter-bar { flex:0 1 auto; min-width:0; }
 .controls .search { flex:0 0 270px; max-width:100%; }
 .controls .date-bar { margin-left:auto; }
+/* Says "these rows are one delivery" on the first row of each block. Quiet by design: it is a
+   fact about the grouping, not a status, and the status badges beside it have to keep meaning
+   more than it does. */
+.delivery-tag { display:inline-block; margin-left:7px; padding:0 6px; border-radius:20px;
+    background:var(--head); border:1px solid var(--line); color:var(--muted);
+    font-size:10.5px; font-weight:600; white-space:nowrap; vertical-align:1px; }
 .filter-bar { display:flex; align-items:center; gap:12px; margin:0 0 10px; }
 .search { position:relative; display:flex; align-items:center; flex:1 1 auto; min-width:0; }
 .search-ico { position:absolute; left:11px; color:var(--muted); pointer-events:none; }
@@ -1383,6 +1834,16 @@ th[aria-sort="ascending"], th[aria-sort="descending"] { background:#F4EDDC; }
 .chips .chip.sel { background:var(--nav-2); color:#fff; }
 .chips .chip.sel:hover { background:var(--nav); color:#fff; }
 .chips .chip:focus-visible { outline:2px solid var(--gold); outline-offset:-2px; }
+/* The wrapping variant, for preset chips on a form. The date group is four short segments welded
+   into one pill and must never wrap; these are whole phrases, there are seven of them, and on a
+   narrow window they have to fall onto a second line rather than push the form sideways. So the
+   group loses its own border and each chip carries one. */
+.chips-wrap { display:flex; flex-wrap:wrap; gap:6px; border:0; background:transparent; }
+.chips-wrap .chip { border:1px solid var(--line); border-radius:8px; background:var(--surface);
+    padding:5px 11px; cursor:pointer; }
+.chips-wrap .chip + .chip { border-left:1px solid var(--line); }
+.presets { margin:0 0 14px; }
+.presets .preset-label { display:block; font-size:12px; color:var(--muted); margin:0 0 5px; }
 /* The exact range, folded away behind one square. Open, it is a panel over the table rather than a
    row that pushes the table down — the point of putting it away was to stop it taking that space.
    `list-style:none` twice: WebKit uses a marker pseudo-element the standard property misses. */
@@ -1405,6 +1866,26 @@ th[aria-sort="ascending"], th[aria-sort="descending"] { background:#F4EDDC; }
     align-items:center; gap:7px; padding:10px 12px; background:var(--surface);
     border:1px solid var(--line); border-radius:10px; box-shadow:0 8px 24px rgba(60,50,20,.14);
     white-space:nowrap; }
+/* ---- reason chips -------------------------------------------------------- */
+/* Its own row under the controls, because it is a readout as much as a control: the counts say
+   where the work is before anyone presses anything. Separate pills rather than a segmented group —
+   these are not one choice among four, they are four independent facts about the queue. */
+.reason-bar { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin:0 0 10px;
+    font-size:12.5px; }
+.reason-label { color:var(--muted); margin-right:1px; }
+.pill { border:1px solid var(--line); border-radius:999px; background:var(--surface);
+    color:var(--fg); font-size:12px; font-weight:560; padding:4px 11px; gap:6px; }
+.pill:hover { border-color:var(--gold-deep); color:var(--gold-deep); }
+.pill .pill-n { color:var(--muted); font-variant-numeric:tabular-nums; }
+.pill.sel { background:var(--nav-2); border-color:var(--nav-2); color:#fff; }
+.pill.sel:hover { background:var(--nav); border-color:var(--nav); color:#fff; }
+.pill.sel .pill-n { color:rgba(255,255,255,.72); }
+/* Shown, not hidden: "Unreadable · 0" says that class of failure is not happening, which a chip
+   that is simply absent cannot say. */
+.pill.off, .pill.off:hover { color:var(--muted); border-color:var(--line); opacity:.55;
+    cursor:default; }
+.pill:focus-visible { outline:2px solid var(--gold); outline-offset:2px; }
+
 /* ---- one-column dropdown filter ----------------------------------------- */
 .choice-bar { display:inline-flex; align-items:center; gap:7px; font-size:12.5px;
     color:var(--muted); }
@@ -1496,6 +1977,12 @@ input.date-from:focus, input.date-to:focus { outline:2px solid var(--gold); outl
    "this is test data" is a different kind of fact from "this was delivered". */
 .badge-inbox  { color:#1f5f86; border-color:#b9d5e8; background:#eef5fa; }
 .badge-sample { color:#7a746a; border-color:#ded9cf; background:#f6f3ec; font-style:italic; }
+/* Read out of Junk Email. Loud on purpose, and not the quiet grey `sample` gets: a delivery
+   notification Exchange filed as spam is not scaffolding, it is a message that would have been
+   lost outright before the reader looked in that folder. The colour is what makes "Premier's
+   tenant is junking warehouse mail" visible on the page instead of a fact somebody has to go and
+   query Graph to discover — which is exactly how it was found the first time. */
+.badge-junk   { color:#8a5a00; border-color:#e8d09a; background:#fdf6e6; }
 /* The six delivery statuses. Deliberately a separate ramp from the triage verdicts above: a PO
    being "delivered" and an email being "surface" are unrelated facts, and sharing a colour would
    invite reading one as the other. Warehouse sits between transit and delivered, so it gets its
@@ -1787,6 +2274,10 @@ iframe.mail-body { display:block; width:100%; height:min(64vh,760px); border:1px
 /* Run progress. All CSS: these pages spend exactly one inline script and it is not for this.
    The ring is a conic-gradient sweep over a masked disc — one element, no SVG, no canvas. */
 .prog { display:flex; align-items:center; gap:16px; margin:2px 0 14px; }
+/* Explicit, because `display:flex` above beats the user agent's `[hidden]`. The block is shipped
+   on the Automation page even when nothing is running, so a run started in another tab can be
+   revealed in place by the ticker rather than needing a reload. */
+.prog[hidden] { display:none; }
 .ring { --pct:0; position:relative; width:64px; height:64px; flex:none; border-radius:50%;
     background:conic-gradient(var(--gold) calc(var(--pct) * 1%), #e6e4de 0); }
 .ring::after { content:""; position:absolute; inset:7px; border-radius:50%; background:var(--surface); }
@@ -1936,6 +2427,17 @@ document.addEventListener('click', function (e) {
   // an archive, "Back to message". Checked before the row handler and restricted to buttons,
   // because a whole row uses `data-frag` too and that branch has its own rules about what a click
   // inside it means.
+  // A link that also names a fragment: the reclassify control. It stays an `<a href>` so a browser
+  // with no script lands on the full page, and opens over the queue when there is one. Modified
+  // clicks are left alone — those mean "open somewhere else", and honouring them here would open a
+  // popup on a page the reader is not looking at.
+  var fragLink = e.target.closest('a[data-frag]');
+  if (fragLink && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0)) {
+    e.preventDefault();
+    loadFragment(fragLink.getAttribute('data-frag'), {
+      push: true, title: fragLink.getAttribute('data-frag-title') || 'Message'});
+    return;
+  }
   var control = e.target.closest('button[data-frag]');
   if (control) {
     e.preventDefault();
@@ -2186,7 +2688,8 @@ function loadFragment(url, opts) {
     // `refreshEveryView` because a fragment can carry its own paged table — a spreadsheet
     // attachment preview is one. The first paint runs at page load, which was long before this
     // markup existed, so without this the table arrives showing every row it has.
-    .then(function (html) { body.innerHTML = html; fitFrames(body); refreshEveryView(); })
+    .then(function (html) { body.innerHTML = html; fitFrames(body); refreshEveryView();
+                            prefillVerdictName(); })
     .catch(function (err) {
       body.innerHTML = '<p class="empty">Could not open this: ' + err + '</p>';
     });
@@ -2255,6 +2758,82 @@ document.addEventListener('click', function (e) {
   try { localStorage.setItem('premier-rail', collapsed ? '1' : '0'); } catch (err) { /* private mode */ }
 });
 
+// Did my click land? Until this existed the answer was "you cannot tell for about two seconds".
+//
+// Every page here is server-rendered and every nav entry is a plain `<a href>`, so a click starts a
+// document navigation and the browser then keeps the CURRENT page fully painted — old content, old
+// entry still lit — until the response arrives. On the heavier pages that is well over a second
+// with no on-screen change at all, which reads as a dead button and is exactly why people press it
+// twice.
+//
+// So: light the entry that was clicked, and run a bar along the top edge. Both are undone by
+// leaving the page, and by `pageshow` for the one case where we come back to this document rather
+// than leaving it (below).
+function markNavigating(link) {
+  if (link) link.classList.add('going');
+  // On the root element, which is also what the CSS uses to stand the departing entry down — the
+  // rail must not read as two current pages while one is becoming the other.
+  document.documentElement.classList.add('nav-busy');
+  var bar = document.querySelector('.load-bar');
+  if (bar) bar.hidden = false;
+}
+
+function clearNavigating() {
+  document.querySelectorAll('.nav a.going, .side-alert.going').forEach(function (a) {
+    a.classList.remove('going');
+  });
+  // A button left disabled by a submission this page never came back from — Back out of a slow
+  // POST and the restored document would otherwise hand back a control that can never be pressed.
+  document.querySelectorAll('[data-busy-label][disabled]').forEach(function (b) {
+    b.disabled = false;
+    b.removeAttribute('aria-busy');
+    var l = b.querySelector('.lbl') || b;
+    if (b.title) l.textContent = b.title;
+  });
+  document.documentElement.classList.remove('nav-busy');
+  var bar = document.querySelector('.load-bar');
+  if (bar) bar.hidden = true;
+}
+
+document.addEventListener('click', function (e) {
+  var link = e.target.closest('.nav a, .side-alert');
+  if (!link) return;
+  // A modified click opens somewhere else — a new tab, a new window, a download. THIS page is not
+  // going anywhere, so marking it as leaving would light an entry that never becomes current and
+  // leave the bar running for ever. `button !== 0` covers the middle-click that also opens a tab.
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+  if (link.target && link.target !== '_self') return;
+  if (e.defaultPrevented) return;
+  markNavigating(link);
+});
+
+// A button whose work is slow enough to look broken. "Check now" reaches Microsoft and can take
+// twenty seconds; until this existed the page sat completely unchanged for all of it, which reads
+// as a dead button and invited the second and third presses that each started another mailbox walk.
+//
+// `submit`, not `click`: the form submits by Enter as well, and both need the same feedback.
+//
+// **Synchronously, not in a `setTimeout(…, 0)`.** The deferred version was written to be careful —
+// a button disabled during a *click* is never submitted — but by the time `submit` fires the
+// browser has already gathered the form data, so disabling here cannot cancel anything. Deferring
+// it meant the callback raced the navigation and usually lost: measured in real Chrome, the label
+// never changed at all on an actual press, only when the submission was cancelled. A feedback
+// mechanism that works everywhere except the case it exists for is worse than none, because it
+// tests green.
+document.addEventListener('submit', function (e) {
+  var button = e.target.querySelector('[data-busy-label]');
+  if (!button || button.disabled) return;
+  var label = button.querySelector('.lbl') || button;
+  button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
+  label.textContent = button.getAttribute('data-busy-label');
+});
+
+// Back from the browser's cache restores this document exactly as it was left — including, without
+// this, a nav entry still lit for a page we navigated away from and a bar still sliding. `pageshow`
+// fires for both a fresh load and a bfcache restore, so one listener covers both.
+window.addEventListener('pageshow', clearNavigating);
+
 // Table search. One delegated listener for every filter on the page.
 //
 // The haystack is NOT just the visible text. `_clipped()` in routes.py truncates Subject and Why
@@ -2272,6 +2851,23 @@ function rowHaystack(row) {
     row.__hay = parts.join(' ').toLowerCase().replace(/\\s+/g, ' ');
   }
   return row.__hay;
+}
+
+// A bare number is a purchase order, and is matched against the row's own PO rather than its text.
+//
+// One email's subject can name several purchase orders at once — the property delivery confirmation
+// names seven — so a text search for `912614` returned 46 queue rows of which **none** were that
+// PO: they were 907514's and 907249's, matched on a subject they happened to share. Every one of
+// them displayed its true PO in its own column, so the page was honest and the search was not.
+//
+// Only rows that declare a PO are held to this. A row without `data-po` (an attachment, a message
+// with no PO resolved) falls back to text, so a number in a tracking reference is still findable.
+function termMatches(row, hay, term) {
+  if (/^\\d{5,}$/.test(term)) {
+    var po = row.getAttribute('data-po');
+    if (po) { return po.toLowerCase().indexOf(term) !== -1; }
+  }
+  return hay.indexOf(term) !== -1;
 }
 
 function anyFilterActive() {
@@ -2395,7 +2991,7 @@ function paintPages(control, page, pages, size) {
 // One pass does filtering, paging and the zebra together. They were two independent passes at
 // first, and each kept overwriting the other's mind about which rows were visible.
 //
-// Every whitespace-separated word must match, so "208491 delivered" narrows rather than widens. A
+// Every whitespace-separated word must match, so "908491 delivered" narrows rather than widens. A
 // unit matches when *any* of its rows does: searching a PO number has to bring back that purchase
 // order's whole block, not the single line the digits happen to sit on.
 function refreshView(id) {
@@ -2424,6 +3020,11 @@ function refreshView(id) {
   // than for one verdict.
   var choices = choice ? choice.split('|') : [];
   var choiceColumn = choice ? choiceColumnOf(scope) : -1;
+  // The reason chips, which narrow by a second, independent dimension: what kind of thing this is
+  // (the dropdown) and why it is here (these) are different questions, and picking one must not
+  // silently clear the other.
+  var pill = document.querySelector('.pill.sel[data-reason-for~="' + id + '"]');
+  var reason = pill ? pill.getAttribute('data-reason') : '';
   // A row may carry its own value instead, for a state that is not any one cell — see
   // `table(choice_values=...)`. Checked once for the table rather than once per row.
   var rowValued = choice ? !!scope.querySelector('tbody tr[data-choice-value]') : false;
@@ -2432,7 +3033,7 @@ function refreshView(id) {
   parts.units.forEach(function (unit) {
     var hit = !terms.length || unit.some(function (row) {
       var hay = rowHaystack(row);
-      return terms.every(function (t) { return hay.indexOf(t) !== -1; });
+      return terms.every(function (t) { return termMatches(row, hay, t); });
     });
     // Both ends inclusive — "1st to 5th" includes the 5th to everyone who is not a database. A row
     // whose date cell is blank is out as soon as a range is set: it cannot be shown to be inside
@@ -2452,12 +3053,21 @@ function refreshView(id) {
           // A row may carry several words at once — a signature logo that nothing could read is
           // both `inline` and `unread` — so this is an intersection, not an equality. Comparing
           // the whole attribute made a row in two states match neither of them.
-          var words = own.trim().toLowerCase().split(/\s+/);
+          var words = own.trim().toLowerCase().split(/\\s+/);
           return choices.some(function (want) { return words.indexOf(want) !== -1; });
         }
         if (choiceColumn < 0) return false;
         var cell = row.children[choiceColumn];
         return !!cell && choices.indexOf(cell.textContent.trim().toLowerCase()) !== -1;
+      });
+    }
+    if (hit && reason) {
+      // Token match, not equality: a merged queue row carries every reason it stands for, space
+      // separated, the same shape `data-reason-for~=` uses above. Equality found such a row only
+      // under the one reason its badge happened to show.
+      hit = unit.some(function (row) {
+        var carried = ' ' + (row.getAttribute('data-reason') || '') + ' ';
+        return carried.indexOf(' ' + reason + ' ') !== -1;
       });
     }
     unit.forEach(function (row) { row.classList.toggle('filtered-out', !hit); });
@@ -2467,7 +3077,8 @@ function refreshView(id) {
   // Any narrowing at all, not just typed text. `nth-child(even)` counts hidden rows, so a table
   // narrowed by date or verdict alone striped at random while this only watched the search box.
   scope.classList.toggle('filtering',
-    terms.length > 0 || dateColumn >= 0 || choiceColumn >= 0 || (choices.length > 0 && rowValued));
+    terms.length > 0 || dateColumn >= 0 || choiceColumn >= 0 || (choices.length > 0 && rowValued)
+    || reason !== '');
 
   var size = control ? parseInt(control.getAttribute('data-page-size'), 10) || 0 : 0;
   var pages = size > 0 ? Math.max(1, Math.ceil(matched.length / size)) : 1;
@@ -2536,7 +3147,16 @@ function refreshFor(input, resetPage) {
   // two thirds of a table while the count sits blank is the same silent-hiding problem the count
   // exists to prevent.
   if (!narrowed(input)) readout.textContent = '';
-  else if (!matched) readout.textContent = 'No ' + noun + 's match — ' + total + ' hidden';
+  else writeCount(readout, ids, matched, total, noun);
+}
+
+// The count for a narrowed set, in words that are true about what was searched.
+function writeCount(readout, ids, matched, total, noun) {
+  // Plainly, because there is nothing left to qualify. This used to carry a second branch for
+  // a capped table: it said 'No match in the 500 loaded' and offered a link to search the
+  // rest, because the browser filter could only ever see the slice the server had sent. No
+  // table is capped any more, so every one of these counts is about every row that exists.
+  if (!matched) readout.textContent = 'No ' + noun + 's match — ' + total + ' hidden';
   else readout.textContent = 'Showing ' + matched + ' of ' + total + ' ' + noun
     + (total === 1 ? '' : 's');
 }
@@ -2551,7 +3171,8 @@ function narrowed(input) {
     var f = document.querySelector('input.date-from[data-from~="' + id + '"]');
     var t = document.querySelector('input.date-to[data-to~="' + id + '"]');
     var c = document.querySelector('select.choice-filter[data-choice-for~="' + id + '"]');
-    return (f && f.value) || (t && t.value) || (c && c.value);
+    var r = document.querySelector('.pill.sel[data-reason-for~="' + id + '"]');
+    return (f && f.value) || (t && t.value) || (c && c.value) || !!r;
   });
 }
 
@@ -2711,6 +3332,43 @@ document.addEventListener('click', function (e) {
   refreshTargets(targets);
 });
 
+// Preset reasons. The chips do not carry the answer — the textarea does, and it is the only thing
+// submitted. Pressing one writes its sentence in, pressing it again takes it out, and anything
+// typed by hand is left alone as another clause of the same list.
+function presetClauses(box) {
+  return (box.value || '').split(';').map(function (part) { return part.trim(); })
+                          .filter(function (part) { return part !== ''; });
+}
+
+// Lit from the text, never from what was last clicked. Deleting a clause by hand has to unlight its
+// chip, or the control starts claiming something the box does not say.
+function markPresets(box) {
+  var clauses = presetClauses(box);
+  document.querySelectorAll('.chip[data-preset-for="' + box.id + '"]').forEach(function (chip) {
+    var on = clauses.indexOf(chip.getAttribute('data-preset')) !== -1;
+    chip.classList.toggle('sel', on);
+    chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+document.addEventListener('click', function (e) {
+  var chip = e.target.closest && e.target.closest('.chip[data-preset]');
+  if (!chip) return;
+  var box = document.getElementById(chip.getAttribute('data-preset-for') || '');
+  if (!box) return;
+  var phrase = chip.getAttribute('data-preset');
+  var clauses = presetClauses(box);
+  var at = clauses.indexOf(phrase);
+  if (at === -1) { clauses.push(phrase); } else { clauses.splice(at, 1); }
+  box.value = clauses.join('; ');
+  markPresets(box);
+  box.focus();
+});
+
+document.addEventListener('input', function (e) {
+  if (e.target.matches && e.target.matches('textarea.fld')) markPresets(e.target);
+});
+
 document.addEventListener('click', function (e) {
   var clear = e.target.closest && e.target.closest('[data-date-clear]');
   if (!clear) return;
@@ -2725,6 +3383,21 @@ document.addEventListener('click', function (e) {
 document.addEventListener('change', function (e) {
   if (!e.target.matches || !e.target.matches('select.choice-filter')) return;
   refreshTargets(e.target.getAttribute('data-choice-for') || '');
+});
+
+// Reason chips. Single-select: pressing the pressed one clears it, which is the only way back to
+// "all reasons" without a fifth chip that says so.
+document.addEventListener('click', function (e) {
+  var pill = e.target.closest && e.target.closest('.pill[data-reason-for]');
+  if (!pill || pill.disabled) return;
+  var targets = pill.getAttribute('data-reason-for') || '';
+  var wanted = !pill.classList.contains('sel');
+  document.querySelectorAll('.pill[data-reason-for="' + targets + '"]').forEach(function (other) {
+    var on = wanted && other === pill;
+    other.classList.toggle('sel', on);
+    other.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  refreshTargets(targets);
 });
 
 document.addEventListener('click', function (e) {
@@ -2763,12 +3436,424 @@ document.addEventListener('keydown', function (e) {
   refreshFor(e.target, true);
 });
 
+// --- deciding what a message is, without leaving the queue ---------------------------------------
+// The decision used to be a page: press "Not a delivery" on a row, land on a form, submit, land on
+// another list. Three navigations, and the filter, the page and the scroll position were gone by
+// the end of them — on a queue of 3,500 rows that is the row you were reading, lost.
+//
+// Here the same form arrives in the popup already open over the queue, and the answer comes back as
+// data rather than as a page. The rows the verdict retires are taken out of the tables in place.
+// The server is unchanged in what it decides; this changes only where the reader is standing.
+
+function verdictForm() {
+  var dialog = document.getElementById('mailbox-dialog');
+  if (!dialog || !dialog.open) return null;
+  return dialog.querySelector('form.uform[action="/ui/mail/verdict"]');
+}
+
+// Every row of these messages, across every table on the page: the message's own row, its
+// attachments, and each record read out of it.
+function rowsOfMessages(ids) {
+  var wanted = {};
+  ids.forEach(function (id) { wanted[id] = true; });
+  return Array.prototype.filter.call(
+    document.querySelectorAll('tr[data-mail-id]'),
+    function (row) { return wanted[row.getAttribute('data-mail-id')] === true; });
+}
+
+function takeRowsAway(ids) {
+  var gone = rowsOfMessages(ids);
+  gone.forEach(function (row) { row.remove(); });
+  // The counts, the paging and the search all read the rows that are there, so one repaint is what
+  // makes the page true again. Nothing is refetched.
+  refreshEveryView();
+  return gone.length;
+}
+
+// What was just decided, and the way back out of it. Undo posts the opposite verdict for exactly
+// the messages that were set aside, then reloads — the rows have to come back from the server,
+// and `restorePlace()` puts the filter and the scroll back as they were.
+function sayWhatWasDecided(answer, rows) {
+  var messages = answer.email_ids || [];
+  var said = (answer.verdict === 'not_delivery' ? 'Set aside ' : 'Updated ')
+    + messages.length + (messages.length === 1 ? ' message' : ' messages')
+    + (rows ? ' · ' + rows + (rows === 1 ? ' row' : ' rows') + ' off this page' : '');
+  var box = document.createElement('div');
+  box.className = 'toast';
+  box.setAttribute('role', 'status');
+  box.appendChild(document.createTextNode(said + ' · '));
+  var undo = document.createElement('button');
+  undo.type = 'button';
+  undo.className = 'toast-undo';
+  undo.textContent = 'Undo';
+  undo.addEventListener('click', function () {
+    undo.disabled = true;
+    undo.textContent = 'Undoing…';
+    var back = answer.verdict === 'not_delivery' ? 'delivery' : 'not_delivery';
+    var undone = 0;
+    messages.forEach(function (id) {
+      var body = 'email_id=' + encodeURIComponent(id) + '&to=' + encodeURIComponent(back)
+        + '&by=' + encodeURIComponent(answer.by || 'undo')
+        + '&note=' + encodeURIComponent('undone from the queue');
+      fetch('/ui/mail/verdict', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'},
+        body: body
+      }).then(function () {
+        if (++undone === messages.length) { savePlace(); location.reload(); }
+      });
+    });
+  });
+  box.appendChild(undo);
+  document.body.appendChild(box);
+  setTimeout(function () { box.remove(); }, 12000);
+}
+
+document.addEventListener('submit', function (e) {
+  var form = e.target;
+  if (form !== verdictForm()) return;
+  e.preventDefault();
+  var button = form.querySelector('button[type="submit"]');
+  var label = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = 'Recording…'; }
+  var by = form.querySelector('[name="by"]');
+  // Remembered so the second decision of a session is one press and a reason, not a name retyped
+  // thirty times. `localStorage`, because it is the person, not the page they are standing on.
+  if (by && by.value) { try { localStorage.setItem('premier-verdict-by', by.value); } catch (err) {} }
+
+  fetch(form.getAttribute('action'), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'},
+    body: new URLSearchParams(new FormData(form)).toString()
+  }).then(function (r) { return r.json(); }).then(function (answer) {
+    if (!answer || !answer.ok) {
+      // Refused — an unsigned decision, most often. The form stays open carrying what was typed.
+      if (button) { button.disabled = false; button.textContent = label; }
+      var problem = document.createElement('div');
+      problem.className = 'errors';
+      problem.appendChild(Object.assign(document.createElement('p'),
+        {textContent: (answer && answer.problem) || 'That was not recorded. Try again.'}));
+      form.parentNode.insertBefore(problem, form);
+      return;
+    }
+    answer.by = by ? by.value : '';
+    var dialog = document.getElementById('mailbox-dialog');
+    // `resetFragmentStack` runs off the dialog's own close handler, so the layers this decision
+    // was opened through are cleared with it rather than left behind.
+    if (dialog && dialog.open && dialog.close) { window.__fragStack = []; dialog.close(); }
+    sayWhatWasDecided(answer, takeRowsAway(answer.email_ids || []));
+  }).catch(function () {
+    // The network, not the decision. Nothing was recorded, so the form is handed back with what
+    // was typed still in it and the full page form one link away.
+    if (button) { button.disabled = false; button.textContent = label; }
+    var problem = document.createElement('div');
+    problem.className = 'errors';
+    problem.appendChild(Object.assign(document.createElement('p'),
+      {textContent: 'That did not reach the server, and nothing was recorded. Try again.'}));
+    form.parentNode.insertBefore(problem, form);
+  });
+});
+
+// The name this person signed with last time, filled in as the form arrives in the popup.
+function prefillVerdictName() {
+  var form = verdictForm();
+  if (!form) return;
+  var by = form.querySelector('[name="by"]');
+  var remembered = null;
+  try { remembered = localStorage.getItem('premier-verdict-by'); } catch (err) { /* private mode */ }
+  if (by && !by.value && remembered) by.value = remembered;
+}
+
+
+// --- keeping your place -------------------------------------------------------
+// Every page here is server-rendered, so acting on a row is a navigation: Not a delivery, Waive,
+// Create, and the Back link out of each of them. The filter text, the table page, the sort and the
+// scroll position lived only in the document, so all four were gone on the way back — and the
+// person landed on 500 unfiltered rows hunting for the one they had been reading.
+//
+// So the page writes down what it looks like and puts it back. `sessionStorage`, not `local`: this
+// is where *this tab* was standing. It should not follow the operator into a second window opened
+// to compare two queues, and it should not still be filtering the queue tomorrow morning.
+//
+// The key is the full path and query, so /ui/records and /ui/manual remember separately, and
+// ?all=1 is a different view of a page rather than the same one.
+var PLACE_PREFIX = 'premier-place:';
+var PLACE_TTL_MS = 43200000;          // 12 hours: a filter older than a shift is not where you are
+var NAV_KEY = 'premier-nav';
+var TRAIL_PREFIX = 'premier-trail:';
+var navIndex = 0;
+var TOAST_KEY = 'premier-toast';
+
+// Every read and write goes through these two. Private mode, and a browser set to block site data,
+// both throw on the first touch — and a page that remembers nothing must still be a working page.
+function readStore(key) {
+  try { return sessionStorage.getItem(key); } catch (err) { return null; }
+}
+
+function writeStore(key, value) {
+  try {
+    if (value === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, value);
+  } catch (err) { /* storage disabled: the page works, it just does not remember */ }
+}
+
+function placeKey() { return PLACE_PREFIX + location.pathname + location.search; }
+
+// What the page looks like right now, as data. Only what a person set: an empty box is not a state
+// worth restoring, and storing it would make "nothing is filtered" look like a decision.
+function collectPlace() {
+  var state = {filters: {}, dates: {}, choice: {}, reason: {}, pages: {}, sort: {},
+               scrollY: window.scrollY, savedAt: Date.now()};
+  document.querySelectorAll('input.filter').forEach(function (input) {
+    if (input.value !== '') state.filters[input.getAttribute('data-filter') || ''] = input.value;
+  });
+  document.querySelectorAll('input.date-from, input.date-to').forEach(function (input) {
+    var from = input.classList.contains('date-from');
+    var targets = input.getAttribute(from ? 'data-from' : 'data-to') || '';
+    if (input.value) state.dates[(from ? 'from ' : 'to ') + targets] = input.value;
+  });
+  document.querySelectorAll('select.choice-filter').forEach(function (select) {
+    if (select.value) state.choice[select.getAttribute('data-choice-for') || ''] = select.value;
+  });
+  document.querySelectorAll('.pill.sel[data-reason-for]').forEach(function (pill) {
+    state.reason[pill.getAttribute('data-reason-for') || ''] = pill.getAttribute('data-reason') || '';
+  });
+  Object.keys(pageOf).forEach(function (id) {
+    if (pageOf[id] > 1) state.pages[id] = pageOf[id];
+  });
+  document.querySelectorAll('.scroll[id]').forEach(function (scope) {
+    var th = scope.querySelector('thead th[aria-sort="ascending"], thead th[aria-sort="descending"]');
+    if (th && th.getAttribute('data-sort')) {
+      state.sort[scope.id] = {column: parseInt(th.getAttribute('data-sort'), 10),
+                              direction: th.getAttribute('aria-sort')};
+    }
+  });
+  return state;
+}
+
+function placeIsEmpty(state) {
+  return !Object.keys(state.filters).length && !Object.keys(state.dates).length
+    && !Object.keys(state.choice).length && !Object.keys(state.reason).length
+    && !Object.keys(state.pages).length && !Object.keys(state.sort).length
+    && !state.scrollY;
+}
+
+function savePlace() {
+  var state = collectPlace();
+  writeStore(placeKey(), placeIsEmpty(state) ? null : JSON.stringify(state));
+}
+
+// Saved a moment after the change rather than on every keystroke: typing a PO number is eight
+// events and one state worth keeping.
+var placeTimer = null;
+function savePlaceSoon() {
+  if (placeTimer) clearTimeout(placeTimer);
+  placeTimer = setTimeout(savePlace, 300);
+}
+
+document.addEventListener('input', savePlaceSoon);
+document.addEventListener('change', savePlaceSoon);
+// Paging, sorting and the reason pills are clicks, and each one runs its own listener first.
+document.addEventListener('click', savePlaceSoon);
+// The scroll position is only interesting at the moment of leaving, and `pagehide` fires for a
+// navigation, a reload and a tab close alike.
+window.addEventListener('pagehide', savePlace);
+
+function storedPlace() {
+  var raw = readStore(placeKey());
+  if (!raw) return null;
+  var state = null;
+  try { state = JSON.parse(raw); } catch (err) { return null; }
+  if (!state || !state.savedAt || Date.now() - state.savedAt > PLACE_TTL_MS) return null;
+  return state;
+}
+
+function restoreFilters(state) {
+  document.querySelectorAll('input.filter').forEach(function (input) {
+    var saved = state.filters[input.getAttribute('data-filter') || ''];
+    if (saved) input.value = saved;
+  });
+  var ranges = {};
+  document.querySelectorAll('input.date-from, input.date-to').forEach(function (input) {
+    var from = input.classList.contains('date-from');
+    var targets = input.getAttribute(from ? 'data-from' : 'data-to') || '';
+    var saved = state.dates[(from ? 'from ' : 'to ') + targets];
+    if (saved) { input.value = saved; ranges[targets] = true; }
+  });
+  // A restored range with no chip lit would leave the group claiming no range while one is hiding
+  // two thirds of the table. `null` is the Custom segment, which is what a remembered range is.
+  Object.keys(ranges).forEach(function (targets) { markChips(targets, null); });
+  document.querySelectorAll('select.choice-filter').forEach(function (select) {
+    var saved = state.choice[select.getAttribute('data-choice-for') || ''];
+    if (saved) select.value = saved;
+  });
+  Object.keys(state.reason).forEach(function (targets) {
+    document.querySelectorAll('.pill[data-reason-for="' + targets + '"]').forEach(function (pill) {
+      var on = pill.getAttribute('data-reason') === state.reason[targets];
+      pill.classList.toggle('sel', on);
+      pill.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  });
+}
+
+// Sort before page, because sorting is what decides which rows page two holds.
+function restorePaging(state) {
+  Object.keys(state.sort).forEach(function (id) {
+    var how = state.sort[id];
+    if (how && typeof how.column === 'number') sortBy(id, how.column, how.direction);
+  });
+  Object.keys(state.pages).forEach(function (id) { pageOf[id] = state.pages[id]; });
+}
+
+// Beside the count, and only when something was restored. A filter the person did not just type is
+// hiding rows, and the difference between "nothing matched" and "nothing is here" has to be one
+// press away.
+function offerClearFilters() {
+  document.querySelectorAll('.filter-bar').forEach(function (bar) {
+    if (bar.querySelector('.place-clear')) return;
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'place-clear';
+    button.textContent = 'Clear filters';
+    button.title = 'This page was left filtered. Clear it and show everything.';
+    bar.appendChild(button);
+  });
+}
+
+function clearPlace() {
+  document.querySelectorAll('input.filter').forEach(function (input) { input.value = ''; });
+  var ranges = {};
+  document.querySelectorAll('input.date-from, input.date-to').forEach(function (input) {
+    var from = input.classList.contains('date-from');
+    ranges[input.getAttribute(from ? 'data-from' : 'data-to') || ''] = true;
+    input.value = '';
+  });
+  Object.keys(ranges).forEach(function (targets) { markChips(targets, ''); });
+  document.querySelectorAll('select.choice-filter').forEach(function (select) { select.value = ''; });
+  document.querySelectorAll('.pill.sel[data-reason-for]').forEach(function (pill) {
+    pill.classList.remove('sel');
+    pill.setAttribute('aria-pressed', 'false');
+  });
+  Object.keys(pageOf).forEach(function (id) { pageOf[id] = 1; });
+  writeStore(placeKey(), null);
+  document.querySelectorAll('.place-clear').forEach(function (button) { button.remove(); });
+  refreshEveryView();
+}
+
+document.addEventListener('click', function (e) {
+  if (e.target.closest && e.target.closest('.place-clear')) clearPlace();
+});
+
+// Puts the page back the way it was left. Returns whether it did, because the caller repaints once
+// either way and doing it twice is the paged table flashing every row it has.
+function restorePlace() {
+  var state = storedPlace();
+  if (!state) return false;
+  restoreFilters(state);
+  restorePaging(state);
+  refreshEveryView();
+  if (Object.keys(state.filters).length || Object.keys(state.dates).length
+      || Object.keys(state.choice).length || Object.keys(state.reason).length) {
+    offerClearFilters();
+  }
+  window.scrollTo(0, state.scrollY || 0);
+  return true;
+}
+
+// Where this page sits in the tab's history, and what was on the entries before it.
+//
+// This app has always used a real link rather than `history.back()`, for a reason that still
+// holds: a refused form is a POST landing on the form's OWN url, so one step back is the form
+// again rather than the queue behind it. The trail below is what turns the shortcut from an
+// assumption into something checkable — a step back is taken only when the previous entry is
+// provably the link's destination, and every other case follows the href exactly as before.
+//
+// The index is stamped on the history entry itself, so a page the browser restores by Back keeps
+// the one it was given rather than being counted as a new visit.
+function trackPlace() {
+  var here = location.pathname + location.search;
+  var state = null;
+  try { state = history.state; } catch (err) { state = null; }
+  if (state && state.premierNav) {
+    navIndex = state.premierNav;
+  } else {
+    navIndex = (parseInt(readStore(NAV_KEY), 10) || 0) + 1;
+    writeStore(NAV_KEY, String(navIndex));
+    try { history.replaceState({premierNav: navIndex}, ''); } catch (err) { /* no history api */ }
+  }
+  writeStore(TRAIL_PREFIX + navIndex, here);
+}
+
+// The entry immediately before this one: the only thing `history.back()` can be relied on to reach.
+function entryBefore() {
+  return navIndex > 1 ? readStore(TRAIL_PREFIX + (navIndex - 1)) : null;
+}
+
+// The last page that was not this one, which is where an action should return to. Not the same as
+// `entryBefore`: a refusal re-renders this url, so the entry right before can be this very form.
+function pageBefore() {
+  for (var back = navIndex - 1; back > 0 && back > navIndex - 12; back--) {
+    var was = readStore(TRAIL_PREFIX + back);
+    if (was && was.split('?')[0] !== location.pathname) return was;
+  }
+  return null;
+}
+
+// A history step when the entry behind us really is this link's destination: the browser then hands
+// back the page it already has, filters, scroll and all, with no request at all. Otherwise the href
+// does its ordinary job and `restorePlace()` puts the filters back on arrival.
+document.addEventListener('click', function (e) {
+  var link = e.target.closest && e.target.closest('a[data-back-to]');
+  if (!link) return;
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+  if (link.getAttribute('data-back-to') !== entryBefore() || history.length < 2) return;
+  e.preventDefault();
+  savePlace();
+  history.back();
+});
+
+// Where a POST should send them afterwards, filled in as it leaves. The server validates it — a
+// page cannot be trusted to name its own redirect — and falls back to today's landing page.
+document.addEventListener('submit', function (e) {
+  var form = e.target;
+  var field = form.querySelector && form.querySelector('input[name="return_to"]');
+  if (field && !field.value) field.value = pageBefore() || '';
+  var said = form.getAttribute('data-done');
+  if (said) writeStore(TOAST_KEY, said);
+});
+
+// What just happened, said once on the page they land on. It rides in storage rather than the query
+// string so the address bar stays clean and a reload does not repeat it.
+function showToast() {
+  var said = readStore(TOAST_KEY);
+  if (!said || !document.body) return;
+  writeStore(TOAST_KEY, null);
+  var box = document.createElement('div');
+  box.className = 'toast';
+  box.setAttribute('role', 'status');
+  box.textContent = said;
+  document.body.appendChild(box);
+  setTimeout(function () { box.remove(); }, 6000);
+}
+
 // The first paint. Without it a paged table renders every row until someone touches a control,
 // which is exactly the state paging exists to avoid.
+//
+// Preset chips are lit here too, for the same reason: a refused submission comes back carrying what
+// was typed, and chips that ignored it would show nothing selected above a box that already holds
+// two of their sentences.
+function firstPaint() {
+  trackPlace();
+  // `restorePlace` repaints when it has something to put back, so this does not repaint twice.
+  if (!restorePlace()) refreshEveryView();
+  document.querySelectorAll('textarea.fld').forEach(markPresets);
+  showToast();
+}
+
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', refreshEveryView);
+  document.addEventListener('DOMContentLoaded', firstPaint);
 } else {
-  refreshEveryView();
+  firstPaint();
 }
 
 // New mail, without anyone pressing F5. These pages are server-rendered and had no client-side
@@ -2777,14 +3862,55 @@ if (document.readyState === 'loading') {
 // what makes a ten-second poll affordable.
 //
 // The page reloads *itself* only when doing so cannot interrupt anyone: scrolled to the top, no
-// message dialog open, tab in the foreground. Otherwise the pill waits to be clicked. Reloading
-// under someone reading a POD is worse than being slightly out of date.
+// message dialog open, tab in the foreground, and no ingest run in flight. Otherwise the pill
+// waits to be clicked. Reloading under someone reading a POD is worse than being slightly out of
+// date — and during a run the token moves on nearly every poll, so "reload when it moved" would
+// mean reloading for the whole run.
 (function () {
   var POLL_MS = 10000;
-  var baseline = document.body && document.body.getAttribute('data-version');
-  if (!baseline) return;
+
+  // **Deferred, because this script runs in `<head>`.**
+  //
+  // It read `document.body` at parse time, where `body` does not exist yet — so `baseline` was
+  // always null, the guard below returned, and `setInterval` was never reached. Measured in real
+  // Chrome over CDP: **zero polls in twenty-five seconds.** This poller had therefore never run,
+  // which means the "New mail — click to load" pill could never appear either.
+  //
+  // It went unnoticed because the one page that visibly depended on staying current had a
+  // a meta-refresh tag doing the job instead. Remove that refresh — as the two-second
+  // reload had to be — and the page simply froze, still claiming to be working long after the run
+  // had finished. Two bugs that concealed each other.
+  //
+  // The rest of `_JS` already waits for the DOM (see `refreshEveryView` below); only this block
+  // did not.
+  function start() {
+    var body = document.body;
+    var baseline = body && body.getAttribute('data-version');
+    if (!baseline) return;
+    setUp(baseline, body.getAttribute('data-running') === '1');
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+
+  function setUp(baseline, startedRunning) {
+
+  // Seeded from the server render, not from the first poll. A page opened during a run and then
+  // left in a background tab polls nothing while it is hidden — so if the run finishes in that
+  // time, the first poll on return would see `running:false` with nothing to compare against and
+  // conclude no transition had happened. The page would sit reading "Running now..." for a run
+  // that ended long before. Starting from what the server actually rendered closes that hole.
+  var wasRunning = startedRunning;
 
   function pill() { return document.getElementById('live-pill'); }
+
+  function offerPill() {
+    var p = pill();
+    if (p) p.hidden = false;
+  }
 
   function safeToReloadWithoutAsking() {
     return window.scrollY < 4
@@ -2801,10 +3927,41 @@ if (document.readyState === 'loading') {
     fetch('/ui/version', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (v) {
-        if (!v || !v.token || v.token === baseline || v.token === 'unavailable') return;
+        if (!v) return;
+
+        var running = v.running === true;
+        var justFinished = wasRunning && !running;
+        wasRunning = running;
+
+        // A run that has just ended, handled BEFORE the token is even looked at.
+        //
+        // Gating this on the token would reintroduce the bug it is here to fix: the token is
+        // `boot:newest_email_log_id:count:run_id:arrivals`, and a run that read nothing new moves
+        // none of those — `start_run` inserted the row (so `run_id` was already in the baseline
+        // this page rendered with) and `finish_run` only updates it. So a quiet run can begin and
+        // end with an identical token, and a page waiting for the token to move would show
+        // "Running now..." for ever. Observed exactly that: run 1085 finished at 17:31:07 and the
+        // page still claimed it was running at 17:49.
+        //
+        // This is the one automatic reload left, and it is an edge rather than a level: it fires
+        // once, on the true -> false transition, not for as long as the run is over.
+        if (justFinished) {
+          if (safeToReloadWithoutAsking()) { location.reload(); return; }
+          offerPill();      // mid-read: let them choose the moment, same as for new mail
+          return;
+        }
+
+        if (v.token === baseline || !v.token || v.token === 'unavailable') return;
+
+        // While a run is in flight, never reload on our own — offer the pill instead. The token
+        // carries email_log's count and highest id, so during a pass it changes on almost every
+        // poll: auto-reloading here would put the page back to reloading every ten seconds, which
+        // is the behaviour removed from /ui/automation (where it was a two-second <meta refresh>
+        // that ignored all of the etiquette above).
+        if (running) { offerPill(); return; }
+
         if (safeToReloadWithoutAsking()) { location.reload(); return; }
-        var p = pill();
-        if (p) p.hidden = false;
+        offerPill();
       })
       .catch(function () { /* a failed poll must never break the page */ });
   }
@@ -2813,7 +3970,152 @@ if (document.readyState === 'loading') {
     if (e.target.closest('#live-pill')) location.reload();
   });
 
-  setInterval(check, POLL_MS);
+    setInterval(check, POLL_MS);
+  }
+})();
+
+// The progress ring, advancing while a run is in flight.
+//
+// This is the half the removed meta-refresh tag used to do, without the half that made it
+// unacceptable. That tag reloaded the whole document every two seconds for the length of a run —
+// hundreds of reloads, each throwing away scroll position, open dialogs and table filters, and it
+// went on doing so for twelve hours at a stretch when a run wedged in Graph auth. So the poller
+// above is deliberately forbidden from reloading while `running` is true.
+//
+// Patching four bits of text in place has none of those costs. Nothing is thrown away because
+// nothing is replaced: no reload, no scroll reset, no dialog closed, no filter lost. The etiquette
+// `safeToReloadWithoutAsking()` has to work out does not apply, because there is nothing to ask
+// about.
+//
+// It talks to `/ui/run-progress`, not `/ui/version`: that endpoint reads two SQLite databases and
+// runs an anti-join, which is affordable at ten seconds and not at two. This one reads a dict in
+// the server's memory.
+(function () {
+  var TICK_MS = 2000;
+
+  function el(name) { return document.querySelector('[data-' + name + ']'); }
+
+  function paint(p) {
+    var block = el('prog');
+    if (!block) return;
+    block.hidden = !p.running;
+    var stopWhenIdle = el('run-stop');
+    if (stopWhenIdle && !p.running) {
+      var idleBtn = stopWhenIdle.querySelector('button');
+      if (idleBtn) {
+        idleBtn.disabled = true;
+        var idleLbl = idleBtn.querySelector('.lbl');
+        if (idleLbl) idleLbl.textContent = 'Stop this run';
+      }
+    }
+    if (!p.running) return;
+
+    // The card AROUND the ring, not just the ring. A page drawn while nothing was running says
+    // "Last run 58 minutes ago" over `0 emails read`; showing a live ring inside that card without
+    // touching it produced a screen claiming both at once — a run at 100% above the words "last run
+    // 58 minutes ago". The server already renders exactly this state when it draws during a run
+    // (headline, warn tone, and `—` for figures nobody can know yet), so this brings the page to
+    // the state the server would have rendered, rather than inventing a third one.
+    //
+    // Only ever on the way IN. When the run ends, the ten-second poller's `justFinished` edge is
+    // what restores the page — it reloads when that is not rude and offers the pill when it is,
+    // which is a judgement this ticker has no business making. Cost: up to ten seconds where the
+    // ring is gone but the headline still reads "Running now…".
+    var card = block.closest('.card');
+    if (card) {
+      card.className = 'card warn';
+      var head = card.querySelector('h2');
+      if (head) head.textContent = 'Running now\\u2026';
+      var detail = card.querySelector('[data-run-detail]');
+      if (detail) {
+        detail.textContent = 'The automation is working through the mail. You can leave this '
+          + 'page \\u2014 it keeps going, and the progress above advances as it does.';
+      }
+      // Every figure in this strip comes from a run row inserted BEFORE the pass, with each count
+      // defaulting to zero. Mid-run they are not small numbers, they are unknown ones.
+      card.querySelectorAll('.statrow b').forEach(function (b) { b.textContent = '\\u2014'; });
+    }
+
+    var ring = el('prog-ring');
+    var pct = el('prog-pct');
+    if (ring) {
+      if (p.total > 0) {
+        var value = Math.max(0, Math.min(100, Math.round(p.done * 100 / p.total)));
+        ring.classList.remove('spin');
+        ring.style.setProperty('--pct', value);
+        if (pct) pct.textContent = value + '%';
+      } else {
+        // No denominator yet — reading the mailbox is one call with no interior milestones, and a
+        // determinate ring frozen at 0% reads as stalled. Spin instead, exactly as the server-
+        // rendered form does.
+        ring.classList.add('spin');
+        ring.style.setProperty('--pct', 0);
+        if (pct) pct.textContent = '';
+      }
+    }
+    var what = el('prog-what');
+    if (what) what.textContent = p.label || 'Working';
+    var detail = el('prog-detail');
+    if (detail) {
+      var text = p.total > 0 ? p.done + ' of ' + p.total
+               : (p.done > 0 ? p.done + ' mailbox call' + (p.done === 1 ? '' : 's') + ' so far'
+                             : 'connecting to the mailbox');
+      if (p.note) text += ' \\u00b7 ' + p.note;
+      if (p.elapsed_seconds !== null && p.elapsed_seconds !== undefined) {
+        text += ' \\u00b7 ' + elapsed(p.elapsed_seconds);
+      }
+      // Only once it is worth saying. A few seconds between calls is normal; a figure that keeps
+      // climbing is how a stuck run shows itself before the watchdog steps in.
+      if (p.silent_seconds !== null && p.silent_seconds !== undefined && p.silent_seconds >= 30) {
+        text += ' \\u00b7 no activity for ' + elapsed(p.silent_seconds).replace('running ', '');
+      }
+      if (p.stop_requested) text = 'stopping \\u2014 finishing the call it is in \\u00b7 ' + text;
+      detail.textContent = text;
+    }
+    var stop = el('run-stop');
+    if (stop) {
+      var btn = stop.querySelector('button');
+      if (btn) {
+        btn.disabled = !!p.stop_requested;
+        var lbl = btn.querySelector('.lbl');
+        if (lbl) lbl.textContent = p.stop_requested ? 'Stopping\\u2026' : 'Stop this run';
+      }
+    }
+  }
+
+  // Server-computed seconds, formatted here. The count comes from the server because the browser's
+  // clock is not ours, and "running for 2 minutes" off a skewed clock is worse than no number.
+  function elapsed(seconds) {
+    if (seconds < 90) return 'running ' + seconds + 's';
+    var mins = Math.floor(seconds / 60);
+    if (mins < 90) return 'running ' + mins + ' min';
+    var hours = Math.floor(seconds / 3600);
+    return 'running ' + hours + (hours === 1 ? ' hour' : ' hours');
+  }
+
+  function tick() {
+    // A background tab advances nothing. Nobody is looking, and the ring is repainted from the
+    // next poll the moment it comes back.
+    if (document.visibilityState !== 'visible') return;
+    fetch('/ui/run-progress', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(paint)
+      .catch(function () { /* a failed tick must never break the page */ });
+  }
+
+  function start() {
+    // Only on a page that carries the block. Every other page would be polling for something it
+    // has nowhere to display.
+    if (!el('prog')) return;
+    setInterval(tick, TICK_MS);
+    tick();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
 })();
 """
 
@@ -2823,6 +4125,208 @@ _LIVE_PILL = (
     '<button id="live-pill" class="live-pill" hidden aria-live="polite" '
     'title="Reload to show the new mail">New mail — click to load</button>'
 )
+
+# Shipped hidden on every page and revealed by the script when a navigation starts. Rendered rather
+# than created in JS so there is nothing to build on the click — the whole point is that the
+# feedback lands in the same frame as the press.
+#
+# `aria-hidden`: the lit nav entry is what a screen reader should hear, and a bar that reports no
+# progress has nothing to announce.
+_LOAD_BAR = '<div class="load-bar" hidden aria-hidden="true"></div>'
+
+_LOGIN_CSS = """
+  /* Only the centring and the two things the rest of the app has no equivalent of. The card, the
+     fields and the button are `.card`, `.field`/`.fld` and `.btn.primary`, which already exist —
+     a login screen that invented its own would drift away from the app it fronts. */
+  .login-wrap { min-height:100vh; display:flex; align-items:center; justify-content:center;
+                padding:24px; box-sizing:border-box; }
+  .login-card { width:100%; max-width:340px; }
+  .login-card h1 { font-size:1.1rem; margin:0 0 2px; }
+  .login-card .sub { color:var(--muted); font-size:.82rem; margin:0 0 16px; }
+  /* `button.btn`, not `button`. The bare selector also matched the reveal button inside the
+     password box and beat `.reveal` on specificity, so the eye was stretched to the full
+     300px of the field and its flex centring parked it in the middle of the text. */
+  .login-card button.btn { width:100%; margin-top:4px; }
+  .login-error { border-left:3px solid var(--danger); background:var(--surface);
+                 padding:8px 10px; margin:0 0 14px; font-size:.82rem; }
+  .login-note { color:var(--muted); font-size:.75rem; margin:14px 0 0; line-height:1.45; }
+"""
+
+_LOGIN_MESSAGES = {
+    # Keyed by a flag, never by text from the query string: a message taken from the caller is a
+    # sentence an attacker gets to write onto Premier's login page and mail to somebody.
+    "1": "That username and password do not match.",
+    "setup": "Check the username, and that both passwords match and run to 12 characters.",
+    "reset": "Check the username exists, and that both passwords match and run to 12 characters.",
+}
+
+
+_EYE_ON = _icon('<path d="M1 8s2.6-4.5 7-4.5S15 8 15 8s-2.6 4.5-7 4.5S1 8 1 8z"/>'
+                '<circle cx="8" cy="8" r="1.9"/>')
+
+_EYE_OFF = _icon('<path d="M1 8s2.6-4.5 7-4.5c1 0 1.9.2 2.7.5"/>'
+                 '<path d="M13.3 6.1c1.1 1 1.7 1.9 1.7 1.9s-2.6 4.5-7 4.5c-1.3 0-2.4-.4-3.3-.9"/>'
+                 '<path d="M2 14 14 2"/>')
+
+
+def password_field(name: str, label: str, *, autocomplete: str = "current-password") -> Raw:
+    """A password box with an eye button that shows what was typed.
+
+    Built here rather than as `field(kind="password")` because the button has to sit *inside* the
+    box, which means the control needs a positioned wrapper of its own -- and `field()` is used by
+    every other form in the app, none of which wants one.
+
+    The button is a real `<button type="button">`: `type` matters, because a button inside a form
+    submits it by default, and an eye that signs you in on the way past is worse than no eye. It
+    carries `aria-pressed` so a screen reader announces the state rather than just the press, and
+    both icons ship in the markup with CSS choosing between them, so toggling costs no redraw and
+    no second request.
+
+    What it does *not* do is remember the choice. Revealing a password is a deliberate act for the
+    moment you are checking a typo, and a page that came back with the password already showing --
+    because you revealed one three days ago -- is a page that shows it to whoever is behind you.
+    """
+    control_id = f"f-{name}"
+    return tag(
+        "div",
+        tag("label", label, tag("span", " *", class_="req"), for_=control_id),
+        tag("div",
+            tag("input", type="password", name_=name, id=control_id, required="required",
+                autocomplete=autocomplete, class_="fld"),
+            tag("button",
+                tag("span", _EYE_ON, class_="eye-on"),
+                tag("span", _EYE_OFF, class_="eye-off"),
+                type="button", class_="reveal", data_reveal=control_id,
+                aria_controls=control_id, aria_pressed="false",
+                aria_label=f"Show {label.lower()}", title=f"Show {label.lower()}"),
+            class_="fld-wrap"),
+        class_="field")
+
+
+_REVEAL_CSS = """
+  .fld-wrap { position:relative; display:block; }
+  .fld-wrap .fld { width:100%; box-sizing:border-box; padding-right:38px; }
+  .reveal { position:absolute; top:1px; right:1px; bottom:1px; width:34px; display:flex;
+            align-items:center; justify-content:center; padding:0; border:0; cursor:pointer;
+            background:none; color:var(--muted); border-radius:0 5px 5px 0;
+            min-width:34px; max-width:34px; flex:none; }
+  .reveal:hover { color:var(--fg); }
+  .reveal:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+  .reveal .eye-on, .reveal .eye-off { display:flex; }
+  .reveal .eye-off { display:none; }
+  .reveal[aria-pressed="true"] .eye-on { display:none; }
+  .reveal[aria-pressed="true"] .eye-off { display:flex; }
+"""
+
+_LOGIN_JS = """
+// The eye button, and nothing else. This page deliberately does not load `_JS`: that script polls
+// /ui/version every ten seconds against a route a signed-out visitor is refused, which is a
+// redirect loop wearing a heartbeat's clothes. So this is its own handful of lines.
+//
+// Delegated from the document rather than bound per button, and `addEventListener` rather than an
+// `onclick` attribute -- inline handlers are forbidden throughout this app, and a login page is
+// the last place to make an exception.
+document.addEventListener('click', function (event) {
+  var button = event.target.closest && event.target.closest('button.reveal');
+  if (!button) return;
+  var input = document.getElementById(button.getAttribute('data-reveal'));
+  if (!input) return;
+  var showing = input.type === 'password';
+  input.type = showing ? 'text' : 'password';
+  button.setAttribute('aria-pressed', showing ? 'true' : 'false');
+  var what = (button.getAttribute('aria-label') || '').replace(/^(Show|Hide) /, '');
+  button.setAttribute('aria-label', (showing ? 'Hide ' : 'Show ') + what);
+  button.setAttribute('title', (showing ? 'Hide ' : 'Show ') + what);
+  // Back to the box with the caret where it was, so revealing mid-word does not cost the typist
+  // their place.
+  var at = input.value.length;
+  input.focus();
+  try { input.setSelectionRange(at, at); } catch (e) { /* type=password may refuse */ }
+});
+"""
+
+
+def login_page(*, next: str = "/ui", error: str = "", first_run: bool = False,
+               can_set_up: bool = False, resetting: bool = False,
+               can_reset: bool = False) -> str:
+    """The sign-in screen. The only page in the app that is not built by `page()`.
+
+    Three things it deliberately does without.
+
+    **No `<script>`.** The form posts natively, so nothing here needs one — and `_JS` would start
+    the ten-second `/ui/version` poll against a route this visitor is not allowed to call, which is
+    a redirect loop dressed up as a heartbeat. It also keeps the app's one inline script behind the
+    gate, where `test_pages_carry_exactly_one_first_party_script_and_nothing_else` guards it.
+
+    **No sidebar and no stat strip.** Both come from `_chrome(conn)`, which reads the queue and the
+    ledger. Drawing those counts for somebody who has not signed in would publish the shape of
+    Premier's mailbox — how much is waiting, how much was routed — to anyone who can reach the port.
+
+    **No way to tell a bad username from a bad password.** `error` is a flag and prints one fixed
+    line from `_LOGIN_MESSAGES`; the caller never supplies the words.
+
+    `can_set_up` draws the create-the-first-account form instead. It is passed only when the store
+    is empty *and* the request came from loopback, and `api.login` re-checks both before it writes
+    anything — this decides which form is drawn, never what is allowed.
+    """
+    if resetting:
+        heading, subtitle = "Reset the password", \
+            "Offered only on the machine serving this app."
+        action, verb = "/login/reset", "Set new password"
+        note = ("At least 12 characters. The old password is not needed and could not be checked "
+                "anyway — only a PBKDF2-SHA256 hash of it is stored, and that is not reversible. "
+                "Every signed-in session is ended.")
+    elif can_set_up:
+        heading, subtitle = "Create the first account", \
+            "No account exists yet. This form is offered only on this machine."
+        action, verb = "/login/set-up", "Create account"
+        note = "At least 12 characters. Stored only as a PBKDF2-SHA256 hash, never as text."
+    else:
+        heading, subtitle = "Premier Receiver", "Sign in to continue."
+        action, verb = "/login", "Sign in"
+        note = ("No account exists yet. Run tools/create_admin.py on the machine serving this "
+                "app to create one." if first_run else
+                "Accounts are created with tools/create_admin.py.")
+
+    entering = "new-password" if (can_set_up or resetting) else "current-password"
+    fields = [field("username", "Username", required=True),
+              password_field("password", "Password", autocomplete=entering)]
+    if can_set_up or resetting:
+        fields.append(password_field("confirm", "Repeat password", autocomplete="new-password"))
+    else:
+        # Carried in the form rather than left in the URL, so submitting cannot drop it.
+        fields.append(tag("input", type="hidden", name_="next", value=next or "/ui"))
+
+    return (
+        _DOCTYPE
+        + _VIEWPORT
+        + str(tag("title", "Sign in · Premier Receiver"))
+        + "<style>" + _CSS + "</style>"
+        + "<style>" + _LOGIN_CSS + _REVEAL_CSS + "</style>"
+        + "<script>" + _LOGIN_JS + "</script>"
+        + "</head><body>"
+        + str(tag("div",
+                  tag("div",
+                      tag("h1", heading),
+                      tag("p", subtitle, class_="sub"),
+                      (tag("p", _LOGIN_MESSAGES.get(error, _LOGIN_MESSAGES["1"]),
+                           class_="login-error") if error else Raw("")),
+                      tag("form", *fields,
+                          tag("button", verb, type="submit", class_="btn primary"),
+                          method="post", action=action),
+                      # Only where `api.login` would actually honour it. Drawn off this machine it
+                      # would be a link to a route that silently does nothing, which reads as the
+                      # app being broken rather than as the guard working.
+                      (tag("p", tag("a", "Forgotten the password?", href="/login?reset=1"),
+                           class_="login-note") if can_reset and not resetting else Raw("")),
+                      (tag("p", tag("a", "Back to sign in", href="/login"),
+                           class_="login-note") if resetting else Raw("")),
+                      tag("p", note, class_="login-note"),
+                      class_="login-card card"),
+                  class_="login-wrap"))
+        + "</body></html>"
+    )
+
 
 _DOCTYPE = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
 _VIEWPORT = "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -2873,7 +4377,8 @@ def _kill_banner() -> Raw:
     )
 
 
-def _sidebar(active: str, counts: Optional[dict] = None, last_run: str = "") -> Raw:
+def _sidebar(active: str, counts: Optional[dict] = None, last_run: str = "",
+             user: str = "") -> Raw:
     groups = []
     for label, entries in _NAV:
         links = []
@@ -2901,10 +4406,30 @@ def _sidebar(active: str, counts: Optional[dict] = None, last_run: str = "") -> 
     # vertical space it was never going to use.
     foot = tag("div", _kill_control(),
                tag("span", last_run, class_="last-run") if last_run else Raw(""),
+               _signed_in_control(user),
                tag("span", "Powered by Spitfire", class_="powered"),
                class_="side-foot")
     return tag("aside", brand, _side_alert(counts), tag("nav", *groups, class_="nav"), foot,
                class_="side")
+
+
+def _signed_in_control(user: str) -> Raw:
+    """Who you are, and the way out.
+
+    A `<form method="post">`, not a link. A GET that signs you out is triggered by anything that
+    fetches a URL without being asked -- a chat client unfurling a pasted link, a browser
+    prefetching what it thinks you will click -- and being signed out at random reads as the app
+    being broken.
+
+    No inline handler and no JavaScript: the button submits the form it is in, which is also what
+    `test_pages_carry_exactly_one_first_party_script_and_nothing_else` requires of everything here.
+    """
+    if not user:
+        return Raw("")
+    return tag("form",
+               tag("span", f"Signed in as {user}", class_="who"),
+               tag("button", "Sign out", type="submit", class_="sign-out"),
+               method="post", action="/logout", class_="signed-in")
 
 
 def _side_alert(counts: Optional[dict] = None) -> Raw:
@@ -2939,12 +4464,13 @@ def _side_alert(counts: Optional[dict] = None) -> Raw:
 
 
 def page(title: str, active: str, *sections, header: Optional[Raw] = None, footer: str = "",
+         user: str = "",
          subtitle: str = "", actions: Sequence = (), counts: Optional[dict] = None,
          refresh_seconds: int = 0, back: str = "", back_label: str = "") -> str:
     """The one shell every page goes through.
 
     `active` is matched against the sidebar's hrefs, so a detail page passes its parent
-    (`/ui/po/208491` passes `/ui/po`) and the parent stays lit. `counts` maps an href to a number
+    (`/ui/po/908491` passes `/ui/po`) and the parent stays lit. `counts` maps an href to a number
     for the badge beside it; only truthy values render, so a queue at zero shows nothing rather
     than a reassuring "0" the eye still has to read.
 
@@ -2984,7 +4510,11 @@ def page(title: str, active: str, *sections, header: Optional[Raw] = None, foote
     # it for the same glance.
     back_link = (tag("a", Raw("&lsaquo;&nbsp;"), "Back", href=back, class_="back-link",
                      title=f"Back to {back_label}" if back_label else "Back",
-                     aria_label=f"Back to {back_label}" if back_label else None)
+                     aria_label=f"Back to {back_label}" if back_label else None,
+                     # Read by the script: when the page behind this one *is* `back`, it steps back
+                     # through history, which restores that page as it was rather than re-fetching
+                     # it with the filter cleared. The href stands for everyone else.
+                     data_back_to=back)
                  if back else Raw(""))
     # Title and subtitle stack; the actions sit at the far right. They were siblings in one flex
     # row before, which put the subtitle *beside* the title and left nowhere for a page-level
@@ -3016,8 +4546,9 @@ def page(title: str, active: str, *sections, header: Optional[Raw] = None, foote
         # In <head>, so the rail class lands before the sidebar is parsed. See `_JS`.
         + "<script>" + _JS + "</script>"
         + "</head>"
-        + f'<body data-version="{esc(_version_token())}">'
-        + str(tag("div", _sidebar(active, counts, footer), content, class_="shell"))
+        + f'<body data-version="{esc(_version_token())}" data-running="{_running_flag()}">'
+        + _LOAD_BAR
+        + str(tag("div", _sidebar(active, counts, footer, user), content, class_="shell"))
         + _MAIL_DIALOG
         + _LIVE_PILL
         + "</body></html>"
@@ -3037,6 +4568,26 @@ def _version_token() -> str:
         return live_version_token()
     except Exception:                                              # noqa: BLE001
         return ""
+
+
+def _running_flag() -> str:
+    """`"1"` while an ingest run is in flight, stamped on `<body>` for the poller to start from.
+
+    The poller needs to spot the moment a run *ends*, which is an edge and not a state — so it has
+    to know what was true when the page was drawn. Reading it from the first poll instead leaves a
+    real hole: a page opened during a run and then left in a background tab polls nothing while
+    hidden, so a run finishing in that window would have no transition to detect on return, and the
+    page would keep claiming to be running indefinitely.
+
+    Never raises, and answers `"0"` if it cannot tell. A page renderer must not fail over a hint,
+    and `"0"` only costs a reload that does not happen — whereas raising would cost the whole page.
+    """
+    try:
+        from operations import runner
+
+        return "1" if runner.is_running() else "0"
+    except Exception:                                              # noqa: BLE001
+        return "0"
 
 
 def _run_form() -> Raw:

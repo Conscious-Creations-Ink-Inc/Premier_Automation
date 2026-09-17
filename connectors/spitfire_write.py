@@ -45,7 +45,7 @@ from urllib.parse import urlparse
 import requests
 
 from config import settings
-from connectors import spitfire_cassette
+from connectors import spitfire_auth, spitfire_cassette
 
 _logger = logging.getLogger(__name__)
 
@@ -128,9 +128,34 @@ _ALLOWED_READBACKS: Tuple[Tuple[str, str], ...] = (
     ("GET",  "/api/session/who"),              # liveness; a lapsed cookie must be nameable
     ("POST", "/api/project/{}/docs"),          # read despite the verb: finds the PO and pay requests
     ("GET",  "/api/document/{}/session"),       # opens an edit session; returns a bare GUID string
+    # The approval route, read so `sign_off_route_steps` can find *our own* stop on it. A read:
+    # `route/apply` and `route/perform` — the two calls that email Premier staff — stay in
+    # `_DENIED_SUBSTRINGS` and are not reachable from this module at all.
+    ("GET",  "/api/document/{}/route"),
 )
 
 _ALLOWED = _ALLOWED_WRITES + _ALLOWED_READBACKS
+
+RESPONDED = "A"
+"""`DocRoute.Status` for a stop its routee has signed off.
+
+`A` means two different things either side of this module: on `DocMasterDetail.Status` it is
+"POD Confirmed", which bypasses the FAA approval gate and is refused by `_DENIED_SUBSTRINGS`.
+On a `DocRoute` row it is "Responded", which is the thumbs-up on one person's own step.
+"""
+
+_ROUTE_SENTINEL = "0001-01-01"
+"""Spitfire writes this for "never", and as a non-empty string it reads truthy.
+
+Measured across 4,602 mirrored route rows: treating it as a real timestamp inverts the
+`Reached` test, which is the gate for whether a stop may be responded to at all.
+"""
+
+
+def _route_reached(row: Any) -> bool:
+    """Whether the route has actually arrived at this stop."""
+    value = str((row or {}).get("Reached") or "").strip()
+    return bool(value) and not value.startswith(_ROUTE_SENTINEL)
 
 _ALLOWED_SEGMENTS = frozenset(
     (method.upper(), tuple(path.strip("/").split("/"))) for method, path in _ALLOWED
@@ -171,6 +196,38 @@ def is_allowed(method: str, path: str) -> bool:
     return False
 
 
+def line_in(items: Sequence[Dict[str, Any]], po_line_key: str) -> Optional[Dict[str, Any]]:
+    """The receipt line standing against `po_line_key`, out of items already read.
+
+    The matching rule of `SpitfireWriteClient.find_prepopulated_line`, lifted out so it can be
+    applied to one `read_items` result many times. Posting a twenty-line delivery through the method
+    would read the whole document twenty times to answer twenty questions about one payload.
+
+    Matched on `SCDocItemKey` — the purchase order line's own `DocItemKey` — because that is the
+    identity Spitfire itself used to build the row. **Not on the spec code:** 82 of 179 lines share
+    a spec with a sibling on the same order, so a spec match would pick an arbitrary one of them.
+    """
+    wanted = (po_line_key or "").strip().lower()
+    if not wanted:
+        return None
+    for item in items:
+        related = item.get("RelatedLineDetails") or {}
+        if str(related.get("SCDocItemKey") or "").strip().lower() == wanted:
+            return item
+    return None
+
+
+def task_key_of(item: Optional[Dict[str, Any]]) -> str:
+    """The `ItemTaskKey` a quantity is written against, or "" if the row carries none.
+
+    `DocItemTask[0]`, not `DocItemKey` — `set_line_quantity` patches `DocItemTask.Quantity` and
+    `InstanceKey` is the task's key. Getting this wrong writes nothing and reports success.
+    """
+    tasks = (item or {}).get("DocItemTask") or [{}]
+    first = tasks[0] if isinstance(tasks[0], dict) else {}
+    return str(first.get("ItemTaskKey") or "")
+
+
 @dataclass
 class WriteRecord:
     """One issued request, kept so a post can prove exactly what it did.
@@ -198,11 +255,14 @@ class SpitfireSessionExpired(RuntimeError):
 class SpitfireWriteClient:
     """Issues the receipt-posting chain, and nothing else.
 
-    Cookie mode only, on purpose. `POST /api/Account` works and would let this class log in with
-    a password, but there is no service account yet: the credential in `.env` belongs to a named
-    human and carries AdminLevel 31 (Read+Insert+Update+Delete+Blanket). Silently re-authenticating
-    a write client when a ticket lapses would turn an expiry into an unattended write, so an
-    expired ticket raises `SpitfireSessionExpired` and stops.
+    **Authentication.** With `SPITFIRE_UID`/`SPITFIRE_PW` configured this client rides the shared
+    login ticket from `connectors/spitfire_auth.py`; otherwise a `SPITFIRE_SESSION_COOKIE`. It never
+    logs in itself — `POST /api/Account` is not on `_ALLOWED_WRITES` — the read connector does.
+
+    **A ticket is renewed only in `whoami()`**, which every posting chain calls before it creates
+    anything. A 401 *during* a chain still raises `SpitfireSessionExpired` and stops: re-logging in
+    and carrying on would resume a half-made receipt unattended, and the ledger already knows how to
+    recover a `PARTIAL` safely.
     """
 
     def __init__(self, base_url: Optional[str] = None, session_cookie: Optional[str] = None,
@@ -210,11 +270,17 @@ class SpitfireWriteClient:
         self.base_url = (base_url or settings.SPITFIRE_BASE_URL or "").rstrip("/")
         if not self.base_url:
             raise ValueError("SpitfireWriteClient needs SPITFIRE_BASE_URL (check .env)")
-        self.session_cookie = session_cookie or settings.SPITFIRE_SESSION_COOKIE
-        if not self.session_cookie:
+        self._host = urlparse(self.base_url).hostname
+        # Same precedence as the read client: a cookie passed in, then the account, then a cookie
+        # from config.
+        account = None if session_cookie else spitfire_auth.credentials()
+        self.login_mode = account is not None
+        self.session_cookie = None if self.login_mode else (session_cookie
+                                                            or spitfire_auth.session_cookie())
+        if not self.login_mode and not self.session_cookie:
             raise SpitfireSessionExpired(
-                "no SPITFIRE_SESSION_COOKIE is set; capture one from the browser "
-                "(F12 -> Application -> Cookies -> sfPMSAuth) before posting")
+                "no Spitfire credentials are configured; set SPITFIRE_UID and SPITFIRE_PW in .env "
+                "before posting")
         self.timeout = timeout
         self.audit_log: List[WriteRecord] = []
         self._session = requests.Session()
@@ -222,9 +288,27 @@ class SpitfireWriteClient:
         # replay it answers the read-backs from disk and refuses the four mutating calls outright —
         # a replayed create_receipt would return one DocMasterKey for every delivery.
         spitfire_cassette.mount(self._session)
-        host = urlparse(self.base_url).hostname
-        # On the jar rather than as a header, so redirects and any later Set-Cookie merge normally.
-        self._session.cookies.set("sfPMSAuth", self.session_cookie, domain=host, path="/")
+        if self.login_mode:
+            ticket = spitfire_auth.cached_ticket(self.base_url, account.uid)
+            if ticket:
+                self._load_ticket(ticket)
+        else:
+            # On the jar rather than as a header, so redirects and any later Set-Cookie merge.
+            self._session.cookies.set("sfPMSAuth", self.session_cookie, domain=self._host, path="/")
+
+    def _load_ticket(self, cookies: Dict[str, str]) -> None:
+        self._session.cookies.clear()
+        for name, value in cookies.items():
+            self._session.cookies.set(name, value, domain=self._host, path="/")
+
+    def _renew_ticket(self) -> None:
+        """Take a live ticket from the shared login, logging in again if it lapsed. Pre-chain only."""
+        if spitfire_cassette.mode() == spitfire_cassette.REPLAY:
+            return
+        try:
+            self._load_ticket(spitfire_auth.login_ticket(self.base_url))
+        except (RuntimeError, ValueError, requests.RequestException) as exc:
+            raise SpitfireSessionExpired(f"could not log in to Spitfire: {exc}") from exc
 
     # --- transport ------------------------------------------------------------------------------
 
@@ -254,6 +338,10 @@ class SpitfireWriteClient:
         self.audit_log.append(WriteRecord(method.upper(), path, response.status_code,
                                           int((time.monotonic() - started) * 1000), note))
         if response.status_code == 401:
+            if self.login_mode:
+                raise SpitfireSessionExpired(
+                    "the Spitfire session expired part-way through the post. Nothing was retried; "
+                    "the ledger records what had already landed. The next post logs in afresh.")
             raise SpitfireSessionExpired(
                 "the sfPMSAuth cookie has expired or was rejected. Capture a fresh one from the "
                 "browser (F12 -> Application -> Cookies -> sfPMSAuth) and restart the post.")
@@ -296,7 +384,12 @@ class SpitfireWriteClient:
 
         Called before the chain starts so an expired cookie is reported *before* a receipt is
         created, not halfway through leaving a titled but empty document behind.
+
+        In login mode this is also where a lapsed ticket is renewed — the one point in a chain
+        where logging in again cannot resume anything half-made.
         """
+        if self.login_mode:
+            self._renew_ticket()
         payload = self._json_or_raise(self._request("GET", "/api/session/who", note="liveness"),
                                       "reading the session")
         if isinstance(payload, dict):
@@ -454,21 +547,14 @@ class SpitfireWriteClient:
         `SourceItemNumber`, `AccountCategory`, `ProjEntity`, `GLAcct`, `UOM` and `Rate`, numbered
         to match the order — gaps included. The only empty field is the quantity.
 
-        Verified on training 2026-08-22 against PO 212559: `create_receipt` returned a document
+        Verified on training 2026-08-22 against PO 912559: `create_receipt` returned a document
         whose items 0001, 0002, 0004 and 0005 were already linked to that PO's four lines.
 
         Matched on `SCDocItemKey` — the PO line's own `DocItemKey` — because that is the identity
         Spitfire itself used to build the row. Matching on the spec would reintroduce exactly the
         ambiguity the matcher exists to resolve: 82 of 179 lines share a spec with a sibling.
         """
-        wanted = (po_line_key or "").strip().lower()
-        if not wanted:
-            return None
-        for item in self.read_items(doc_key):
-            related = item.get("RelatedLineDetails") or {}
-            if str(related.get("SCDocItemKey") or "").strip().lower() == wanted:
-                return item
-        return None
+        return line_in(self.read_items(doc_key), po_line_key)
 
     def set_line_quantity(self, doc_key: str, quantities: Dict[str, float]) -> None:
         """Set the received quantity on lines Spitfire already built. `{ItemTaskKey: quantity}`.
@@ -542,16 +628,25 @@ class SpitfireWriteClient:
                     "InstanceKey": task_key, "Data": _fmt_quantity(quantity),
                     "IsURIEncoded": False}
                    for task_key, quantity in quantities.items()]
+        self._commit_changes(doc_key, session_id, changes, note="set line quantities",
+                             failure="setting the receipt line quantities failed")
+
+    def _commit_changes(self, doc_key: str, session_id: str, changes: list, *,
+                        note: str, failure: str) -> None:
+        """PATCH staged field changes and always release the session afterwards.
+
+        Shared by `set_line_quantity` and `sign_off_route_steps` because the rule that matters is
+        the same for both and is not obvious: the release in the `finally` is what *commits*. A
+        session left open holds an edit lock on a document in Premier's system that nobody can see
+        in order to release it, and the changes staged in it stay staged, so the next writer
+        inherits them.
+        """
         try:
             response = self._request("PATCH", f"/api/document/{doc_key}/session/changes",
-                                     json=changes, note="set line quantities")
+                                     json=changes, note=note)
             if response.status_code >= 400:
-                raise RuntimeError(
-                    f"setting the receipt line quantities failed — {self._explain(response)}")
+                raise RuntimeError(f"{failure} — {self._explain(response)}")
         finally:
-            # Always, including after a failure: a session left open holds an edit lock on a
-            # document in Premier's system that nobody can see in order to release it — and the
-            # changes staged in it stay staged, so the next writer inherits them.
             self._release_session(doc_key, session_id)
 
     def _release_session(self, doc_key: str, session_id: str = "") -> None:
@@ -579,6 +674,126 @@ class SpitfireWriteClient:
         except Exception:                                              # noqa: BLE001
             _logger.warning("could not release the edit session on document %s", doc_key)
 
+    def session_user_key(self) -> str:
+        """Our own `UserKey`. `whoami` returns the email, which route rows do not carry."""
+        payload = self._json_or_raise(
+            self._request("GET", "/api/session/who", note="identity"), "reading the session")
+        return str((payload or {}).get("UserKey") or "") if isinstance(payload, dict) else ""
+
+    def read_route(self, doc_key: str) -> list:
+        """The document's approval route, one entry per routee."""
+        payload = self._json_or_raise(
+            self._request("GET", f"/api/document/{doc_key}/route", note="read route"),
+            f"reading the route on {doc_key}")
+        return payload if isinstance(payload, list) else []
+
+    MAX_SIGN_PASSES = 4
+    """How many times `sign_off_route_steps` will re-read the route.
+
+    Our account sits at sequences 1, 5 and 15, so three signatures is the most any document has
+    ever needed and the fourth pass is the one that finds nothing and stops. A bound rather than
+    `while True` because the loop's exit depends on the *server* changing `Status` — if it ever
+    reported a row as unacted after accepting the write, an unbounded loop would sign it for ever.
+    """
+
+    def sign_off_route_steps(self, doc_key: str) -> List[str]:
+        """Sign off **our own** stops on this receipt's route. Returns one line per stop signed.
+
+        Every receipt this system creates is staged with an approval route, and ours is the first
+        stop on it. Until that stop is responded to the route never advances and Premier's
+        reviewers at sequence 10 never see the receipt — so a POD posted and left unsigned is a
+        proof nobody is asked to look at. On a fresh receipt our stops are sequences 1 and 5.
+
+        **They cannot both be signed from one reading of the route, and that is the whole shape of
+        this method.** Measured on receipt 0002 (2026-09-17): sequence 1 was `Reached` and offered
+        `A,H,P`, while sequence 5 had no `Reached` timestamp at all and offered `C,D,P,G` — no `A`
+        among them. Spitfire will not accept a response on a stop the route has not arrived at, and
+        signing sequence 1 is what makes sequence 5 arrive. So this signs one stop, **reads the
+        route again**, and signs whatever became reachable, until a pass finds nothing. A single
+        pass looks like it worked and silently leaves sequence 5 Pending.
+
+        Scope, deliberately narrow, and unchanged by the loop:
+
+        * **Only rows that are ours and `Reached`.** Chosen by `UserKey` and timestamp, never by a
+          hard-coded sequence: our account sits at 1, 5 and 15 and which one is live moves over
+          time. `Reached` is the gate Spitfire itself applies — a stop the route has not arrived
+          at cannot be responded to.
+        * **Only where Spitfire says we may**, i.e. the row offers `CanEditRouteResponseCode`
+          enabled and `A` among its choices. If the server does not offer the capability we do not
+          invent it.
+        * **`Status` only.** On Premier's own completed receipts every acted row reads
+          `ResponseCode = None`; only `Status` moves to `A`. The `ResponseCode "A"` seen elsewhere
+          was on a purchase-order route, a different document type with different conventions.
+
+        Signing our step asserts "the proof of delivery is attached". It is **not** approving the
+        receipt: sequence 10 is Premier's decision, and dispatching the route — `route/apply`,
+        which emails three real people — is refused by name in `_DENIED_SUBSTRINGS`. Nothing here
+        adds, removes or reorders a routee. Signing advances the route; it does not announce it.
+        """
+        user_key = self.session_user_key().lower()
+        if not user_key:
+            return ["could not sign the route: the session names no user key"]
+
+        signed: List[str] = []
+        refused: set = set()
+        for _ in range(self.MAX_SIGN_PASSES):
+            row = self._next_signable_step(doc_key, user_key, refused)
+            if row is None:
+                break
+            sequence = row.get("Sequence")
+            if not self._sign_one_step(doc_key, row, signed):
+                # Recorded so the next pass does not pick the same row again and spend every
+                # remaining pass on it.
+                refused.add(str(row.get("RouteID")))
+                continue
+            signed.append(f"route step {sequence} signed off")
+
+        return signed or ["no route step of ours is reached and unsigned"]
+
+    def _next_signable_step(self, doc_key: str, user_key: str, refused: set):
+        """The first stop of ours the route has reached and Spitfire will accept a response on.
+
+        Re-reads the route every time it is called: a stop that was neither reached nor offering
+        `A` a moment ago may be both now, because signing the stop before it is what advances the
+        route onto it.
+        """
+        for row in self.read_route(doc_key):
+            if str(row.get("UserKey") or "").lower() != user_key:
+                continue
+            if str(row.get("RouteID")) in refused:
+                continue
+            if not _route_reached(row) or str(row.get("Status") or "") == RESPONDED:
+                continue
+            allowed = any(command.get("CommandName") == "CanEditRouteResponseCode"
+                          and command.get("Enabled")
+                          for command in (row.get("MenuCommands") or []))
+            if allowed and RESPONDED in str(row.get("Choices") or "").split(","):
+                return row
+        return None
+
+    def _sign_one_step(self, doc_key: str, row, signed: List[str]) -> bool:
+        """Set `DocRoute.Status = A` on one row. False when nothing was written, with the reason
+        already appended to `signed` so the caller's report says what happened."""
+        sequence = row.get("Sequence")
+        self._release_session(doc_key)
+        session = self._json_or_raise(
+            self._request("GET", f"/api/document/{doc_key}/session?freshenData=true",
+                          note="open document session"),
+            f"opening an edit session on {doc_key}")
+        session_id = session if isinstance(session, str) else str(
+            (session or {}).get("SessionID") or "")
+        if not session_id:
+            signed.append(f"route step {sequence} not signed: no edit session")
+            return False
+
+        self._commit_changes(
+            doc_key, session_id,
+            [{"DataMember": "DocRoute", "DataField": "Status",
+              "InstanceKey": row.get("RouteID"), "Data": RESPONDED, "IsURIEncoded": False}],
+            note="sign off our route step",
+            failure=f"signing route step {sequence} failed")
+        return True
+
     def verify_quantities(self, doc_key: str, quantities: Dict[str, float]) -> Dict[str, float]:
         """Read the receipt back and return `{ItemTaskKey: quantity}` as Spitfire now holds it.
 
@@ -599,7 +814,7 @@ class SpitfireWriteClient:
         return found
 
     # --- 3. attachments -------------------------------------------------------------------------
-    # One endpoint, two shapes. Premier's own receipt 209330 carries both in a single collection:
+    # One endpoint, two shapes. Premier's own receipt 909330 carries both in a single collection:
     # three document links (its PO and two pay requests) and one file link (the POD), told apart
     # only by which of `DocKey` / `AttachedDocMaster` is populated.
 

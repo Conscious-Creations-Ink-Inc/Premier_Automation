@@ -23,7 +23,7 @@ class FakeWriteClient:
     more than the happy path.
     """
 
-    def __init__(self, fail_on: str = "", sub_contract: str = "212614"):
+    def __init__(self, fail_on: str = "", sub_contract: str = "912614"):
         self.fail_on = fail_on
         self.sub_contract = sub_contract
         self.calls: list = []
@@ -40,6 +40,16 @@ class FakeWriteClient:
     def whoami(self):
         self._maybe_fail("whoami")
         return "api@consciouscreations.ai"
+
+    def sign_off_route_steps(self, doc_key):
+        """Our own stops on the receipt's route, responded to.
+
+        Present on the double deliberately: `_sign_off_route` catches everything, so a double
+        without this method makes the call vanish and every test about signing pass vacuously.
+        That is exactly how the first version of this change looked correct while signing nothing.
+        """
+        self._maybe_fail("sign_off_route_steps")
+        return ["route step 1 signed off", "route step 5 signed off"]
 
     def create_receipt(self, project_id, po_number, receipt_type_key=None):
         self._maybe_fail("create_receipt")
@@ -109,7 +119,7 @@ class FakeWriteClient:
 
     def find_documents(self, project_id, doc_type_key, doc_no_like="", limit=25):
         self._maybe_fail("find_documents")
-        return [{"DocMasterKey": "pay-req-1", "DocNo": "0002", "SubContract": "212614"}]
+        return [{"DocMasterKey": "pay-req-1", "DocNo": "0002", "SubContract": "912614"}]
 
     def read_attachments(self, doc_key):
         self._maybe_fail("read_attachments")
@@ -151,24 +161,24 @@ def conn():
            (id, source_email_id, po_number, spec_code, item_description, vendor_name,
             quantity_received, unit_of_measure, pod_stated_date, received_by, po_line_number,
             email_date, extraction_source, extraction_confidence, created_at)
-           VALUES (1, 'mail-1', '212614', 'LT-03b', 'LT-03B Frosted Replacement',
+           VALUES (1, 'mail-1', '912614', 'LT-03b', 'LT-03B Frosted Replacement',
                    'Archipelago Lighting', 19.0, 'EA', '2026-01-20', 'J Smith', 1,
                    '2026-01-20', 'test', 1.0, '2026-01-20')""")
     c.execute(
         """INSERT INTO spitfire_po_index (po_number, doc_master_key, project_code, refreshed_at)
-           VALUES ('212614', '4b186a21-59be-4c0a-8221-6f20363e6191', 'MRC024PB100003', 'now')""")
+           VALUES ('912614', '4b186a21-59be-4c0a-8221-6f20363e6191', 'PRJ001PB100003', 'now')""")
     c.execute(
         """INSERT INTO spitfire_po_lines
            (line_key, po_number, line_number, spec_code, description, unit_of_measure,
             qty_ordered, qty_received, qty_in_transit, cost_code, refreshed_at)
-           VALUES ('k1','212614',1,'LT-03b','LT-03B Frosted Replacement','EA',
+           VALUES ('k1','912614',1,'LT-03b','LT-03B Frosted Replacement','EA',
                    19.0, 0.0, 0.0, 'MAT-FDP', 'now')""")
     # The POD, with its bytes — the cache path attachment_bytes.resolve tries first.
     c.execute(
         """INSERT INTO mail_attachment
            (email_id, ordinal, filename, content_type, kind, size_bytes, is_inline, content)
            VALUES ('mail-1', 0, 'POD_212614.pdf', 'application/pdf', 'pdf', 9, 0, ?)""",
-        (pod_pdf("212614"),))
+        (pod_pdf("912614"),))
     c.execute(
         """INSERT INTO attachment_ledger
            (email_id, depth, ordinal, filename, sniffed_kind, disposition, is_inline,
@@ -298,7 +308,7 @@ def test_a_record_with_no_stored_pod_bytes_is_flagged_not_posted(conn, record, o
     # which is ours to investigate — deleting the row too would be "the email carried nothing",
     # a different situation with a different fix, and `_pod_absence_reason` now tells them apart.
     conn.execute("UPDATE mail_attachment SET content = NULL WHERE email_id = 'mail-1'")
-    conn.execute("""UPDATE attachment_ledger SET is_pod = 1, pod_po_numbers = '212614'
+    conn.execute("""UPDATE attachment_ledger SET is_pod = 1, pod_po_numbers = '912614'
                      WHERE email_id = 'mail-1'""")
     conn.commit()
 
@@ -349,9 +359,9 @@ def test_link_failures_do_not_discard_a_good_receipt(conn, record, offline):
 def test_any_file_kind_can_be_the_pod_once_something_has_read_it(conn, record, offline):
     """A POD is chosen by what the file says, not by its extension. An image or a legacy `.doc`
     is proof of delivery exactly when a reader recorded it as one — proven live on 2026-08-17,
-    when a `.png` and a `.doc` both reached receipts 0002 and 0003 on PO 212559."""
+    when a `.png` and a `.doc` both reached receipts 0002 and 0003 on PO 912559."""
     conn.execute("""UPDATE attachment_ledger SET sniffed_kind='doc', filename='signed.doc',
-                        is_pod=1, pod_po_numbers='212614' WHERE email_id='mail-1'""")
+                        is_pod=1, pod_po_numbers='912614' WHERE email_id='mail-1'""")
     conn.execute("UPDATE mail_attachment SET kind='doc', filename='signed.doc'"
                  " WHERE email_id='mail-1'")
     conn.commit()
@@ -448,12 +458,20 @@ def test_a_partial_delivery_books_what_arrived(conn, record, offline):
     assert client.quantities == {"task-1": 2.0}
 
 
-def test_nothing_in_the_chain_ever_routes(conn, record, offline):
-    """Creating a receipt stages three real Premier employees. Dispatching is a separate call, and
-    it must never appear here."""
+def test_nothing_in_the_chain_ever_dispatches_the_route(conn, record, offline):
+    """Creating a receipt stages three real Premier employees. Dispatching is a separate call and
+    must never appear here — `route/apply` and `route/perform` email those three people, and
+    `PATCH /Status` marks a receipt POD Confirmed with no approval at all.
+
+    Narrowed from "no call may contain `route` or `Status`" on 2026-09-16, when the chain began
+    signing off *our own* route stop after the POD. That is a `DocRoute.Status` write on one row
+    belonging to us, which the old wording forbade and the docstring never meant: signing our step
+    is the thumbs-up on our own line, and without it the route never reaches Premier at all.
+    """
     client = FakeWriteClient()
     spitfire_post.post_record(conn, record, read_client_factory=offline, client=client)
-    assert not any("route" in call or "Status" in call for call in client.calls)
+    forbidden = ("route/apply", "route/perform", "set_status", "dispatch", "perform")
+    assert not any(bad in call.lower() for call in client.calls for bad in forbidden), client.calls
 
 
 # --- which file is the proof ------------------------------------------------------------------
@@ -492,7 +510,7 @@ def test_the_pod_wins_over_an_earlier_spreadsheet(conn, record):
     conn.execute("DELETE FROM mail_attachment")
     conn.execute("DELETE FROM attachment_ledger")
     _attach(conn, 0, "tracker.xlsx", "xlsx", b"PK\x03\x04tracker")
-    _attach(conn, 6, "POD_212614.pdf", "pdf", pod_pdf("212614"), disposition="dropped_duplicate")
+    _attach(conn, 6, "POD_212614.pdf", "pdf", pod_pdf("912614"), disposition="dropped_duplicate")
 
     chosen = spitfire_post._pod_for(conn, record)
 
@@ -523,7 +541,7 @@ def test_an_unreadable_pdf_does_not_stop_the_search(conn, record):
     conn.execute("DELETE FROM mail_attachment")
     conn.execute("DELETE FROM attachment_ledger")
     _attach(conn, 0, "corrupt.pdf", "pdf", b"%PDF-1.4\n\x00\x01\x02 truncated")
-    _attach(conn, 1, "POD_212614.pdf", "pdf", pod_pdf("212614"))
+    _attach(conn, 1, "POD_212614.pdf", "pdf", pod_pdf("912614"))
 
     chosen = spitfire_post._pod_for(conn, record)
 
@@ -548,7 +566,7 @@ def test_an_image_pod_is_honoured_from_the_stored_verdict(conn, record):
     _attach(conn, 0, "tracker.xlsx", "xlsx", b"PK\x03\x04tracker")
     _attach(conn, 1, "IMG_2479.jpeg", "image", b"\xff\xd8\xff\xe0 photographed delivery note")
     conn.execute("""UPDATE attachment_ledger
-                       SET is_pod = 1, pod_po_numbers = '212614',
+                       SET is_pod = 1, pod_po_numbers = '912614',
                            pod_delivery_date = '2026-01-20', pod_signed_by = 'J SMITH'
                      WHERE filename = 'IMG_2479.jpeg'""")
     conn.commit()
@@ -575,12 +593,47 @@ def test_a_docx_pod_is_honoured_too(conn, record):
     conn.execute("DELETE FROM mail_attachment")
     conn.execute("DELETE FROM attachment_ledger")
     _attach(conn, 0, "Delivery Receipt.docx", "docx", b"PK\x03\x04 word doc with a scan")
-    conn.execute("""UPDATE attachment_ledger SET is_pod = 1, pod_po_numbers = '212614'
+    conn.execute("""UPDATE attachment_ledger SET is_pod = 1, pod_po_numbers = '912614'
                      WHERE filename = 'Delivery Receipt.docx'""")
     conn.commit()
 
     chosen = spitfire_post._pod_for(conn, record)
     assert chosen is not None and chosen.filename == "Delivery Receipt.docx"
+
+
+def _read_from(conn, filename):
+    """The record, re-read after pointing `source_ledger_id` at the attachment named `filename`."""
+    conn.execute("""UPDATE extracted_records SET source_ledger_id =
+                        (SELECT id FROM attachment_ledger WHERE filename = ?) WHERE id = 1""",
+                 (filename,))
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+    return conn.execute("SELECT * FROM extracted_records WHERE id = 1").fetchone()
+
+
+def test_the_document_a_record_was_read_from_is_attached_when_no_pod_exists(conn):
+    """Premier's rule (2026-09-15): a line read off a document posts with that document attached.
+    The same spreadsheet that is refused above when nothing links it to the record."""
+    conn.execute("DELETE FROM mail_attachment")
+    conn.execute("DELETE FROM attachment_ledger")
+    _attach(conn, 0, "other tracker.xlsx", "xlsx", b"PK\x03\x04other")
+    _attach(conn, 1, "Receiving list.xlsx", "xlsx", b"PK\x03\x04receiving")
+
+    chosen = spitfire_post._pod_for(conn, _read_from(conn, "Receiving list.xlsx"))
+
+    assert chosen is not None and chosen.filename == "Receiving list.xlsx", \
+        "the record's own source file must be attached, never a neighbour"
+
+
+def test_a_real_pod_still_wins_over_the_source_document(conn):
+    conn.execute("DELETE FROM mail_attachment")
+    conn.execute("DELETE FROM attachment_ledger")
+    _attach(conn, 0, "Receiving list.xlsx", "xlsx", b"PK\x03\x04receiving")
+    _attach(conn, 1, "POD_212614.pdf", "pdf", pod_pdf("912614"))
+
+    chosen = spitfire_post._pod_for(conn, _read_from(conn, "Receiving list.xlsx"))
+
+    assert chosen is not None and chosen.filename == "POD_212614.pdf"
 
 
 # --- the two stages ------------------------------------------------------------------------
@@ -735,7 +788,7 @@ def test_verify_pod_says_so_when_nothing_was_ever_posted(conn, record):
 
 
 def test_the_same_delivery_cannot_post_twice_under_a_new_record_id(conn, record, offline):
-    """The duplicate that actually happened. PO 212559 collected eight receipts on training,
+    """The duplicate that actually happened. PO 912559 collected eight receipts on training,
     each from a re-extraction of one delivery: `idempotency_key` carries the record id, and
     reprocessing a mail erases records and re-extracts them under new ids, so every attempt hashed
     to a new key and nothing could see they were the same goods.
@@ -779,7 +832,7 @@ def test_a_genuinely_different_delivery_on_the_same_line_still_posts(conn, recor
                       (email_id, ordinal, filename, content_type, kind, size_bytes, is_inline,
                        content)
                     VALUES ('mail-2', 0, 'POD2_212614.pdf', 'application/pdf', 'pdf', 9, 0, ?)""",
-                 (pod_pdf("212614") + b"\n% second shipment",))
+                 (pod_pdf("912614") + b"\n% second shipment",))
     conn.execute("""INSERT INTO attachment_ledger
                       (email_id, depth, ordinal, filename, sniffed_kind, disposition, is_inline,
                        first_seen_at)
@@ -789,7 +842,7 @@ def test_a_genuinely_different_delivery_on_the_same_line_still_posts(conn, recor
                        quantity_received, unit_of_measure, pod_stated_date, received_by,
                        po_line_number, email_date, extraction_source, extraction_confidence,
                        created_at)
-                    VALUES (98, 'mail-2', '212614', 'LT-03b', 'LT-03B Frosted Replacement',
+                    VALUES (98, 'mail-2', '912614', 'LT-03b', 'LT-03B Frosted Replacement',
                             'Archipelago Lighting', 5.0, 'EA', '2026-02-02', 'J Smith', 1,
                             '2026-02-02', 'test', 1.0, '2026-02-02')""")
     conn.commit()
@@ -839,7 +892,7 @@ def test_a_reviewer_s_chosen_attachment_outranks_what_the_files_say(conn):
 
 def test_with_no_choice_made_the_automatic_rules_are_untouched(conn):
     """The guard on the override. With `pod_ledger_id` null the order is exactly what it was, so
-    the 210634 bug — a tracker spreadsheet at ordinal 0 uploaded to Premier's ERP as the proof —
+    the 910634 bug — a tracker spreadsheet at ordinal 0 uploaded to Premier's ERP as the proof —
     cannot return through this door."""
     _attach(conn, 1, "tracker.xlsx", "xlsx", b"PK\x03\x04 not a pod")
 
@@ -919,7 +972,7 @@ def test_a_waived_body_only_delivery_posts_without_an_upload(conn, offline):
     """Steps 4 and 5 are skipped; steps 1-3 and the read-back are not. The receipt is real, its
     line is on it, and nothing was uploaded."""
     _strip_the_pod(conn)
-    conn.execute("UPDATE extracted_records SET pod_waived_by = 'M Gutierrez', "
+    conn.execute("UPDATE extracted_records SET pod_waived_by = 'M Rivera', "
                  "pod_source = 'email_body' WHERE id = 1")
     conn.commit()
 
@@ -932,27 +985,27 @@ def test_a_waived_body_only_delivery_posts_without_an_upload(conn, offline):
     assert "create_receipt" in client.calls and "set_line_quantity" in client.calls
     assert "add_line" not in client.calls
     assert not result.pod_file_key
-    assert "M Gutierrez" in result.message
+    assert "M Rivera" in result.message
 
 
 def test_the_ledger_names_who_accepted_a_receipt_with_no_proof(conn, offline):
     """Six months later, "why does this receipt carry nothing?" has to be answerable from the
     ledger alone — the screen that asked the question is long gone."""
     _strip_the_pod(conn)
-    conn.execute("UPDATE extracted_records SET pod_waived_by = 'M Gutierrez' WHERE id = 1")
+    conn.execute("UPDATE extracted_records SET pod_waived_by = 'M Rivera' WHERE id = 1")
     conn.commit()
 
     spitfire_post.post_pod(conn, _row(conn), read_client_factory=offline, client=FakeWriteClient())
 
     detail = post_ledger.existing_for_record(conn, 1)[0].detail
-    assert "no POD" in detail and "M Gutierrez" in detail
+    assert "no POD" in detail and "M Rivera" in detail
 
 
 def test_a_body_only_delivery_cannot_post_twice(conn, offline):
     """The duplicate guard with no hash to key on — the case the evidence key exists for. Without
     it every body-only delivery on one PO line would key alike, or to nothing."""
     _strip_the_pod(conn)
-    conn.execute("UPDATE extracted_records SET pod_waived_by = 'M Gutierrez' WHERE id = 1")
+    conn.execute("UPDATE extracted_records SET pod_waived_by = 'M Rivera' WHERE id = 1")
     conn.execute(
         """INSERT INTO mail_body (email_id, subject, sender, received_at, body_text, source,
                                   cached_at)
@@ -1074,3 +1127,194 @@ def test_the_matched_po_line_key_is_what_finds_the_receipt_line(conn, record, of
     spitfire_post.post_pod(conn, record, read_client_factory=offline, client=client)
 
     assert seen == ["k1"]
+
+
+# --- recovering a chain that died mid-flight -----------------------------------------------------
+#
+# A claim is written before the first call to Spitfire, so a receipt can never exist without a row
+# naming it. The cost is that a killed process leaves the row at CLAIMED for ever: it is in
+# BLOCKING, so claim(), record_refusal(), post_report(), verify_pod() and the Post button all
+# refuse to touch it. `evidenced_state` is the half that says what to settle each one as, and it
+# gets the answer from the receipt rather than from the ledger — the ledger being the thing in
+# doubt.
+#
+# Live case, record 234 on PO 912560: killed on 2026-08-26 after the receipt, the POD upload and
+# the attach had all succeeded. `settled_at` was NULL and `detail` empty, a shape no exception path
+# can produce, and Spitfire held receipt 0001 with the right POD on it the whole time.
+
+
+def stranded_claim(conn, *, receipt="", doc_no="", pod_key="", report_key=""):
+    """A CLAIMED row that never settled, at whatever point the chain reached."""
+    attempt = post_ledger.claim(conn, record_id=1, po_number="912614", line_number=1,
+                                pod_md5="ABC123", project_code="PRJ001PB100003", quantity=19.0)
+    if receipt:
+        post_ledger.record_receipt(conn, attempt.idempotency_key,
+                                   receipt_key=receipt, receipt_doc_no=doc_no)
+    if pod_key or report_key:
+        post_ledger.record_file(conn, attempt.idempotency_key,
+                                pod_file_key=pod_key, report_file_key=report_key)
+    return post_ledger.existing_for_record(conn, 1)[0]
+
+
+def test_a_claim_that_created_nothing_settles_as_failed(conn, record):
+    """FAILED is deliberately not in BLOCKING: nothing was created, so nothing is orphaned and the
+    record is free to post again once whatever killed it is fixed."""
+    attempt = stranded_claim(conn)
+    result = spitfire_post.evidenced_state(conn, attempt, record, client=FakeWriteClient())
+    assert result.state == post_ledger.FAILED
+    assert "no receipt was ever created" in result.message
+
+
+def test_a_receipt_carrying_the_pod_settles_as_pod_posted(conn, record):
+    """The live case. Every step of `post_pod` landed and only the settle was lost, so the honest
+    state is the resting one the two-step split exists for — not PARTIAL, which means a step
+    failed and a human has to work out which."""
+    client = FakeWriteClient()
+    client.attachments.append({"DocKey": "pod-key-1"})
+    attempt = stranded_claim(conn, receipt="rcpt-1", doc_no="0001", pod_key="pod-key-1")
+
+    result = spitfire_post.evidenced_state(conn, attempt, record, client=client)
+
+    assert result.state == post_ledger.POD_POSTED
+    assert "0001" in result.message
+    assert any("hash matches ours" in s for s in result.steps)
+
+
+def test_a_receipt_carrying_the_report_too_settles_as_posted(conn, record):
+    client = FakeWriteClient()
+    client.attachments.extend([{"DocKey": "pod-key-1"}, {"DocKey": "report-key-1"}])
+    attempt = stranded_claim(conn, receipt="rcpt-1", doc_no="0001",
+                             pod_key="pod-key-1", report_key="report-key-1")
+
+    result = spitfire_post.evidenced_state(conn, attempt, record, client=client)
+
+    assert result.state == post_ledger.POSTED
+
+
+def test_a_receipt_without_its_pod_settles_as_partial(conn, record):
+    """A receipt exists and the proof is not on it. Retrying would build a second receipt beside
+    the half-built one, which is why PARTIAL blocks and offers no button."""
+    attempt = stranded_claim(conn, receipt="rcpt-1", doc_no="0001", pod_key="pod-key-1")
+    result = spitfire_post.evidenced_state(conn, attempt, record, client=FakeWriteClient())
+    assert result.state == post_ledger.PARTIAL
+    assert "not on it" in result.message
+
+
+def test_a_pod_whose_hash_no_longer_matches_settles_as_partial(conn, record):
+    """Present is not the same as ours. Without this second question a file replaced after upload
+    would settle as a clean POD_POSTED and the report would be hung on evidence nobody sent."""
+    class Replaced(FakeWriteClient):
+        def verify_upload(self, file_key, expected_md5):
+            return False
+
+    client = Replaced()
+    client.attachments.append({"DocKey": "pod-key-1"})
+    attempt = stranded_claim(conn, receipt="rcpt-1", doc_no="0001", pod_key="pod-key-1")
+
+    result = spitfire_post.evidenced_state(conn, attempt, record, client=client)
+
+    assert result.state == post_ledger.PARTIAL
+    assert "not the file we sent" in result.message
+
+
+def test_a_claim_that_cannot_be_read_stays_claimed(conn, record):
+    """The conservative direction, and the whole reason this returns a state rather than raising.
+
+    Settling an unreadable claim to FAILED would unblock a second post against a receipt that may
+    already exist. Staying CLAIMED keeps it blocking and keeps it listed as stranded, which is
+    exactly what an unknown should do.
+    """
+    attempt = stranded_claim(conn, receipt="rcpt-1", doc_no="0001", pod_key="pod-key-1")
+
+    result = spitfire_post.evidenced_state(conn, attempt, record,
+                                           client=FakeWriteClient(fail_on="read_attachments"))
+
+    assert result.state == post_ledger.CLAIMED
+    assert not result.ok
+    assert post_ledger.stranded(conn), "it must still be listed for the next attempt"
+
+
+# --- signing our own route step ----------------------------------------------------------------
+#
+# Every receipt this system created before 2026-09-16 sat at our own unsigned stop, so the route
+# never advanced and Premier's reviewers at sequence 10 never saw the proof of delivery attached
+# to it. Signing is not approving: sequence 10 stays Premier's decision.
+
+def test_the_pod_stage_signs_our_own_route_step(conn, record, offline):
+    """The proof is on the receipt, so the receipt is worth looking at — and until our own stop is
+    responded to nobody is asked to. Premier's decision 2026-09-17: sign here, not after the
+    report."""
+    client = FakeWriteClient()
+    result = spitfire_post.post_pod(conn, record, client=client, read_client_factory=offline)
+
+    assert result.ok and result.state == post_ledger.POD_POSTED
+    assert "sign_off_route_steps" in client.calls
+    assert any("route step" in step for step in result.steps), result.steps
+
+
+def test_the_route_is_signed_only_once_the_pod_is_on_the_receipt(conn, record, offline):
+    """A signature asserts the proof is attached. Signing before the attachment read-back would
+    assert that about a receipt that might still fail to carry it."""
+    client = FakeWriteClient()
+    spitfire_post.post_pod(conn, record, client=client, read_client_factory=offline)
+
+    assert "attach_file" in client.calls
+    assert client.calls.index("attach_file") < client.calls.index("sign_off_route_steps")
+
+
+def test_the_report_stage_does_not_sign_again(conn, record, offline):
+    """One signature per receipt. The stop is a property of the document, and re-signing an acted
+    row is a write with nothing behind it."""
+    client = FakeWriteClient()
+    spitfire_post.post_pod(conn, record, client=client, read_client_factory=offline)
+    signed_after_pod = client.calls.count("sign_off_route_steps")
+    spitfire_post.post_report(conn, record, client=client)
+
+    assert client.calls.count("sign_off_route_steps") == signed_after_pod == 1
+
+
+def test_a_route_that_cannot_be_signed_does_not_sink_a_good_receipt(conn, record, offline):
+    """The receipt exists and carries its POD — the evidence Premier needs. An unsigned step is
+    worth reporting and is not worth turning that into PARTIAL for a person to investigate."""
+    client = FakeWriteClient(fail_on="sign_off_route_steps")
+    result = spitfire_post.post_pod(conn, record, client=client, read_client_factory=offline)
+
+    assert result.ok, result.message
+    assert result.state == post_ledger.POD_POSTED, "a failed signature must not become PARTIAL"
+    assert any("could not sign off the route" in step for step in result.steps), result.steps
+
+def test_one_receiving_report_is_the_proof_for_every_purchase_order_on_it(conn):
+    """A receiving report covering two purchase orders proves both deliveries.
+
+    The shape of the Warehouse Receiving Report for RR 211373-29: ten item lines, seven against one
+    order and three against another, all read off one PDF. Each order is received as its own
+    receipt — a receipt cannot span purchase orders — so the same file has to reach both, which is
+    rule 3 doing exactly what it says: the document a record was read from, by id.
+    """
+    conn.execute("DELETE FROM mail_attachment")
+    conn.execute("DELETE FROM attachment_ledger")
+    _attach(conn, 0, "WarehouseReceivingReport.pdf", "pdf", b"%PDF-1.4 receiving report")
+    ledger_id = conn.execute(
+        "SELECT id FROM attachment_ledger WHERE filename = 'WarehouseReceivingReport.pdf'"
+    ).fetchone()[0]
+
+    # A second record, on the other purchase order, read off that same document. Copied from the
+    # first row so every NOT NULL column is filled by construction rather than by listing them.
+    conn.row_factory = sqlite3.Row
+    first = dict(conn.execute("SELECT * FROM extracted_records WHERE id = 1").fetchone())
+    first.update(id=2, po_number="912999", spec_code="AAA-100-EQ", source_ledger_id=ledger_id)
+    conn.execute(
+        f"INSERT INTO extracted_records ({','.join(first)}) "
+        f"VALUES ({','.join('?' * len(first))})", list(first.values()))
+    conn.execute("UPDATE extracted_records SET source_ledger_id = ? WHERE id = 1", (ledger_id,))
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+
+    both = [conn.execute("SELECT * FROM extracted_records WHERE id = ?", (rid,)).fetchone()
+            for rid in (1, 2)]
+    assert len({str(r["po_number"]) for r in both}) == 2, "two different purchase orders"
+
+    chosen = [spitfire_post._pod_for(conn, row) for row in both]
+    assert all(c is not None for c in chosen)
+    assert {c.filename for c in chosen} == {"WarehouseReceivingReport.pdf"}, \
+        "one document, attached to the receipt of every purchase order it names"

@@ -219,14 +219,14 @@ signals → confidence identically, and has eight unit tests. **Port it; do not 
 | Cloud-AI approval (Claude + Azure Document Intelligence) | ✅ **Granted** |
 | Dedicated receiving mailbox | ✅ Set up by Joe |
 | Graph app registration + `Mail.ReadWrite` | ✅ Granted 2026-07-20 |
-| Graph **mailbox address** | ✅ `receiver@premierpm.com`, confirmed and verified by `--preflight` |
+| Graph **mailbox address** | ✅ `receiver@example-pm.test`, confirmed and verified by `--preflight` |
 | Graph **Application Access Policy** (scope to one mailbox) | ✅ Confirmed applied |
 | Graph `Mail.Send` | 🚧 Not granted |
 | **Spitfire Swagger + least-privilege service account** | 🚧 **PENDING** |
 | **Spitfire published SQL / cache-sync query (spec → GUID)** | 🚧 **PENDING** |
 | **Non-production Spitfire test environment** | 🚧 **PENDING** |
 | Access to the existing receiver engine (extend, not rebuild) | 🚧 PENDING |
-| Historical email + receiver dataset (Cameo) for back-testing | 🚧 PENDING |
+| Historical email + receiver dataset (Example Hotel) for back-testing | 🚧 PENDING |
 
 The SoW anticipated this: *"Any waiting on outstanding access sits alongside this window rather
 than inside it."* That is exactly what has happened.
@@ -1111,7 +1111,7 @@ environment. **Est 3–4 d.**
 ### Week 4 — Stage 4 Match 🚧 *gated*
 **Port `api/services/reconcile.py` → `pipeline/stage4_match.py`** (the biggest accelerator
 available). Add spec→GUID exact resolution, spec-code pre-filter for O(1) candidate narrowing,
-`MatchResult` persistence, `match_orchestrator.py`. Back-test against the historical Cameo dataset
+`MatchResult` persistence, `match_orchestrator.py`. Back-test against the historical Example Hotel dataset
 if Joe can share it. Fill `tests/test_match.py`. **Est 3 d.**
 
 ### Week 5 — Stages 5 + 6 🚧 *gated*
@@ -1320,7 +1320,7 @@ shows.
 17. 🔴 **Port `api/services/reconcile.py` into `stage4_match.py`** rather than rewriting.
 18. 🔴 Write the end-to-end test.
 19. 🔴 Add authentication before any real Premier data touches the API or UI.
-20. 🟠 Back-test matching against the historical Cameo dataset before go-live.
+20. 🟠 Back-test matching against the historical Example Hotel dataset before go-live.
 
 ---
 
@@ -1348,7 +1348,7 @@ Copy-Item .env.example .env       # then fill in the Graph values
 | `GRAPH_TENANT_ID` | Joe, 2026-07-20 | ✅ |
 | `GRAPH_CLIENT_ID` | Joe, 2026-07-20 | ✅ |
 | `GRAPH_CLIENT_SECRET` | Joe, 2026-07-20 | ✅ expires 2027-07-20 |
-| `GRAPH_MAILBOX_ADDRESS` | Premier | ✅ `receiver@premierpm.com` |
+| `GRAPH_MAILBOX_ADDRESS` | Premier | ✅ `receiver@example-pm.test` |
 
 Optional: `API_HOST`, `API_PORT`, `CORS_ORIGINS`, `DEFAULT_OPERATOR`.
 
@@ -1473,7 +1473,7 @@ turn out to be noise; `--dry-run-ocr` prices a poll first.
 | ❓ Does the service run in Azure reaching in, or inside Premier's network? | Premier IT | Blocks deployment design |
 | ❓ Does the receiver engine write via REST or direct to DB, and can it be reused as-is? | Joe | Blocks Stage 6 |
 | ❓ Are spec codes genuinely unique per PO line? | Joe | **The entire match key depends on this** |
-| ❓ Can the historical Cameo dataset be shared for back-testing? | Joe | Confidence before go-live |
+| ❓ Can the historical Example Hotel dataset be shared for back-testing? | Joe | Confidence before go-live |
 | ❓ Committed Phase-1 go-live date | Nikunj + Joe | None exists; planning is week-to-week |
 
 ---

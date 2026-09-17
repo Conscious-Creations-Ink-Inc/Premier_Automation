@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from config import settings
+from pipeline import attachment_ledger
 from pipeline.models import Attachment
 from pipeline.parsing import integrity, sniff
 from pipeline.stage3_extract.base import ExtractionSource
@@ -172,6 +173,20 @@ class MsgContainerAdapter(ContainerAdapter):
             message.close()
 
     def _expand_eml(self, source: ExtractionSource, budget: Budget) -> List[Attachment]:
+        """A MIME message's parts, with the same decorative rule the other two paths apply.
+
+        This path is not the rare one it looks like. A Graph `itemAttachment` arrives as **MIME,
+        not as a `.msg`** whatever it is named, so a forwarded email — the commonest shape in this
+        corpus — is expanded here rather than by `_expand_msg`.
+
+        It used to hand every part straight to `_child`, which classifies nothing. So a signature
+        logo nested one level down was never marked decorative, went to OCR, and came back
+        `400 InvalidContentDimensions` or `InvalidContent` — the whole
+        `pollackweitznerlogo_emailsignature*.png` family, and a 207-byte 32x32 icon that Azure will
+        not even look at. `_expand_msg` reuses `MsgFileMailbox._collect_attachments` and gets the
+        rule for free; here it has to be applied explicitly, and it is applied with the same inputs
+        so a nested logo is judged exactly as a top-level one is.
+        """
         import email as email_lib
         from email import policy
 
@@ -179,6 +194,18 @@ class MsgContainerAdapter(ContainerAdapter):
         message = email_lib.message_from_bytes(source.content_bytes, policy=policy.default)
         children: List[Attachment] = []
 
+        # The cids the body actually draws, which is what separates a rendered signature logo from
+        # a photograph someone pasted in. Collected before the walk so rule 2 of `classify_image`
+        # has it for every part, whatever order the parts arrive in.
+        body_cids = set()
+        for part in message.walk():
+            if part.get_content_type() in ("text/html", "text/plain"):
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body_cids |= sniff.referenced_cids(
+                        payload.decode(part.get_content_charset() or "utf-8", "replace"))
+
+        seen_digests: dict = {}
         for index, part in enumerate(message.walk()):
             if part.get_content_maintype() == "multipart":
                 continue
@@ -189,7 +216,25 @@ class MsgContainerAdapter(ContainerAdapter):
             if not budget.take(len(payload)):
                 children.append(_child(name, b"", parent_path, "oversize:expansion budget exhausted"))
                 continue
-            children.append(_child(name, payload, parent_path))
+
+            content_id = (part.get("Content-ID") or "").strip()
+            result = sniff.sniff(payload, name, part.get_content_type() or "")
+            drop_hint = None
+            verdict = sniff.classify_image(payload, name, result, body_cids, content_id)
+            if verdict.decorative:
+                drop_hint = f"decorative:{verdict.certainty} — {verdict.reason}"
+            elif result.sha256 in seen_digests:
+                # Same content-hash dedupe both other connectors apply, so a nested message whose
+                # logo appears in every quoted hop is read once rather than once per hop.
+                drop_hint = attachment_ledger.duplicate_drop_hint(
+                    name, seen_digests[result.sha256], result.sha256)
+            else:
+                seen_digests[result.sha256] = name
+
+            child = _child(name, payload, parent_path, drop_hint)
+            child.content_id = content_id or None
+            child.is_inline = bool(content_id and content_id.strip("<>") in body_cids)
+            children.append(child)
         return children
 
 

@@ -3,11 +3,11 @@
 Written against the real June corpus. The single most important rule here is that a **bare
 6-digit number is not a PO number**. In one Authority Logistics subject —
 
-    [External] 239260 - Inbound Notification - 206725, 207665 - 2978 : LXR Cameo ... - MRC
+    [External] 939260 - Inbound Notification - 906725, 907665 - 9078 : Example Hotel ... - MRC
 
-— 239260 is the inbound number and 206725/207665 are the POs, all six digits. Tracking numbers
-(8801592, 69942177, 31457971), Authority/shipment numbers (50009, 49985) and project numbers
-(2978, 2985) coexist in the same text. So a PO is only ever recognised from a *position*: a
+— 939260 is the inbound number and 906725/907665 are the POs, all six digits. Tracking numbers
+(9801592, 99942177, 91457971), Authority/shipment numbers (90009, 99985) and project numbers
+(9078, 9085) coexist in the same text. So a PO is only ever recognised from a *position*: a
 label, a subject slot, or a known PO column. `find_po_numbers` will not guess.
 """
 
@@ -20,8 +20,25 @@ from typing import List, Optional, Tuple
 
 PO_LENGTH_RE = re.compile(r"^\d{6}$")
 
-# Labelled forms, all observed or plausible: "PO 213987", "PO# 213987", "P.O.# 210634",
-# "PO: 213987", "PO #213987", "Purchase Order 210634". Case-insensitive — the old
+
+def is_po_number(value) -> bool:
+    """Whether this string is shaped like a Premier purchase order — six digits, nothing else.
+
+    The shape test that `find_po_numbers` and `parse_po_list` already apply internally, exposed so
+    the places that turn a *parsed* value into a **key** can apply it too. Those were the gap: both
+    of those functions are strictly 6-digit, but a `po_number` read off a document table by a
+    generic adapter is whatever was in the cell, and it flows into `evidence.po_numbers` and from
+    there into triage's hint list without ever passing a shape check.
+
+    Measured 2026-08-25 on an Atlas Logistics "Warehouse Receiving Report" nobody had a parser for:
+    an address block produced the purchase orders `(812) 424-2222`, `Premier`, `1150 New` and
+    `Circuit of\\nc/o EDC\\nDept #`, and all four became delivery-event keys in `released_events`
+    and `accumulation`. The document's real PO was sitting in it as `Project #: 911798`.
+    """
+    return bool(value) and bool(PO_LENGTH_RE.match(str(value).strip()))
+
+# Labelled forms, all observed or plausible: "PO 913987", "PO# 913987", "P.O.# 910634",
+# "PO: 913987", "PO #913987", "Purchase Order 910634". Case-insensitive — the old
 # settings.PO_TOKEN_REGEX was not, and missed every lowercase "po #" (finding C4).
 PO_LABELLED_RE = re.compile(
     r"\b(?:P\.?\s?O\.?|purchase\s+order)s?\s*(?:numbers?|nos?\.?|#)?\s*[:#]?\s*"
@@ -29,14 +46,14 @@ PO_LABELLED_RE = re.compile(
     re.IGNORECASE,
 )
 # The trailing group deliberately swallows a whole list. One label routinely covers several POs
-# — `PO 207505, 207514, 212559, 207249, 208705, 212560, 212614` and `PO 211310 + PO 212578` are
+# — `PO 907505, 907514, 912559, 907249, 908705, 912560, 912614` and `PO 911310 + PO 912578` are
 # both real subjects — and matching only the first left six of seven POs unaccumulated.
 
-# "206725 : 1" / "208491 : 300" — the Authority Inbound `PO # / Line #` cell. This is the
+# "906725 : 1" / "908491 : 300" — the Authority Inbound `PO # / Line #` cell. This is the
 # richest token in the whole corpus: it hands us the PO *and* the Spitfire line number.
 PO_LINE_REF_RE = re.compile(r"^\s*(\d{6})\s*:\s*(\d{1,5})\s*$")
 
-# A comma/slash-separated PO list as it appears in a subject slot: "206725, 207665".
+# A comma/slash-separated PO list as it appears in a subject slot: "906725, 907665".
 PO_LIST_RE = re.compile(r"\b\d{6}\b")
 
 
@@ -47,7 +64,7 @@ class PoLineRef:
 
 
 def parse_po_line_ref(cell: str) -> Optional[PoLineRef]:
-    """`"208491 : 300"` -> PoLineRef("208491", 300). Returns None for anything else, including a
+    """`"908491 : 300"` -> PoLineRef("908491", 300). Returns None for anything else, including a
     bare PO with no line — callers that accept a bare PO must say so explicitly."""
     if not cell:
         return None
@@ -75,7 +92,7 @@ def find_po_numbers(text: str) -> List[str]:
 
 
 def parse_po_list(slot_text: str) -> List[str]:
-    """Every 6-digit token in an already-isolated PO slot ("206725, 207665").
+    """Every 6-digit token in an already-isolated PO slot ("906725, 907665").
 
     Only call this with text you have already established *is* a PO field — a subject slot
     matched by a vendor grammar, or a cell under a `PO #` header. Calling it on free text
@@ -264,13 +281,13 @@ def normalize_date(raw) -> Optional[str]:
 
 # --- Shipment / tracking / carrier reference numbers -------------------------
 
-# "ALS Shipment #: 50052 : 1" (Inbound) and "Authority #: 50009" (Delivered) are the *same*
+# "ALS Shipment #: 90052 : 1" (Inbound) and "Authority #: 90009" (Delivered) are the *same*
 # number under two names — the join that stops one physical delivery becoming two receivers.
 SHIPMENT_SUFFIX_RE = re.compile(r"^\s*(\d{4,8})\s*(?::\s*(\d{1,3}))?\s*$")
 
 
 def parse_shipment_number(raw: str) -> Optional[str]:
-    """`"50052 : 1"` -> `"50052"`, `"50009"` -> `"50009"`, `""` -> None.
+    """`"90052 : 1"` -> `"90052"`, `"90009"` -> `"90009"`, `""` -> None.
 
     The `: 1` suffix is Authority's own leg counter within a shipment; dropping it is what makes
     the Delivered<->Inbound join work, since the Delivered side never carries it.
@@ -283,7 +300,7 @@ def parse_shipment_number(raw: str) -> Optional[str]:
 
 def parse_tracking_numbers(raw: str) -> List[str]:
     """Tracking cells hold one or several numbers, sometimes with the carrier appended
-    (`"31457971\\n7497809572 FEDEX"`). Returns them in order, deduped."""
+    (`"91457971\\n7497809572 FEDEX"`). Returns them in order, deduped."""
     if not raw:
         return []
     seen: List[str] = []
@@ -298,7 +315,7 @@ def parse_tracking_numbers(raw: str) -> List[str]:
 def split_reference_field(raw: str) -> Tuple[List[str], List[str]]:
     """FedEx POD `Purchase Order` fields are a comma-joined grab bag:
 
-        Purchase Order 31457971,210634,49985 : 1
+        Purchase Order 91457971,910634,99985 : 1
 
     which is {carrier reference, PO, Authority shipment}. Returns (po_candidates, others) —
     6-digit tokens are treated as PO candidates, everything else is handed back for the caller

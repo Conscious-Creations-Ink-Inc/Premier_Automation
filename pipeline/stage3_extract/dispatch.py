@@ -16,11 +16,12 @@ import sqlite3
 from typing import Callable, List, Optional, Sequence
 
 from config import settings
-from pipeline import attachment_ledger
+from pipeline import attachment_ledger, parsed_documents
 from pipeline.models import Attachment, ExtractedRecord
 from pipeline.parsing import integrity, sniff
 from pipeline.stage3_extract import containers as container_mod
 from pipeline.stage3_extract.base import ExtractionAdapter, ExtractionSource
+from pipeline.stage3_extract.ocr_adapter import OcrServiceUnavailable
 from pipeline.stage3_extract.unsupported_adapter import UnsupportedFormatError
 
 _logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ def _child_source(parent: ExtractionSource, child: Attachment) -> ExtractionSour
         sender_address=parent.sender_address,
         subject=parent.subject,
         only_po=parent.only_po,
+        known_po_numbers=parent.known_po_numbers,
         ledger_id=child.ledger_id,
         container_path=child.container_path,
     )
@@ -128,6 +130,21 @@ def _read_leaf(conn, source, adapters, now) -> List[ExtractedRecord]:
                 _record(conn, source, attachment_ledger.EXTRACTED, now,
                         claimed_by=name, records=len(records))
                 return records
+        except OcrServiceUnavailable as e:
+            # Recorded, not retried and not guessed at. The file is intact and its bytes are in
+            # `attachment_store`, so this row is re-runnable the moment the dependency is fixed —
+            # which is exactly what `tools/reextract.py` selects on. It must not fall through to
+            # `_classify_failure` below, which would sniff intact image bytes and call them
+            # `corrupt`, blaming the sender's photograph for someone else's outage.
+            # `error_type` carries the *specific* failure where there is one — `TooManyRequests`,
+            # `InvalidContentLength` — rather than the wrapper class for every case alike. It was
+            # always the literal "OcrServiceUnavailable", so "show me the rate-limited ones" could
+            # not be asked of the ledger at all, and telling a throttle apart from a rejected file
+            # meant reading 108 detail strings by eye.
+            _record(conn, source, attachment_ledger.SERVICE_UNAVAILABLE, now,
+                    claimed_by=name, detail=f"{e.service} unavailable — {e.detail}",
+                    error_type=e.error_type)
+            return []
         except UnsupportedFormatError as e:
             _record(conn, source, attachment_ledger.UNSUPPORTED_FORMAT, now,
                     claimed_by=name, detail=e.guidance)
@@ -202,4 +219,34 @@ def _record(
         conn, source.ledger_id, disposition, now,
         claimed_by=claimed_by, records_extracted=records, detail=detail, error_type=error_type,
         pod_document=source.pod_document,
+        grid_verdicts=source.grid_verdicts,
     )
+    _keep_the_parse(conn, source, claimed_by, now)
+
+
+def _keep_the_parse(conn, source: ExtractionSource, adapter: Optional[str], now: str) -> None:
+    """Store everything the reader saw, alongside the verdict about it.
+
+    Written here rather than in each adapter because this is the one place holding both a
+    connection and the `ledger_id` the document belongs to — the same reason `pod_document` is
+    carried on the source and persisted from here.
+
+    Never raises. Keeping evidence is worth a lot, but not the extraction it was captured
+    alongside: a failure to store the parse must not turn a read attachment into an errored one.
+    """
+    if not (source.parsed_text or source.parsed_tables):
+        return
+    try:
+        parsed_documents.save(conn, parsed_documents.ParsedDocument(
+            ledger_id=source.ledger_id,
+            email_id=source.source_email_id or "",
+            filename=source.filename or "",
+            container_path=source.container_path or "",
+            adapter=adapter or "",
+            raw_text=source.parsed_text or "",
+            tables=source.parsed_tables or [],
+            parsed_at=now,
+        ))
+    except Exception:                                              # noqa: BLE001
+        _logger.warning("could not store the parse for %s (%s)",
+                        source.source_email_id, source.filename, exc_info=True)

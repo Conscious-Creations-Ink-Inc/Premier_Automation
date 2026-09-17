@@ -7,10 +7,10 @@ labelled "Ready to process further" while missing every proof-of-delivery field 
 from pipeline import completeness, receipt_log
 
 FULL = {
-    "po_number": "210634", "vendor_name": "P. Kaufmann", "po_line_number": 1,
+    "po_number": "910634", "vendor_name": "P. Kaufmann", "po_line_number": 1,
     "item_description": "Main Drapery Fabric", "quantity_received": 202.0,
     "unit_of_measure": "YD", "spec_code": "GR-350a-WTF", "pod_stated_date": "2025-09-10",
-    "received_by": "U ALI", "carrier_name": "GlobalTranz", "tracking_number": "31457971",
+    "received_by": "U ALI", "carrier_name": "GlobalTranz", "tracking_number": "91457971",
 }
 
 
@@ -22,7 +22,7 @@ def test_a_fully_populated_record_is_complete():
 def test_a_po_only_record_is_missing_everything_else():
     """Ten of the thirteen live records looked exactly like this — a PO number and nothing at all
     to compare against it."""
-    result = completeness.gaps({"po_number": "206481"})
+    result = completeness.gaps({"po_number": "906481"})
     assert result.is_complete is False
     assert set(result.missing_required) == set(completeness.REQUIRED) - {"po_number"}
 
@@ -37,7 +37,7 @@ def test_the_fabric_record_shape_is_incomplete_without_its_notification():
     behind it, and no other system can supply that date.
     """
     result = completeness.gaps({
-        "po_number": "210634", "spec_code": "GR-350a-WTF",
+        "po_number": "910634", "spec_code": "GR-350a-WTF",
         "item_description": "Main Drapery Fabric", "quantity_received": 196.0,
         "unit_of_measure": "YD",
     })
@@ -92,7 +92,7 @@ def test_advisory_fields_are_marked_as_such_when_asked_for():
 
 def test_it_reads_objects_as_well_as_mappings():
     class Row:
-        po_number = "210634"
+        po_number = "910634"
 
     assert "po_number" not in completeness.gaps(Row()).missing_required
 

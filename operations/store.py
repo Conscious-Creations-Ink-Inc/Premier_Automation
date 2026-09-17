@@ -81,7 +81,19 @@ class Schedule:
     on a console whose last run was hours ago made the next run due immediately."""
 
 
-def get_connection(db_path: Path = CONSOLE_DB_PATH) -> sqlite3.Connection:
+def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    """Open the console database, resolving the default at call time rather than import time.
+
+    The default used to be `db_path: Path = CONSOLE_DB_PATH`, which binds the module constant once
+    when the function is defined — so rebinding `store.CONSOLE_DB_PATH` afterwards changed nothing
+    and there was no way to point the console at another file. That is why the test suite wrote
+    forty-eight rows into Premier's real run history, and why those rows were not merely untidy:
+    the scheduler counts its interval from `last_run()`, so every test run silently pushed the next
+    live run an hour into the future.
+
+    Resolving here makes the constant the single point of control, and `tests/conftest.py` pins it.
+    """
+    db_path = db_path or CONSOLE_DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -151,6 +163,32 @@ def finish_run(
          json.dumps(detail or {}), run_id),
     )
     conn.commit()
+
+
+def abandon_unfinished_runs(conn: sqlite3.Connection, *, at: str) -> int:
+    """Close out any run still marked in progress, and return how many there were.
+
+    Called once at startup, where the claim is free: this process has just begun, so it owns no
+    run, and `_LOCK` lives in memory and cannot outlive the process that held it. A row with no
+    `finished_at` at this moment is therefore not a run in progress — it is a run whose process
+    died before `finish_run` could be reached, and `_run_locked`'s `finally` cannot help with a
+    hard kill.
+
+    Nothing reconciled these, so they accumulated: eleven rows going back to 2026-08-13, each one
+    rendering as "running..." in history for ever. The cost is not cosmetic. An operator reading
+    the console cannot tell a phantom from the real thing, which is exactly the confusion that let
+    a genuinely hung run sit unnoticed for twelve hours.
+
+    `elapsed_seconds` is deliberately left at 0 rather than computed from `started_at`: we do not
+    know when the process died, and a fabricated duration is worse than an obvious absence.
+    """
+    cur = conn.execute(
+        """UPDATE runs SET finished_at=?, error=?
+           WHERE finished_at IS NULL""",
+        (at, "interrupted — the console restarted while this run was in progress"),
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def recent_runs(conn: sqlite3.Connection, limit: int = 25) -> List[Run]:

@@ -30,9 +30,10 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 from pipeline import completeness
+from pipeline.parsing import items
 
 
 def _labels(gaps) -> List[str]:
@@ -93,6 +94,16 @@ def complete(conn: sqlite3.Connection, row: Any, *, line: Optional[int] = None,
                          f"{', '.join(str(n) for n in known)}"))
         updates["po_line_number"] = line
         applied.append(f"PO line # = {line} (chosen by the reviewer)")
+
+    # Nobody chose a line and the record has none. On a purchase order where the spec names one
+    # line, `apply_verification` settles it from the spec; where 29 lines share a spec — PO 907514's
+    # signage package — only the wording can, and without this the record sits in the queue
+    # identifying nothing but "PO 907514, LOB-900-SI", which is true of all 23 of them.
+    if line is None and row["po_line_number"] is None:
+        resolved, note = find_line_by_description(conn, row)
+        if resolved is not None:
+            updates["po_line_number"] = resolved
+            applied.append(note)
 
     if not updates:
         gaps = completeness.gaps(row)
@@ -172,6 +183,124 @@ def apply_verification(conn: sqlite3.Connection, row: Any, verification: Any, *,
                  f"quantity agrees)"],
         message=("this record is now complete and can be posted" if gaps.is_complete
                  else f"still {gaps.describe()}"))
+
+
+AMBIGUOUS_SPEC_LINE_THRESHOLD = 95
+"""How alike a description must read before it may name a purchase-order line on its own.
+
+Higher than `items.SAME_ITEM_THRESHOLD` (85), and deliberately. Grouping only has to decide
+whether two rows belong together; this decides **which budget line a receipt is charged to**, so
+it asks for a near-exact reading of the same name. Measured on PO 907514: 22 of 23 descriptions
+match their line at 100, and the 23rd — `Main Elevator Lobby Directory` — peaks at 53 and is left
+for a person, which is the right answer for it.
+"""
+
+
+def _po_lines(conn: sqlite3.Connection, po_number: str) -> List[Any]:
+    """The purchase order's cached lines. Local only — this never reaches Spitfire."""
+    return list(conn.execute(
+        "SELECT line_number, spec_code, description, unit_of_measure, qty_ordered "
+        "FROM spitfire_po_lines WHERE po_number = ?", (po_number,)))
+
+
+def spec_is_ambiguous(lines: Sequence[Any], spec_code: Optional[str]) -> bool:
+    """Does more than one line on this purchase order carry this spec code?
+
+    On most POs a spec names exactly one line, which is why `apply_verification` can treat a
+    spec match as proof and a description match as merely suggestive. PO 907514 breaks that: **29
+    lines all read `LOB-900-SI`**, a signage package whose lines differ only by description. There
+    the spec is not weak evidence, it is *no* evidence of which line, and the description is the
+    only thing that can say. 82 of 368 cached lines (22%) sit on such a pair.
+    """
+    wanted = items.normalise(spec_code)
+    if not wanted:
+        return False
+    return sum(1 for line in lines if items.normalise(line["spec_code"]) == wanted) > 1
+
+
+def resolve_line_by_description(conn: sqlite3.Connection, row: Any, *,
+                                now: Optional[str] = None) -> Completion:
+    """Name the purchase-order line for a record whose spec cannot, using its description.
+
+    Only for the ambiguous-spec case above. Where a spec identifies a line, `apply_verification`
+    already does this and its refusal to accept description alone stays exactly as it is — a
+    description match is genuinely the weaker claim *when a spec was available and disagreed*.
+
+    Every one of these has to hold, and each rules out a way of being wrong:
+
+    * the record must carry a spec that matches the candidate lines — this narrows to one PO's
+      signage package rather than searching the whole order
+    * more than one line must share that spec, or this is not the case being solved
+    * the description must match **one** line and no other at the same score; a tie means the
+      description cannot tell them apart and a person decides
+    * the quantity must agree with that line's ordered quantity — the same condition
+      `apply_verification` imposes, and what turns a plausible name match into a checkable one
+    * nothing already recorded is overwritten, a reviewer's choice least of all
+
+    Returns a refusal with a stated reason rather than raising, so a caller can report why a row
+    stayed in the queue.
+    """
+    line_number, note = find_line_by_description(conn, row)
+    if line_number is None:
+        return Completion(ok=False, message=note)
+
+    _write(conn, int(row["id"]), {"po_line_number": line_number},
+           now or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    after = dict(row)
+    after["po_line_number"] = line_number
+    gaps = completeness.gaps(after)
+    return Completion(
+        ok=True, is_complete=gaps.is_complete, remaining=_labels(gaps), applied=[note],
+        message=("this record is now complete and can be posted" if gaps.is_complete
+                 else f"still {gaps.describe()}"))
+
+
+def find_line_by_description(conn: sqlite3.Connection, row: Any):
+    """`(line_number, note)` — the line this record's wording names, or `(None, why not)`.
+
+    Pure: reads the mirror and decides. The note is written to be shown either way, so a record
+    that stays in the queue says what stopped it rather than simply sitting there.
+    """
+    if row["po_line_number"] is not None:
+        return None, "this record already carries a line"
+
+    po_number = str(row["po_number"] or "").strip()
+    spec_code = row["spec_code"] if "spec_code" in row.keys() else None
+    description = row["item_description"] if "item_description" in row.keys() else None
+    if not po_number or not items.normalise(description):
+        return None, "no purchase order or no description to match on"
+
+    lines = _po_lines(conn, po_number)
+    if not lines:
+        return None, (f"purchase order {po_number} is not in the local mirror, so its lines cannot "
+                      f"be read — verify it against Spitfire first")
+    if not spec_is_ambiguous(lines, spec_code):
+        return None, "this spec names a single line, so the spec decides it rather than the wording"
+
+    wanted_spec = items.normalise(spec_code)
+    candidates = [line for line in lines if items.normalise(line["spec_code"]) == wanted_spec]
+    line, score, unique = items.best_match(
+        description, candidates, key=lambda c: c["description"],
+        threshold=AMBIGUOUS_SPEC_LINE_THRESHOLD)
+
+    if line is None:
+        return None, (f"no line on {po_number} reads like {description!r} (closest {score:.0f} of "
+                      f"{AMBIGUOUS_SPEC_LINE_THRESHOLD}) — choose the line yourself if you know it")
+    if not unique:
+        return None, (f"more than one line on {po_number} reads like {description!r} equally well, "
+                      f"so the wording cannot choose between them")
+
+    quantity = row["quantity_received"]
+    ordered = line["qty_ordered"]
+    if quantity is None or ordered is None or float(quantity) != float(ordered):
+        return None, (f"line {line['line_number']} matches the wording but is ordered {ordered} "
+                      f"against {quantity} received, so it is left for a person to settle")
+
+    return int(line["line_number"]), (
+        f"PO line # = {line['line_number']} (only line on {po_number} named "
+        f"{line['description']!r}; {len(candidates)} lines share spec {spec_code}, "
+        f"quantity agrees at {ordered})")
 
 
 def _pod_facts(conn: sqlite3.Connection, row: Any):

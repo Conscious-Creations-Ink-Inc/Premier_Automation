@@ -36,7 +36,7 @@ POD_TEXT = [
     "Signed for by: U ALI",
     "Shipping Information:",
     "Tracking number: 7497809572 Ship Date: Sep 5, 2025",
-    "Purchase Order 210634 : 1",
+    "Purchase Order 910634 : 1",
 ]
 
 
@@ -63,10 +63,10 @@ def store(monkeypatch):
     conn.execute("""INSERT INTO extracted_records
         (id, source_email_id, po_number, spec_code, item_description, vendor_name,
          quantity_received, unit_of_measure)
-        VALUES (1, 'mail-1', '210634', 'GR-350a-WTF', 'Main Drapery Fabric', 'P. Kaufmann',
+        VALUES (1, 'mail-1', '910634', 'GR-350a-WTF', 'Main Drapery Fabric', 'P. Kaufmann',
                 196.0, 'YD')""")
     conn.executemany("INSERT INTO spitfire_po_lines VALUES (?, ?)",
-                     [("210634", 1), ("210634", 3), ("210634", 4)])
+                     [("910634", 1), ("910634", 3), ("910634", 4)])
     conn.commit()
     return conn
 
@@ -117,12 +117,12 @@ def test_a_value_already_present_is_never_overwritten(store, monkeypatch):
 def test_a_pod_naming_a_different_po_is_refused(store, monkeypatch):
     """A delivery note for someone else's purchase order is not evidence for this line, and its
     date would be wrong on the receipt in a way nobody could see afterwards."""
-    _serve_pod(monkeypatch, _pdf([l.replace("210634", "999999") for l in POD_TEXT]))
+    _serve_pod(monkeypatch, _pdf([l.replace("910634", "999999") for l in POD_TEXT]))
 
     outcome = record_completion.complete(store, _row(store), line=1)
 
     assert not outcome.ok
-    assert "999999" in outcome.message and "not 210634" in outcome.message
+    assert "999999" in outcome.message and "not 910634" in outcome.message
     assert _row(store)["pod_stated_date"] is None, "a refused completion still wrote"
 
 
@@ -156,7 +156,7 @@ def test_a_photographed_pod_read_at_ingest_fills_the_record(store, monkeypatch):
     store.execute("""INSERT INTO attachment_ledger
                      (email_id, ordinal, filename, is_pod, pod_po_numbers,
                       pod_delivery_date, pod_signed_by)
-                     VALUES ('mail-1', 0, 'POD.png', 1, '210634', '2025-09-10', 'U ALI')""")
+                     VALUES ('mail-1', 0, 'POD.png', 1, '910634', '2025-09-10', 'U ALI')""")
     store.commit()
 
     outcome = record_completion.complete(store, _row(store), line=1)
@@ -277,3 +277,137 @@ def test_a_parent_spec_match_still_counts_as_exact(store):
 def test_no_resolved_line_is_not_an_error(store):
     assert not record_completion.apply_verification(
         store, _row(store), _Verification(None)).ok
+
+
+# --- One spec, many lines -----------------------------------------------------------------------
+#
+# PO 907514 carries 29 Spitfire lines that all read `LOB-900-SI`, a signage package whose lines
+# differ only by description. There the spec cannot say which line a delivery is, so every one of
+# the 23 delivered items identified itself only as "PO 907514, LOB-900-SI" — true of all 23.
+
+@pytest.fixture
+def signage(monkeypatch):
+    """A purchase order whose spec names many lines, as PO 907514's really does."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE extracted_records (
+            id INTEGER PRIMARY KEY, source_email_id TEXT, po_number TEXT, spec_code TEXT,
+            item_description TEXT, vendor_name TEXT, quantity_received REAL, unit_of_measure TEXT,
+            po_line_number INTEGER, pod_stated_date TEXT, received_by TEXT,
+            carrier_name TEXT, tracking_number TEXT, updated_at TEXT);
+        CREATE TABLE spitfire_po_lines (
+            po_number TEXT, line_number INTEGER, spec_code TEXT, description TEXT,
+            unit_of_measure TEXT, qty_ordered REAL);
+        CREATE TABLE attachment_ledger (
+            id INTEGER PRIMARY KEY, email_id TEXT, depth INTEGER DEFAULT 0, ordinal INTEGER,
+            filename TEXT, is_pod INTEGER DEFAULT 0, pod_po_numbers TEXT DEFAULT '',
+            pod_delivery_date TEXT, pod_signed_by TEXT);
+    """)
+    # Spitfire keeps the catalogue code inside the description; the delivery paperwork does not.
+    conn.executemany(
+        "INSERT INTO spitfire_po_lines VALUES ('907514', ?, 'LOB-900-SI', ?, 'EA', ?)",
+        [(11, "Common Room ID Item: ST-6", 15.0),
+         (13, "P.S. Small Directional Item: ST-3", 3.0),
+         (14, "Restroom Door Placard Item: ST-11", 8.0),
+         (18, "Exit Item: ST-14", 4.0),
+         (24, "Exit Route Item: ST-15", 4.0)])
+    conn.commit()
+    return conn
+
+
+def _signage_record(conn, description, quantity, *, record_id=1, spec="LOB-900-SI"):
+    conn.execute("""INSERT INTO extracted_records
+        (id, source_email_id, po_number, spec_code, item_description, quantity_received,
+         unit_of_measure) VALUES (?, 'mail-sig', '907514', ?, ?, ?, 'EA')""",
+        (record_id, spec, description, quantity))
+    conn.commit()
+    return conn.execute("SELECT * FROM extracted_records WHERE id = ?", (record_id,)).fetchone()
+
+
+def test_the_description_names_the_line_when_the_spec_cannot(signage):
+    """22 of PO 907514's 23 delivered items resolve this way; nothing else can tell them apart."""
+    row = _signage_record(signage, "Common Room ID", 15.0)
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line == 11, note
+    assert "Common Room ID" in note and "lines share spec" in note
+
+
+def test_a_catalogue_code_on_the_purchase_order_line_does_not_prevent_the_match():
+    """Spitfire stores `P.S. Small Directional Item: ST-3`; the email says `P.S. Small Directional`.
+    The code carries digits the email never mentions, and the digit rule — rightly strict about
+    numbers — rejected every candidate outright until the code was stripped. Measured then: 0/23."""
+    from pipeline.parsing import items
+    assert items.strip_catalogue_code("P.S. Small Directional Item: ST-3") == "P.S. Small Directional"
+    assert items.strip_catalogue_code("Medicine Ball 4 Kg CODE: A0001002") == "Medicine Ball 4 Kg"
+    assert items.strip_catalogue_code("Item Description Only") == "Item Description Only"
+
+
+def test_a_subset_description_never_picks_the_longer_line(signage):
+    """"Exit" must find line 18, not line 24's "Exit Route" — `token_set_ratio` scores them equal."""
+    row = _signage_record(signage, "Exit", 4.0)
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line == 18, note
+
+
+def test_a_wording_no_line_matches_is_left_to_a_person(signage):
+    """One of PO 907514's 23 is exactly this: `Main Elevator Lobby Directory`, best score 53."""
+    row = _signage_record(signage, "Main Elevator Lobby Directory", 3.0)
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line is None
+    assert "choose the line yourself" in note
+
+
+def test_a_line_that_disagrees_on_quantity_is_refused(signage):
+    """The name matching is only half of it — the figure has to agree, or a reviewer looks."""
+    row = _signage_record(signage, "Common Room ID", 9.0)   # the line is ordered 15
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line is None
+    assert "ordered 15.0" in note and "9.0 received" in note
+
+
+def test_an_unambiguous_spec_is_left_to_the_spec(signage):
+    """Where a spec names one line, the spec decides — `apply_verification`'s refusal to accept a
+    description alone is deliberate and stays exactly as it is."""
+    signage.execute("INSERT INTO spitfire_po_lines VALUES "
+                    "('907514', 40, 'LOB-901-XX', 'Lonely Sign Item: ST-99', 'EA', 2.0)")
+    signage.commit()
+    row = _signage_record(signage, "Lonely Sign", 2.0, spec="LOB-901-XX")
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line is None
+    assert "spec names a single line" in note
+
+
+def test_a_cold_mirror_says_so_rather_than_guessing(signage):
+    """The resolution reads the local cache. A PO nobody has verified is not in it."""
+    signage.execute("DELETE FROM spitfire_po_lines")
+    signage.commit()
+    row = _signage_record(signage, "Common Room ID", 15.0)
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line is None
+    assert "not in the local mirror" in note
+
+
+def test_a_reviewers_line_is_never_replaced(signage):
+    """A person's choice outranks the scorer, as it does everywhere else in this module."""
+    row = _signage_record(signage, "Common Room ID", 15.0)
+    signage.execute("UPDATE extracted_records SET po_line_number = 99 WHERE id = 1")
+    signage.commit()
+    row = signage.execute("SELECT * FROM extracted_records WHERE id = 1").fetchone()
+
+    line, note = record_completion.find_line_by_description(signage, row)
+
+    assert line is None
+    assert "already carries a line" in note

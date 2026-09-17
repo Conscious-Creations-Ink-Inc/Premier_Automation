@@ -21,14 +21,14 @@ def new_conn():
 
 def record(**overrides) -> ExtractedRecord:
     values = dict(
-        source_email_id="msg-1", po_number="208491", shipment_number=None,
+        source_email_id="msg-1", po_number="908491", shipment_number=None,
         spec_code="STE-402-LT-B", parent_spec_code="STE-402-LT", sub_spec_suffix="B",
         item_description="BASE, Floor Lamp 2", vendor_name="Light Annex",
-        carrier_name="Custom Companies", tracking_number="69942177", quantity_received=1.0,
+        carrier_name="Custom Companies", tracking_number="99942177", quantity_received=1.0,
         unit_of_measure="EA", pod_stated_date="2025-10-09",
         email_date="2025-10-09T23:17:49+05:30", delivery_location=None, comments=None,
         extraction_source="authority_inbound", extraction_confidence=1.0, raw_snippet="…",
-        po_line_number=300, received_by="Miguel C.", notification_number="239475",
+        po_line_number=300, received_by="Jordan T.", notification_number="939475",
     )
     values.update(overrides)
     return ExtractedRecord(**values)
@@ -41,7 +41,7 @@ def test_build_groups_rows_into_po_then_line_then_receipts():
 
     report = receipt_log.build(conn)
     [po] = report.purchase_orders
-    assert po.po_number == "208491"
+    assert po.po_number == "908491"
     assert po.vendor == "Light Annex"
     [line] = po.lines
     assert line.label == "0300"
@@ -62,14 +62,14 @@ def test_two_line_numbers_are_two_lines():
 
 def test_the_receipt_reference_falls_back_through_three_sources():
     conn = new_conn()
-    extracted_records_store.write_pending(conn, record(notification_number="239475"), NOW)
+    extracted_records_store.write_pending(conn, record(notification_number="939475"), NOW)
     extracted_records_store.write_pending(
-        conn, record(po_line_number=301, notification_number=None, shipment_number="50052"), NOW)
+        conn, record(po_line_number=301, notification_number=None, shipment_number="90052"), NOW)
     extracted_records_store.write_pending(
         conn, record(po_line_number=302, notification_number=None, shipment_number=None), NOW)
 
     refs = [line.receipts[0].reference for line in receipt_log.build(conn).purchase_orders[0].lines]
-    assert refs == ["239475", "50052", "Email confirmation"]
+    assert refs == ["939475", "90052", "Email confirmation"]
 
 
 def test_order_qty_and_final_are_never_populated_from_email():
@@ -197,7 +197,7 @@ def test_build_does_not_require_the_caller_to_set_a_row_factory():
     conn = new_conn()
     conn.row_factory = None
     extracted_records_store.write_pending(conn, record(), NOW)
-    assert receipt_log.build(conn).purchase_orders[0].po_number == "208491"
+    assert receipt_log.build(conn).purchase_orders[0].po_number == "908491"
     assert conn.row_factory is None, "the caller's factory is restored"
 
 
@@ -212,7 +212,7 @@ def _store_with_a_record(**overrides):
     from pipeline import state_db
 
     conn = state_db.get_connection(":memory:")
-    fields = dict(source_email_id="mail-1", po_number="208491", spec_code="STE-402-LT-B",
+    fields = dict(source_email_id="mail-1", po_number="908491", spec_code="STE-402-LT-B",
                   item_description="BASE, Floor Lamp 2", vendor_name=None,
                   quantity_received=11.0, unit_of_measure=None, pod_stated_date="2025-10-01",
                   received_by=None, po_line_number=300, origin="auto", created_by=None,
@@ -226,7 +226,7 @@ def _store_with_a_record(**overrides):
         """INSERT INTO spitfire_po_lines
            (line_key, po_number, line_number, spec_code, description, vendor_name,
             unit_of_measure, qty_ordered, qty_received, qty_in_transit, refreshed_at)
-           VALUES ('k1', '208491', 300, 'STE-402-LT-B', 'BASE, Floor Lamp 2', 'Light Annex',
+           VALUES ('k1', '908491', 300, 'STE-402-LT-B', 'BASE, Floor Lamp 2', 'Light Annex',
                    'EA', 12.0, 0.0, 0.0, 'now')""")
     conn.commit()
     return conn
@@ -300,15 +300,15 @@ def test_an_automated_record_reads_as_automation():
 
 def test_a_manual_record_names_the_person_who_entered_it():
     report = receipt_log.build(
-        _store_with_a_record(origin="manual", created_by="M Gutierrez"))
-    assert report.purchase_orders[0].lines[0].receipts[0].receiver == "M Gutierrez"
+        _store_with_a_record(origin="manual", created_by="M Rivera"))
+    assert report.purchase_orders[0].lines[0].receipts[0].receiver == "M Rivera"
 
 
 def test_whoever_signed_for_the_goods_outranks_both():
     """A named signature is the more specific truth about who took delivery, whichever way the
     record was made."""
     report = receipt_log.build(
-        _store_with_a_record(origin="manual", created_by="M Gutierrez", received_by="U ALI"))
+        _store_with_a_record(origin="manual", created_by="M Rivera", received_by="U ALI"))
     assert report.purchase_orders[0].lines[0].receipts[0].receiver == "U ALI"
 
 
@@ -335,7 +335,7 @@ def test_manual_and_automated_records_produce_the_same_report_shape():
         return book["Receipt Log"]
 
     automated = sheet()
-    manual = sheet(origin="manual", created_by="M Gutierrez")
+    manual = sheet(origin="manual", created_by="M Rivera")
 
     assert automated.max_row == manual.max_row
     assert automated.max_column == manual.max_column
@@ -345,4 +345,4 @@ def test_manual_and_automated_records_produce_the_same_report_shape():
     assert len(differing) == 1, differing
     row, column = differing[0]
     assert automated.cell(row, column).value == "Automation"
-    assert manual.cell(row, column).value == "M Gutierrez"
+    assert manual.cell(row, column).value == "M Rivera"

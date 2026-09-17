@@ -1,7 +1,7 @@
 """Spreadsheet trackers (corpus class C2) — `.xlsx` and legacy `.xls`.
 
 When a property or vendor stops replying, Premier switches to a spreadsheet: one row per item,
-with a confirmation column the recipient fills in. `Cameo Receivers.xlsx` (148 rows) and
+with a confirmation column the recipient fills in. `Property Receivers.xlsx` (148 rows) and
 `Public Space - Pending Receipt Confirmation Orders.xlsx` (92 rows) are the real ones, and
 between them they carry more receivable lines than the rest of the corpus combined.
 
@@ -52,12 +52,20 @@ class ExcelAdapter(ExtractionAdapter):
 
         workbook = openpyxl.load_workbook(io.BytesIO(source.content_bytes), data_only=True, read_only=True)
         records: List[ExtractedRecord] = []
+        tables: List[list] = []
         try:
             for sheet in workbook.worksheets:
                 rows = [grid_reader.as_strings(row) for row in sheet.iter_rows(values_only=True)]
+                tables.append(rows)
                 records.extend(grid_reader.records_from_rows(source, rows, f"excel:{sheet.title}"))
         finally:
             workbook.close()
+        # One table per sheet, kept whole. Every other document-shaped adapter has done this since
+        # `parsed_documents` existed; this one never did, so the store holds zero spreadsheet
+        # parses and `tools/replay_parse.py` says so in its own docstring ("spreadsheets store no
+        # parse"). Which meant the one format whose extraction rules changed most often was the one
+        # format that could not be replayed for free.
+        source.parsed_tables = tables
         return records
 
     # --- .xls ----------------------------------------------------------------
@@ -73,6 +81,7 @@ class ExcelAdapter(ExtractionAdapter):
 
         book = xlrd.open_workbook(file_contents=source.content_bytes)
         records: List[ExtractedRecord] = []
+        tables: List[list] = []
         try:
             for sheet in book.sheets():
                 rows = []
@@ -82,9 +91,11 @@ class ExcelAdapter(ExtractionAdapter):
                         cell = sheet.cell(row_index, column_index)
                         cells.append(_xls_cell_value(cell, book.datemode))
                     rows.append(cells)
+                tables.append(rows)
                 records.extend(grid_reader.records_from_rows(source, rows, f"xls:{sheet.name}"))
         finally:
             book.release_resources()
+        source.parsed_tables = tables
         return records
 
 

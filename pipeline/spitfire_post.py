@@ -7,13 +7,25 @@ invisible from Spitfire's side and the ledger is the only place it can be seen.
 
     1  create the receipt      the PO link, via forBatch -> SubContract
     2  title it                immediately, so it is never anonymous in Premier's UI
-    3  add the receipt line    quantity, UOM and cost code copied from the matched PO line
+    3  set the quantities      onto the rows Spitfire already built from the order, in one PATCH
     4  upload the POD          -> fileKey, hash-verified against our own MD5
     5  attach the POD
     6  build + upload + attach the receiver report
     7  link the purchase order
     8  link its pay requests
     9  read everything back    the only proof any of it landed
+
+Step 3 said "add the receipt line" until 2026-08-31, describing `spitfire_write.add_line` — which
+this module stopped calling on 2026-08-22 and must never call again. Creating a receipt with
+`forBatch` builds one row per purchase-order line already carrying its `SCDocItemKey`, spec, cost
+code and unit; appending a row beside those produces an orphan whose every linking field is
+discarded on insert, which is why nothing this system posted before that date was ever counted.
+
+**Two grains, and the second is the one the UI drives.** `post_pod` / `post_report` take one record
+and build one receipt for it — kept for records belonging to no delivery, and for the tests.
+`post_delivery_pod` / `post_delivery_report` take a delivery and build **one receipt carrying one
+row per item line**, which is what a delivery actually is and what Premier's own automation
+produces. See the section header above `post_delivery_pod` for where the two deliberately differ.
 
 **Nothing here routes.** Creating the receipt already stages six routees, three of them real
 Premier employees at sequence 10 — Spitfire applies the configured chain on creation, before
@@ -36,13 +48,13 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import settings
 from connectors import spitfire_write
 from connectors.spitfire_write import SpitfireSessionExpired, SpitfireWriteClient
-from pipeline import (attachment_bytes, dedupe, delivery_status, post_decision, post_ledger,
-                      receipt_log, report_pdf)
+from pipeline import (attachment_bytes, dedupe, deliveries_store, delivery_status, po_verify,
+                      post_decision, post_ledger, read_views, receipt_log, report_pdf)
 
 _logger = logging.getLogger(__name__)
 
@@ -269,6 +281,10 @@ def post_pod(conn: sqlite3.Connection, row: Any, *,
             why = _no_pod_because(decision)
             steps.append(f"no proof of delivery — {why}")
 
+        # Sign our own route steps now the proof is on the receipt, so it reaches whoever checks
+        # it rather than resting at our stop. Non-fatal — see `_sign_off_route`.
+        steps.extend(_sign_off_route(client, receipt_key))
+
         receipt_name = doc_no or receipt_key[:8]
         settled = (f"receipt {receipt_name} — report not posted" if pod else
                    f"receipt {receipt_name} — no POD, {_no_pod_because(decision)}; "
@@ -432,6 +448,734 @@ def verify_pod(conn: sqlite3.Connection, row: Any, *,
                           po_number=po_number, steps=steps)
 
 
+def evidenced_state(conn: sqlite3.Connection, attempt, row: Any, *,
+                    client: Optional[SpitfireWriteClient] = None) -> PostResult:
+    """What a stranded `CLAIMED` attempt actually achieved, read back from Spitfire. Reads only.
+
+    A claim is written *before* the first call, so that a receipt can never be created without a
+    row naming it. The cost is that a process killed mid-chain leaves the row at `CLAIMED` for
+    ever: it is in `BLOCKING`, so `claim`, `record_refusal`, `post_report`, `verify_pod` and the
+    Post button all refuse to touch it, and nothing else may move it. `post_ledger.stranded` lists
+    those rows; this is the half that says what to settle each one *as*.
+
+    Live example, record 234 on PO 912560: killed on 2026-08-26 after the receipt, the POD upload
+    and the attach had all succeeded, leaving `settled_at` NULL and `detail` empty — a shape no
+    exception path can produce, since both handlers in `post_pod` write a reason. Spitfire held
+    receipt 0001 with the POD on it and the right hash the whole time; the Records page said
+    "Posting…" and Verify POD said nothing had been posted at all.
+
+    **Every verdict is read from Spitfire, never inferred from the ledger.** The ledger is what is
+    in doubt — its columns say what we *tried*, and the receipt says what landed:
+
+    - no `receipt_key` on the claim -> `FAILED`. Nothing was created, so nothing is orphaned and
+      the record is free to post again: `FAILED` is deliberately not in `BLOCKING`.
+    - the report is on the receipt -> `POSTED`. The chain had in fact finished.
+    - the POD is on it and the catalog's hash matches our own bytes -> `POD_POSTED`, the resting
+      state the two-step split exists for. The report step is then offered normally.
+    - a receipt exists but the POD is missing or its hash differs -> `PARTIAL`. Something did not
+      land and a person has to work out what; retrying would build a second receipt beside it.
+
+    Raises nothing on a Spitfire failure — it returns `ok=False` with `state=CLAIMED`, meaning
+    *still unknown*. A claim that could not be checked must keep blocking: settling it to `FAILED`
+    on a guess would unblock a duplicate post against a receipt that already exists.
+    """
+    record_id = int(_get(row, "id") or 0)
+    po_number = str(_get(row, "po_number") or "").strip()
+    steps: List[str] = []
+
+    def result(state: str, message: str, **kw) -> PostResult:
+        return PostResult(ok=state in post_ledger.TERMINAL, state=state, message=message,
+                          record_id=record_id, po_number=po_number,
+                          receipt_key=attempt.receipt_key,
+                          receipt_doc_no=attempt.receipt_doc_no, steps=steps, **kw)
+
+    if not attempt.receipt_key:
+        return result(post_ledger.FAILED,
+                      "the claim was recorded but no receipt was ever created, so nothing is "
+                      "outstanding in Spitfire and the record can post again")
+
+    label = attempt.receipt_doc_no or attempt.receipt_key[:8]
+    client = client or SpitfireWriteClient()
+    try:
+        client.whoami()
+        on_receipt = _attachment_keys(client, attempt.receipt_key)
+        steps.append(f"receipt {label} carries {len(on_receipt)} attachment(s)")
+
+        if attempt.report_file_key and attempt.report_file_key.lower() in on_receipt:
+            return result(post_ledger.POSTED, f"receipt {label} already carries both the proof of "
+                                              f"delivery and the receiver report",
+                          pod_file_key=attempt.pod_file_key,
+                          report_file_key=attempt.report_file_key)
+
+        if not attempt.pod_file_key or attempt.pod_file_key.lower() not in on_receipt:
+            return result(post_ledger.PARTIAL,
+                          f"receipt {label} exists but the proof of delivery is not on it")
+        steps.append(f"POD found on receipt {label}")
+
+        # The same second question `verify_pod` asks, and for the same reason: being present is not
+        # being *ours*. Without it a file replaced after upload would settle as a clean POD_POSTED.
+        pod = _pod_for(conn, row)
+        if pod is None:
+            return result(post_ledger.PARTIAL,
+                          f"the proof of delivery for receipt {label} is no longer in our store, "
+                          f"so the bytes on the receipt cannot be checked against it")
+        pod_md5 = hashlib.md5(pod.content).hexdigest().upper()
+        if not client.verify_upload(attempt.pod_file_key, pod_md5):
+            return result(post_ledger.PARTIAL,
+                          f"the POD on receipt {label} is not the file we sent — its catalog hash "
+                          f"does not match ours ({pod_md5})")
+        steps.append(f"catalog hash matches ours ({pod_md5})")
+
+        return result(post_ledger.POD_POSTED,
+                      f"receipt {label} exists with the proof of delivery on it and hash-verified; "
+                      f"the receiver report was never posted",
+                      pod_file_key=attempt.pod_file_key)
+
+    except Exception as exc:                      # noqa: BLE001
+        # Deliberately not a verdict. Left CLAIMED, which keeps blocking — see the docstring.
+        return PostResult(ok=False, state=post_ledger.CLAIMED, message=str(exc),
+                          record_id=record_id, po_number=po_number,
+                          receipt_key=attempt.receipt_key,
+                          receipt_doc_no=attempt.receipt_doc_no, steps=steps)
+
+
+
+
+# --- posting a whole delivery -------------------------------------------------------------------
+# One receipt per (purchase order, delivery), carrying one row per item line.
+#
+# Everything below sits *beside* the per-record pair above rather than replacing it. `post_pod` is
+# still the path for a record belonging to no delivery, and the two differ on purpose in one place:
+# a purchase-order line with no row on the receipt aborts the single-record post, because that post
+# has nothing else to do, and is *dropped* by the grouped post, because nineteen good lines should
+# not be discarded to protect one that was already lost. Premier's own
+# `czx_TPICreate_ReceiptDoc.sql` does the same — it deletes unmatchable items before creating the
+# document, then records "Unable to find match" against them.
+
+
+@dataclass
+class LinePlan:
+    """One item line's place in a delivery post — on the receipt, or not, and why."""
+    record_id: int
+    ok: bool
+    reason: str = ""
+    """Empty when `ok`. Otherwise one sentence, written for the person reading the dialog."""
+
+    line_number: Optional[int] = None
+    quantity: Optional[float] = None
+    unit_of_measure: str = ""
+    spec_code: str = ""
+    description: str = ""
+
+    blocked_on_pod: bool = False
+    """Whether the thing stopping this line is gate 2, and so something a person can settle.
+
+    Set from the facts `plan_delivery` already holds, never by reading `reason`. That sentence is
+    written for a human and gets reworded; routing a control off it would mean the next rewording
+    silently removed the only way out of the dialog, which is the failure this whole change exists
+    to fix.
+    """
+
+
+@dataclass
+class _Context:
+    """What the post carries per line and the dialog never shows."""
+    row: Any
+    decision: Any = None
+    evidence_key: str = ""
+    pod: Optional[attachment_bytes.ResolvedAttachment] = None
+    pod_md5: str = ""
+    idempotency_key: str = ""
+    task_key: str = ""
+
+
+@dataclass
+class DeliveryPostResult:
+    """What one delivery post did, in the terms the dialog and the ledger both need."""
+    ok: bool
+    state: str
+    message: str
+    delivery_id: int = 0
+    po_number: str = ""
+    receipt_key: str = ""
+    receipt_doc_no: str = ""
+    group_key: str = ""
+    lines: List[LinePlan] = field(default_factory=list)
+    steps: List[str] = field(default_factory=list)
+
+    @property
+    def posted_lines(self) -> List[LinePlan]:
+        return [line for line in self.lines if line.ok]
+
+    @property
+    def skipped_lines(self) -> List[LinePlan]:
+        return [line for line in self.lines if not line.ok]
+
+
+def delivery_rows(conn: sqlite3.Connection, delivery_id: int) -> List[Any]:
+    """This delivery's item lines, narrowed to the ones the Records page is actually offering.
+
+    `deliveries_store.lines_for` returns every line that arrived, including those
+    `read_views._READY_CLAUSE` holds back — quantity conflicts, zero confidence, no purchase order.
+    Posting a row a person could not see is the one thing a grouped Post must never do: the button
+    reads "16 of 20 lines" because the block on screen shows 20, and both have to be counted from
+    the same list. PO 907249 is the case in point — 22 lines arrived, 2 are quantity conflicts, and
+    the page shows 20.
+    """
+    ready = {int(row["id"]) for row in read_views.records_ready(conn)}
+    return [row for row in deliveries_store.lines_for(conn, delivery_id)
+            if int(row["id"]) in ready]
+
+
+def plan_delivery(conn: sqlite3.Connection, rows: Sequence[Any], *,
+                  read_client_factory=None) -> Tuple[List[LinePlan], Dict[int, "_Context"]]:
+    """Rule on every line of a delivery, reading the purchase order **once**.
+
+    `post_decision.decide` reads the order live on every call, so calling it per record would read
+    one purchase order twenty times on a request somebody is watching. It is read here instead and
+    handed to each `decide` as `verification=`.
+
+    The rows cannot simply be handed to `verify_records` together and left at that: `chosen_line` is
+    honoured only for a single row, so a batch call would silently discard every line a reviewer
+    picked — the only recovery path there is for an ambiguous spec. `chosen_lines` carries them
+    positionally instead.
+
+    **No gate is reimplemented here.** Every refusal below is `decide`'s own sentence, so the grouped
+    path and the single-record path cannot drift apart in what they permit.
+    """
+    verifications = po_verify.verify_records(
+        conn, list(rows), client_factory=read_client_factory,
+        # `post_decision`'s own coercion, not a second one: the line a reviewer chose has to reach
+        # the verification in exactly the form gate 4 would have passed it.
+        chosen_lines=[post_decision._int_or_none(_get(row, "po_line_number")) for row in rows])
+
+    plans: List[LinePlan] = []
+    contexts: Dict[int, _Context] = {}
+    for row, verification in zip(rows, verifications):
+        record_id = int(_get(row, "id") or 0)
+        description = str(_get(row, "item_description") or "")
+        spec_code = str(_get(row, "spec_code") or "")
+
+        pod = _pod_for(conn, row)
+        pod_md5 = hashlib.md5(pod.content).hexdigest().upper() if pod else ""
+        # Per record, exactly as the single-record path computes it. One delivery-wide evidence key
+        # would change the idempotency key of every record whose proof differs from its neighbour's,
+        # orphaning rows already in Premier's live ledger.
+        evidence_key = pod_md5 or dedupe.evidence_key(
+            body_text=_body_text_of(conn, row), email_id=_get(row, "source_email_id"))
+
+        decision = post_decision.decide(
+            conn, row, verification=verification, pod_md5=pod_md5,
+            client_factory=read_client_factory, evidence_key=evidence_key,
+            pod_reason="" if pod else _pod_absence_reason(conn, row))
+
+        contexts[record_id] = _Context(row=row, decision=decision, evidence_key=evidence_key,
+                                       pod=pod, pod_md5=pod_md5)
+        plans.append(LinePlan(
+            record_id=record_id, ok=decision.may_post,
+            blocked_on_pod=(not decision.may_post and not pod_md5
+                            and not post_decision.can_post_offline(
+                                row, has_pod_bytes=False,
+                                origin_sender=post_decision._origin_sender(conn, row))),
+            reason="" if decision.may_post else decision.reason,
+            line_number=decision.line_number, quantity=decision.quantity,
+            unit_of_measure=decision.unit_of_measure,
+            spec_code=decision.spec_code or spec_code,
+            description=decision.description or description))
+    _refuse_line_collisions(plans)
+    return plans, contexts
+
+
+@dataclass
+class PodBlock:
+    """One line of a delivery that gate 2 refuses, and the sentence saying why."""
+    row: Any
+    record_id: int
+    reason: str
+    """`_pod_absence_reason`'s own words — the same sentence the confirm dialog shows, so the page
+    a person is sent to repeats what sent them there rather than paraphrasing it."""
+
+
+def pod_blocked(conn: sqlite3.Connection, rows: Sequence[Any]) -> List[PodBlock]:
+    """The lines of a delivery blocked on gate 2, resolved from real bytes and nothing else.
+
+    **Gate 2 only, and deliberately not `plan_delivery`.** That function answers every gate, and it
+    opens by reading the whole purchase order out of Spitfire — seconds per delivery, the cost the
+    confirm dialog exists to pay once. A page that only asks "is there a proof of delivery" must not
+    pay for a live purchase-order read, and a line held back for an over-receipt is not something a
+    waiver can free: listing it would ask somebody to sign for a refusal their signature cannot
+    lift.
+
+    **It also must not ask the optimistic question the page asks.** `emails_with_a_possible_pod` is
+    a superset — any non-inline PDF counts — and that guess is exactly what made this page necessary:
+    measured 2026-09-10, of 107 rows the Records page believed had a proof, only 16 resolved one,
+    and the other 91 offered a Post button that refused and no way forward. Here the bytes are
+    resolved for real.
+
+    Affordable because it is scoped to one delivery and memoised. `_pod_for` reads only the row's
+    email, purchase order and reviewer choice, so every line of a one-message delivery shares an
+    answer: one `attachment_ledger` query and at most one PDF text extraction for thirty-two lines
+    rather than thirty-two of each.
+    """
+    seen: Dict[tuple, bool] = {}
+    blocked: List[PodBlock] = []
+    for row in rows:
+        key = (str(_get(row, "source_email_id") or ""), str(_get(row, "po_number") or ""),
+               _get(row, "pod_ledger_id"))
+        if key not in seen:
+            seen[key] = bool(_pod_for(conn, row))
+        if post_decision.can_post_offline(
+                row, has_pod_bytes=seen[key],
+                origin_sender=post_decision._origin_sender(conn, row)):
+            continue
+        blocked.append(PodBlock(row=row, record_id=int(_get(row, "id") or 0),
+                                reason=_pod_absence_reason(conn, row)))
+    return blocked
+
+
+def _refuse_line_collisions(plans: List[LinePlan]) -> None:
+    """Refuse every line of a delivery that resolves to the same purchase-order line as another.
+
+    **Not summed, and the difference matters.** `set_line_quantity` is an assignment, so writing two
+    records into one row silently keeps whichever went last. Adding them instead would book a number
+    **no gate ever approved**: the gates ran per record, so 4 EA and 4 EA each pass against 4
+    outstanding while their sum over-receives — defeating the one gate whose whole purpose is to
+    stop that (`post_decision.OVER_RECEIPT_TOLERANCE` is 0.0).
+
+    Premier's own proc does not sum either: its `UPDATE … FROM … JOIN` applies one arbitrary row's
+    quantity when two source rows join one item, and reports nothing.
+
+    The three things a collision can mean are all badly served by addition — the same goods
+    extracted twice (double-booked), two different items matched onto one line (both booked to the
+    wrong cost code), or a component split, where Authority ships `-B` and `-SH` separately while
+    the order counts assembled units. A person settles it.
+    """
+    seen: Dict[int, List[LinePlan]] = {}
+    for plan in plans:
+        if plan.ok and plan.line_number is not None:
+            seen.setdefault(plan.line_number, []).append(plan)
+    for line_number, group in seen.items():
+        if len(group) < 2:
+            continue
+        described = " and ".join(
+            (f"{post_decision.po_verify.fmt_qty(p.quantity)} {p.unit_of_measure}".strip()
+             + f" (record {p.record_id})") for p in group)
+        for plan in group:
+            plan.ok = False
+            plan.reason = (
+                f"{len(group)} lines of this delivery all resolve to purchase order line "
+                f"{line_number:04d} — {described}. A receipt line holds one quantity, so this "
+                f"needs a person to say which line each item belongs to.")
+
+
+def _refuse(conn: sqlite3.Connection, plans: Sequence[LinePlan], contexts: Dict[int, "_Context"],
+            po_number: str, actor: str) -> None:
+    """Write the gate's refusal to the ledger for every line that is not going on the receipt.
+
+    Recorded rather than only returned, for the reason `record_refusal` already gives: without a row
+    the reason lives only in the dialog somebody closed, and the next person clicks Post to
+    rediscover it at the cost of a live purchase-order read.
+    """
+    for plan in plans:
+        if plan.ok:
+            continue
+        context = contexts.get(plan.record_id)
+        if context is None:
+            continue
+        post_ledger.record_refusal(
+            conn, record_id=plan.record_id, po_number=po_number, line_number=plan.line_number,
+            pod_md5=context.evidence_key, reason=plan.reason, actor=actor)
+
+
+def post_delivery_pod(conn: sqlite3.Connection, delivery_id: int, *,
+                      client: Optional[SpitfireWriteClient] = None,
+                      read_client_factory=None, actor: str = "") -> DeliveryPostResult:
+    """Create **one** receipt for one delivery and put every ready item line on it. Steps 1-5.
+
+    This is what `post_pod` should always have been. A purchase order does not arrive; a delivery
+    against it arrives, carrying some of its lines — so the receipt is per `(PO, delivery)`, which is
+    exactly what `extracted_records.delivery_id` identifies, and one row goes on it per item line.
+    Premier's own automation groups the same way, one header per `(PurchaseOrder, ShipmentNumber)`.
+
+    **Grouping is a receipt-level change only.** Every item line is still matched to its own
+    purchase-order line, by spec, through `post_decision`; nothing is merged and nothing is summed.
+    Twenty lines become twenty rows on one document, not one row of twenty.
+
+    The order of what follows is forced by two facts about this API: nothing in it is idempotent,
+    and a created document cannot be deleted. So every question that could refuse the post is asked
+    **before** the receipt exists, and once it exists the only remaining question is what the ledger
+    should say about a document that will be there for ever.
+    """
+    delivery = deliveries_store.get(conn, delivery_id)
+    if delivery is None:
+        return DeliveryPostResult(
+            ok=False, state="flagged", delivery_id=delivery_id,
+            message="there is no such delivery")
+
+    po_number = str(delivery["po_number"] or "").strip()
+    rows = delivery_rows(conn, delivery_id)
+    if not rows:
+        return DeliveryPostResult(
+            ok=False, state="flagged", delivery_id=delivery_id, po_number=po_number,
+            message=("nothing on this delivery is ready to post — every line is held back as a "
+                     "quantity conflict, incomplete, or already posted"))
+
+    plans, contexts = plan_delivery(conn, rows, read_client_factory=read_client_factory)
+
+    # The duplicate guard, re-asked with the line the verification just *resolved*. Gate 3 inside
+    # `decide` runs before the line is known, so a record whose `po_line_number` is null asks about
+    # `line IS NULL` and cannot see that this very line was posted last week from a record that has
+    # since been re-extracted under a new id. That is the gap PO 912559 fell through eight times.
+    for plan in plans:
+        if not plan.ok:
+            continue
+        existing = post_ledger.find_delivery(
+            conn, po_number, plan.line_number, contexts[plan.record_id].evidence_key)
+        if existing:
+            plan.ok = False
+            plan.reason = post_decision._describe_existing(existing)
+
+    _refuse(conn, plans, contexts, po_number, actor)
+    postable = [plan for plan in plans if plan.ok]
+    if not postable:
+        # **Before Spitfire is touched.** Falling through to `create_receipt` here would leave an
+        # empty document on Premier's instance that nothing can delete — the likeliest way to make
+        # this feature worse than what it replaces, and it needs only a second click.
+        return DeliveryPostResult(
+            ok=False, state="flagged", delivery_id=delivery_id, po_number=po_number, lines=plans,
+            message=(f"none of the {len(plans)} lines on this delivery can be posted — "
+                     f"{plans[0].reason}" if len(plans) == 1 else
+                     f"none of the {len(plans)} lines on this delivery can be posted; "
+                     f"open each for its reason"))
+
+    project_code = contexts[postable[0].record_id].decision.project_code
+    group_key = post_ledger.new_group_key()
+
+    claimed: List[LinePlan] = []
+    for plan in postable:
+        context = contexts[plan.record_id]
+        claim = post_ledger.claim(
+            conn, record_id=plan.record_id, po_number=po_number, line_number=plan.line_number,
+            pod_md5=context.evidence_key, project_code=context.decision.project_code,
+            quantity=plan.quantity, actor=actor, group_key=group_key)
+        if claim is None:
+            # Lost the race between deciding and claiming — two operators on one delivery, or a
+            # double submit that outran the disabled button. The UNIQUE index settles it.
+            plan.ok = False
+            existing = post_ledger.find(conn, post_ledger.idempotency_key(
+                plan.record_id, po_number, plan.line_number, context.evidence_key))
+            plan.reason = (post_decision._describe_existing(existing) if existing
+                           else "this line is already being posted")
+            continue
+        context.idempotency_key = claim.idempotency_key
+        claimed.append(plan)
+
+    if not claimed:
+        return DeliveryPostResult(
+            ok=False, state="flagged", delivery_id=delivery_id, po_number=po_number, lines=plans,
+            group_key=group_key,
+            message="every line on this delivery is already being posted by someone else")
+
+    keys = [contexts[plan.record_id].idempotency_key for plan in claimed]
+    steps: List[str] = []
+    receipt_key = ""
+    doc_no = ""
+    client = client or SpitfireWriteClient()
+
+    def settle_all(state: str, detail: str) -> None:
+        """Close every claimed row at once. A row that will not settle is left `CLAIMED`, which
+        still blocks and is recoverable by reading the receipt back — the safe way to fail."""
+        post_ledger.settle_group(conn, keys, state, detail, client.audit_rows())
+
+    try:
+        client.whoami()   # fails loudly on a lapsed ticket, before a document exists
+
+        # --- 1-2. the receipt, once ----------------------------------------------------------
+        receipt_key = client.create_receipt(project_code, po_number)
+        for key in keys:
+            post_ledger.record_receipt(conn, key, receipt_key=receipt_key)
+        steps.append(f"receipt created ({receipt_key[:8]}…)")
+
+        title = (f"{TEST_MARKER} - receiver automation - PO {po_number}"
+                 f" - {len(claimed)} lines - {date.today().isoformat()} - DO NOT PROCESS")
+        client.set_title(receipt_key, title)
+        steps.append("titled")
+
+        header = client.read_header(receipt_key)
+        doc_no = str(header.get("DocNo") or "")
+        for key in keys:
+            post_ledger.record_receipt(conn, key, receipt_key=receipt_key, receipt_doc_no=doc_no)
+        if str(header.get("SubContract") or "").strip() != po_number:
+            raise RuntimeError(
+                f"the receipt was created but its SubContract reads "
+                f"{header.get('SubContract')!r} instead of {po_number} — it is not linked to the "
+                f"purchase order, so nothing further was attached")
+        steps.append(f"linked to PO via SubContract (DocNo {doc_no or '?'})")
+
+        # --- 3. the quantities, one PATCH ------------------------------------------------------
+        # `read_items` once. `find_prepopulated_line` re-reads the whole document on every call, so
+        # asking it twenty questions about one payload would be twenty document reads.
+        items = client.read_items(receipt_key)
+        quantities: Dict[str, float] = {}
+        going: List[LinePlan] = []
+        for plan in claimed:
+            context = contexts[plan.record_id]
+            item = spitfire_write.line_in(items, context.decision.line_key)
+            task_key = spitfire_write.task_key_of(item)
+            if item is None or not task_key:
+                # Dropped, not fatal — see this section's header comment. The row is already
+                # CLAIMED, and `record_refusal` refuses to touch a blocking row, so it is settled
+                # directly. FLAGGED does not block, so the line posts on a later receipt once the
+                # order is re-read.
+                plan.ok = False
+                plan.reason = (
+                    f"purchase order {po_number} carries no receipt line against line "
+                    f"{plan.line_number} ({context.decision.line_key or 'no key'}) — Spitfire "
+                    f"builds a receipt from the order, so the order moved underneath us. The rest "
+                    f"of the delivery was posted; this line was not.")
+                post_ledger.settle(conn, context.idempotency_key, post_ledger.FLAGGED, plan.reason,
+                                   client.audit_rows())
+                continue
+            context.task_key = task_key
+            quantities[task_key] = float(plan.quantity or 0)
+            going.append(plan)
+
+        if not going:
+            # Every line missed. The document exists and is empty, which no one can delete — so it
+            # is named here rather than quietly abandoned.
+            raise RuntimeError(
+                f"receipt {doc_no or receipt_key[:8]} was created but not one of the "
+                f"{len(claimed)} lines has a row on it — the purchase order moved underneath us")
+
+        # **`settle_all` closes over this name, so narrowing it here narrows what a later failure
+        # settles.** That is deliberate: the dropped lines were settled FLAGGED individually just
+        # above, and FLAGGED does not block, so a failure from here on must leave them alone rather
+        # than sweep them into PARTIAL and wedge lines that are free to post on the next receipt.
+        keys = [contexts[plan.record_id].idempotency_key for plan in going]
+        client.set_line_quantity(receipt_key, quantities)
+        steps.append(f"quantities set on {len(quantities)} lines in one patch")
+
+        # Read back only now, after the session has been released — a read taken any earlier
+        # returns the pre-change value. Every key is compared, not the first: this endpoint's known
+        # failure is silent and 200-shaped, and "one line disagrees" sends people to the wrong line.
+        written = client.verify_quantities(receipt_key, quantities)
+        wrong = sorted(task for task, wanted in quantities.items()
+                       if abs(written.get(task, 0.0) - wanted) >= 0.001)
+        if wrong:
+            missed = [p for p in going if contexts[p.record_id].task_key in wrong]
+            raise RuntimeError(
+                f"{len(quantities) - len(wrong)} of {len(quantities)} quantities landed on receipt "
+                f"{doc_no or receipt_key[:8]}, but "
+                + "; ".join(
+                    f"line {p.line_number} reads "
+                    f"{written.get(contexts[p.record_id].task_key, 0.0):g} rather than "
+                    f"{float(p.quantity or 0):g}" for p in missed)
+                + " — the receipt does not say what we asked it to say")
+        steps.append("quantities read back and confirmed")
+
+        # --- 4-5. the proofs of delivery -------------------------------------------------------
+        # Grouped by content hash, not assumed to be one. A delivery can be described by two
+        # messages — the Inbound notice and the Delivered notice are the designed pair — and a
+        # reviewer can point two records at different attachments through `pod_ledger_id`. The
+        # catalog does not deduplicate, so uploading the same bytes twice makes two entries.
+        uploaded: Dict[str, str] = {}
+        for plan in going:
+            context = contexts[plan.record_id]
+            if not context.pod or context.pod_md5 in uploaded:
+                continue
+            name = _safe_name(context.pod.filename, f"POD_{po_number}")
+            file_key = client.upload_file(context.pod.content, name,
+                                          keywords=f"{TEST_MARKER} POD {po_number}")
+            if not client.verify_upload(file_key, context.pod_md5):
+                raise RuntimeError(
+                    f"the POD uploaded but the server's hash does not match ours — the file in the "
+                    f"catalog ({file_key}) is not the file we sent")
+            client.attach_file(receipt_key, file_key, note=f"{TEST_MARKER} proof of delivery")
+            uploaded[context.pod_md5] = file_key
+            steps.append(f"POD uploaded, hash-verified and attached ({name})")
+
+        if uploaded:
+            on_receipt = _attachment_keys(client, receipt_key)
+            absent = [key for key in uploaded.values() if key.lower() not in on_receipt]
+            if absent:
+                raise RuntimeError(
+                    "the proof of delivery was attached but reading the receipt back did not "
+                    "show it")
+            steps.append("read back and confirmed")
+            for plan in going:
+                file_key = uploaded.get(contexts[plan.record_id].pod_md5, "")
+                if file_key:
+                    post_ledger.record_file(conn, contexts[plan.record_id].idempotency_key,
+                                            pod_file_key=file_key)
+        else:
+            steps.append(f"no proof of delivery — {_no_pod_because(contexts[going[0].record_id].decision)}")
+
+        # The same signature the single-record path makes, once for the whole receipt.
+        steps.extend(_sign_off_route(client, receipt_key))
+
+        receipt_name = doc_no or receipt_key[:8]
+        settle_all(post_ledger.POD_POSTED, f"receipt {receipt_name} — report not posted")
+        dropped = len(plans) - len(going)
+        return DeliveryPostResult(
+            ok=True, state=post_ledger.POD_POSTED, delivery_id=delivery_id, po_number=po_number,
+            receipt_key=receipt_key, receipt_doc_no=doc_no, group_key=group_key, lines=plans,
+            steps=steps,
+            message=(f"{len(going)} item line{'s' if len(going) != 1 else ''} posted to receipt "
+                     f"{receipt_name} on PO {po_number}"
+                     + (f", {dropped} not posted" if dropped else "")
+                     + ". The receiver report has not been posted yet."))
+
+    except SpitfireSessionExpired as exc:
+        state = post_ledger.PARTIAL if receipt_key else post_ledger.FAILED
+        settle_all(state, str(exc))
+        return DeliveryPostResult(ok=False, state="session_expired", delivery_id=delivery_id,
+                                  po_number=po_number, receipt_key=receipt_key,
+                                  receipt_doc_no=doc_no, group_key=group_key, lines=plans,
+                                  steps=steps, message=str(exc))
+    except Exception as exc:                      # noqa: BLE001 — every failure must be recorded
+        # **Every claimed row takes the same state.** FAILED is deliberately not blocking, so one
+        # row settling FAILED while the receipt exists would let the next Post sail past the guard
+        # and build a second receipt beside the half-built one.
+        state = post_ledger.PARTIAL if receipt_key else post_ledger.FAILED
+        settle_all(state, str(exc))
+        _logger.exception("posting delivery %s to Spitfire failed", delivery_id)
+        return DeliveryPostResult(ok=False, state=state, delivery_id=delivery_id,
+                                  po_number=po_number, receipt_key=receipt_key,
+                                  receipt_doc_no=doc_no, group_key=group_key, lines=plans,
+                                  steps=steps, message=str(exc))
+
+
+
+
+def awaiting_report_group(conn: sqlite3.Connection, delivery_id: int) -> List[Any]:
+    """The rows of this delivery's receipt that are waiting for their receiver report.
+
+    Found through the ledger rather than by re-planning the delivery: what the report goes onto is
+    the receipt that exists, and the only record of which rows are on it is the group written when
+    it was created. Re-deriving the set would re-run gates that could now refuse — stranding a
+    receipt carrying a POD and no report over a quantity that moved after the POD went up.
+    """
+    receipts: Dict[str, List[Any]] = {}
+    for row in deliveries_store.lines_for(conn, delivery_id):
+        for attempt in post_ledger.existing_for_record(conn, int(row["id"])):
+            if attempt.state == post_ledger.POD_POSTED and attempt.receipt_key:
+                receipts.setdefault(attempt.receipt_key, []).append(attempt)
+    if not receipts:
+        return []
+    # Newest receipt first when a delivery has more than one — a line fixed after the first receipt
+    # posted becomes a second receipt, and it is that one whose report is outstanding.
+    newest = max(receipts.values(), key=lambda group: max(a.id for a in group))
+    return sorted(newest, key=lambda a: a.id)
+
+
+def post_delivery_report(conn: sqlite3.Connection, delivery_id: int, *,
+                         client: Optional[SpitfireWriteClient] = None,
+                         actor: str = "") -> DeliveryPostResult:
+    """Build **one** receiver report for the delivery and hang it on the receipt. Steps 6-9.
+
+    One report describing every line on the receipt, not one per line: `receipt_log.build` already
+    groups PO → line → receipts and already takes a list of record ids, so the document Premier
+    opens says what the receipt says.
+
+    Refuses unless the group is resting at `POD_POSTED`. That is the guarantee which survives
+    splitting the post in two — the report describes a delivery whose proof is already filed, and it
+    can neither precede that proof nor stand in for it.
+    """
+    delivery = deliveries_store.get(conn, delivery_id)
+    if delivery is None:
+        return DeliveryPostResult(ok=False, state="flagged", delivery_id=delivery_id,
+                                  message="there is no such delivery")
+    po_number = str(delivery["po_number"] or "").strip()
+
+    attempts = awaiting_report_group(conn, delivery_id)
+    if not attempts:
+        return DeliveryPostResult(
+            ok=False, state="flagged", delivery_id=delivery_id, po_number=po_number,
+            message=("the proof of delivery has not been posted for this delivery, so there is no "
+                     "receipt to put a report on — post the POD first"))
+
+    receipt_key = attempts[0].receipt_key
+    doc_no = attempts[0].receipt_doc_no
+    keys = [attempt.idempotency_key for attempt in attempts]
+    record_ids = [attempt.record_id for attempt in attempts]
+    client = client or SpitfireWriteClient()
+    steps: List[str] = []
+
+    try:
+        client.whoami()
+
+        # --- 6. the report, once for the whole receipt -----------------------------------------
+        report_bytes = _build_delivery_report(conn, record_ids, po_number=po_number)
+        report_name = _safe_name(f"Receiver_Report_PO{po_number}.pdf", "Receiver_Report.pdf")
+        report_key = client.upload_file(
+            report_bytes, report_name, keywords=f"{TEST_MARKER} receiver report {po_number}")
+        for key in keys:
+            post_ledger.record_file(conn, key, report_file_key=report_key)
+        client.attach_file(receipt_key, report_key, note=f"{TEST_MARKER} receiver report")
+        steps.append(f"report built for {len(record_ids)} lines, uploaded and attached")
+
+        # --- 7-8. the document links, once per receipt -----------------------------------------
+        # Attaching twice creates two rows: this API has no idempotency anywhere.
+        steps.extend(_link_related(conn, client, receipt_key, po_number,
+                                   post_decision._project_of(conn, po_number)))
+
+        # --- 9. read back -----------------------------------------------------------------------
+        on_receipt = _attachment_keys(client, receipt_key)
+        pod_keys = {a.pod_file_key.lower() for a in attempts if a.pod_file_key}
+        if report_key.lower() not in on_receipt or not pod_keys.issubset(on_receipt):
+            raise RuntimeError("the receipt was built but reading it back did not show the proof "
+                               "of delivery and the report on it")
+        steps.append("read back and confirmed")
+
+        for record_id in record_ids:
+            _mark_pushed(conn, record_id)
+        post_ledger.settle_group(conn, keys, post_ledger.POSTED,
+                                 f"receipt {doc_no or receipt_key[:8]}", client.audit_rows())
+        return DeliveryPostResult(
+            ok=True, state=post_ledger.POSTED, delivery_id=delivery_id, po_number=po_number,
+            receipt_key=receipt_key, receipt_doc_no=doc_no, group_key=attempts[0].group_key,
+            steps=steps,
+            message=(f"posted to Spitfire as receipt {doc_no or receipt_key[:8]} — "
+                     f"{len(record_ids)} item lines on one receipt"))
+
+    except SpitfireSessionExpired as exc:
+        # The receipt and its POD are real and stay that way; only the report is outstanding, so the
+        # group rests where it was rather than becoming PARTIAL. Re-posting is safe.
+        post_ledger.settle_group(conn, keys, post_ledger.POD_POSTED, str(exc), client.audit_rows())
+        return DeliveryPostResult(ok=False, state="session_expired", delivery_id=delivery_id,
+                                  po_number=po_number, receipt_key=receipt_key,
+                                  receipt_doc_no=doc_no, steps=steps, message=str(exc))
+    except Exception as exc:                      # noqa: BLE001 — every failure must be recorded
+        post_ledger.settle_group(conn, keys, post_ledger.PARTIAL, str(exc), client.audit_rows())
+        _logger.exception("posting the report for delivery %s to Spitfire failed", delivery_id)
+        return DeliveryPostResult(ok=False, state=post_ledger.PARTIAL, delivery_id=delivery_id,
+                                  po_number=po_number, receipt_key=receipt_key,
+                                  receipt_doc_no=doc_no, steps=steps, message=str(exc))
+
+
+def _build_delivery_report(conn: sqlite3.Connection, record_ids: Sequence[int], *,
+                           po_number: str) -> bytes:
+    """The receiver report for a whole delivery, as PDF bytes.
+
+    Scoped to this receipt's own records. The whole-store report would put every other purchase
+    order's quantities on a document attached to one receipt, which Premier reads as evidence for
+    that delivery.
+
+    The subtitle names the delivery rather than one item, because there is no longer one item to
+    name — the single-record version put one description and one quantity at the top of a document
+    that now describes twenty.
+    """
+    report = receipt_log.build(conn, record_ids=list(record_ids))
+    html = report_pdf.document(
+        receipt_log.to_html(report),
+        title=f"Receiver Report — PO {po_number}",
+        subtitle=(f"{len(record_ids)} item line{'s' if len(record_ids) != 1 else ''} "
+                  f"received on one delivery"),
+        note=(f"{TEST_MARKER} — generated by the Premier receiver automation from the delivery "
+              f"email. Attached to the receipt alongside the proof of delivery."))
+    return report_pdf.render(html)
+
+
 def _awaiting_report_attempt(conn: sqlite3.Connection, record_id: int):
     """This record's receipt that is still waiting for its report, or None."""
     for attempt in post_ledger.existing_for_record(conn, record_id):
@@ -449,6 +1193,35 @@ def _posted_attempt(conn: sqlite3.Connection, record_id: int):
     return None
 
 
+def _sign_off_route(client: SpitfireWriteClient, receipt_key: str) -> List[str]:
+    """Respond to our own route stops on a receipt, reporting rather than raising.
+
+    **Called from the POD stage**, as soon as the proof is on the receipt and read back. Premier's
+    decision, 2026-09-17: a receipt whose route rests at our own stop is one nobody is asked to
+    look at, and that is worse than one reviewed before its receiver report lands. The trade is
+    real — three receipts sat at `POD_POSTED` for up to three weeks, and with this they would have
+    been visible to reviewers throughout — and it was made knowingly.
+
+    Every receipt this system creates is staged with an approval route whose first stops are ours.
+    Until they are responded to the route never advances and Premier's reviewers at sequence 10
+    never see the receipt — so before this, every POD this system posted sat unread behind our own
+    unsigned step. On a fresh receipt those stops are sequences 1 and 5; they are chosen by
+    `UserKey` and `Reached` rather than by number, because our account also sits at 15 and which
+    stop is live moves over time.
+
+    This signs; it does not dispatch. `route/apply` and `route/perform` email three real Premier
+    employees and are refused by name in `connectors/spitfire_write._DENIED_SUBSTRINGS`.
+
+    Never raises: the caller is past the point where the receipt exists, and `post_delivery_pod`
+    turns any exception from here on into PARTIAL, which would mean a person investigating a
+    receipt whose only fault is an unsigned route step they can click themselves.
+    """
+    try:
+        return client.sign_off_route_steps(receipt_key)
+    except Exception as exc:                                       # noqa: BLE001
+        return [f"could not sign off the route: {exc}"]
+
+
 def _attachment_keys(client: SpitfireWriteClient, receipt_key: str) -> set:
     """The catalog keys actually on a receipt, lowercased for comparison."""
     return {str(a.get("DocKey") or "").lower() for a in client.read_attachments(receipt_key)}
@@ -464,11 +1237,12 @@ def _pod_for(conn: sqlite3.Connection, row: Any) -> Optional[attachment_bytes.Re
 
         1. a PDF that parses as a proof of delivery **and names this record's purchase order**
         2. a PDF that parses as a proof of delivery naming no purchase order at all
-        3. nothing
+        3. the attachment this record was read from (`source_ledger_id`), whatever its kind
+        4. nothing
 
     It used to be "the first non-inline attachment of an acceptable kind, in ledger order", with
     `xlsx`, `msg`, `html` and `text` among the acceptable kinds. On an email carrying a tracker
-    spreadsheet at ordinal 0 and the POD at ordinal 6 — the shape of the 210634 thread, which
+    spreadsheet at ordinal 0 and the POD at ordinal 6 — the shape of the 910634 thread, which
     carries eight attachments — that uploaded **the spreadsheet to Premier's ERP as the proof of
     delivery**, and hashed it into the idempotency key so the duplicate guard keyed on the wrong
     document too. Position in a mail is not evidence of anything.
@@ -478,8 +1252,8 @@ def _pod_for(conn: sqlite3.Connection, row: Any) -> Optional[attachment_bytes.Re
     numbers, so the filename cannot be trusted and neither can proximity.
 
     Returning None is a real outcome, not an error. `post_decision` refuses a record with no POD
-    unless a named person has waived it — a receipt asserting delivery with a spreadsheet attached
-    as proof is worse than no receipt.
+    unless a named person has waived it. Rule 3 is not a return of that bug: it attaches the one
+    file the record's own numbers were read from, by id, never a neighbour chosen by position.
 
     **A reviewer's explicit choice outranks all of it.** `pod_ledger_id` names one attachment and
     that is the one used, whatever the file says about itself. Three cases need it and none can be
@@ -491,7 +1265,7 @@ def _pod_for(conn: sqlite3.Connection, row: Any) -> Optional[attachment_bytes.Re
       the case a person is there to overrule
     * a proof that is not a carrier POD at all — a signed packing slip, a photo of the pallet
 
-    With `pod_ledger_id` null the order below is unchanged, so the 210634 tracker-spreadsheet bug
+    With `pod_ledger_id` null the order below is unchanged, so the 910634 tracker-spreadsheet bug
     cannot return through this door.
     """
     email_id = str(_get(row, "source_email_id") or "")
@@ -549,7 +1323,17 @@ def _pod_for(conn: sqlite3.Connection, row: Any) -> Optional[attachment_bytes.Re
             # arrived on is the only thing tying it to this record. Held back so an explicit
             # match on a later attachment always wins.
             unattributed = resolved
-    return unattributed
+    if unattributed is not None:
+        return unattributed
+
+    # 3. The document this record was read from. Premier's rule (2026-09-15): a line whose numbers
+    #    came off a document goes to Spitfire with that document attached, carrier POD or not. Only
+    #    after rules 1-2, so a real POD on the same email always wins, and only the record's own
+    #    source file — never "the first attachment", which is the 910634 bug.
+    source = _get(row, "source_ledger_id")
+    if source not in (None, ""):
+        return _chosen_pod(conn, email_id, int(source))
+    return None
 
 
 def _body_text_of(conn: sqlite3.Connection, row: Any) -> str:

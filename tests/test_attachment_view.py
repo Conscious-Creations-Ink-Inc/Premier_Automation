@@ -132,13 +132,13 @@ def test_a_spreadsheet_shows_every_sheet_not_the_first_three():
     for name in ("Second", "Third", "Deliveries"):
         sheet = workbook.create_sheet(name)
         sheet.append(["PO", "Qty"])
-        sheet.append(["208491", 11])
+        sheet.append(["908491", 11])
     buffer = io.BytesIO()
     workbook.save(buffer)
 
     panel = attachment_view.render(buffer.getvalue(), "tracker.xlsx", "")
     assert "Deliveries" in panel.html, "the fourth sheet was dropped"
-    assert "208491" in panel.html
+    assert "908491" in panel.html
 
 
 def test_a_document_shows_its_tables_not_only_its_paragraphs():
@@ -152,14 +152,14 @@ def test_a_document_shows_its_tables_not_only_its_paragraphs():
     table = document.add_table(rows=2, cols=2)
     table.cell(0, 0).text = "PO"
     table.cell(0, 1).text = "Qty"
-    table.cell(1, 0).text = "208491"
+    table.cell(1, 0).text = "908491"
     table.cell(1, 1).text = "202"
     buffer = io.BytesIO()
     document.save(buffer)
 
     panel = attachment_view.render(buffer.getvalue(), "notice.docx", "")
     assert "Delivery confirmation" in panel.html
-    assert "208491" in panel.html and "202" in panel.html
+    assert "908491" in panel.html and "202" in panel.html
 
 
 def test_delimited_text_becomes_a_table():
@@ -181,9 +181,9 @@ def test_long_text_is_clipped_and_says_so():
 
 
 def test_an_rtf_attachment_is_readable():
-    rtf = br"{\rtf1\ansi Received 11 EA against PO 208491.}"
+    rtf = br"{\rtf1\ansi Received 11 EA against PO 908491.}"
     panel = attachment_view.render(rtf, "notice.rtf", "")
-    assert "208491" in panel.html
+    assert "908491" in panel.html
 
 
 def test_an_image_streams_rather_than_embedding():
@@ -199,7 +199,7 @@ def test_an_image_streams_rather_than_embedding():
 def test_a_zip_lists_what_is_inside_and_makes_each_openable():
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("notes.txt", "PO 208491")
+        archive.writestr("notes.txt", "PO 908491")
         archive.writestr("pod.txt", "signed")
     panel = attachment_view.render(buffer.getvalue(), "bundle.zip", "",
                                    child_url="/ui/mail/attachment/view?id=x&n=0&child=")
@@ -213,7 +213,7 @@ def test_a_tar_is_listed_even_though_the_pipeline_does_not_expand_one():
 
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        data = b"PO 208491 received"
+        data = b"PO 908491 received"
         info = tarfile.TarInfo("pod.txt")
         info.size = len(data)
         archive.addfile(info, io.BytesIO(data))
@@ -224,11 +224,11 @@ def test_a_tar_is_listed_even_though_the_pipeline_does_not_expand_one():
 def test_walking_into_a_container_returns_the_member():
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("notes.txt", "PO 208491 received")
+        archive.writestr("notes.txt", "PO 908491 received")
     found = attachment_view.child_at(buffer.getvalue(), "bundle.zip", "", [0])
     assert found is not None
     content, name, _mime = found
-    assert b"208491" in content and name == "notes.txt"
+    assert b"908491" in content and name == "notes.txt"
 
 
 def test_walking_past_the_end_is_not_an_error():
@@ -274,13 +274,13 @@ def test_an_unreadable_member_is_listed_with_its_reason_not_hidden():
 
 # --- Nested mail --------------------------------------------------------------
 
-def eml_bytes(subject="Delivered Notification", body="Received 202 YD against PO 210634",
+def eml_bytes(subject="Delivered Notification", body="Received 202 YD against PO 910634",
               attachment=None) -> bytes:
     from email.message import EmailMessage
 
     message = EmailMessage()
     message["From"] = "warehouse@vendor.example"
-    message["To"] = "receiver@premierpm.com"
+    message["To"] = "receiver@example-pm.test"
     message["Subject"] = subject
     message["Date"] = "Tue, 12 Aug 2026 09:00:00 +0000"
     message.set_content(body)
@@ -299,11 +299,11 @@ def test_an_attached_email_renders_as_a_message():
     assert panel.label == "Email message"
     assert "Delivered Notification" in panel.html
     assert "warehouse@vendor.example" in panel.html
-    assert "210634" in panel.html
+    assert "910634" in panel.html
 
 
 def test_an_attached_email_lists_its_own_attachments():
-    panel = attachment_view.render(eml_bytes(attachment="signed by Miguel C."), "f.eml",
+    panel = attachment_view.render(eml_bytes(attachment="signed by Jordan T."), "f.eml",
                                    "message/rfc822",
                                    child_url="/ui/mail/attachment/view?id=x&n=0&child=")
     assert "pod.txt" in panel.html

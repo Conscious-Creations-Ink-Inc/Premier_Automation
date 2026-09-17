@@ -6,7 +6,7 @@ Stage 4 then matches against the mirror instead of against the twelve hand-writt
 `api/demo/catalog.py`.
 
     python -m tools.pull_spitfire_po --preflight            # reachability + login, reads no PO
-    python -m tools.pull_spitfire_po --po 212456            # one PO
+    python -m tools.pull_spitfire_po --po 912456            # one PO
     python -m tools.pull_spitfire_po --from-state           # every PO the pipeline has seen
     python -m tools.pull_spitfire_po --from-state --source sample --limit 20
 

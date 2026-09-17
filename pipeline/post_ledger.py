@@ -9,7 +9,7 @@ thing that can.** Three measurements, all from the training instance:
   gives two rows, 200 both times.
 * `RelatedLineDetails.ReceiptInProgressUnits` — the field whose own schema calls it *"units
   tentatively received not yet approved"*, and the obvious thing to build a guard on — reads
-  **0.0** on a PO carrying an unapproved receipt. Measured on PO 207030, which has a receipt with
+  **0.0** on a PO carrying an unapproved receipt. Measured on PO 907030, which has a receipt with
   a line of qty 1.0 against it and still reports `received 0.0 / inProgress 0.0`.
 
 That last one is the trap: quantities appear to roll up only on approval, and receipts we create
@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -120,6 +121,9 @@ class PostAttempt:
     settled_at: Optional[str]
     attempts: int = 1
     last_attempt_at: Optional[str] = None
+    group_key: str = ""
+    """Which one attempt to build a receipt this row was part of. Empty on every row written before
+    grouping existed, and on every single-record post — both are one row that is its own group."""
 
     @property
     def is_blocking(self) -> bool:
@@ -135,7 +139,10 @@ def _row_to_attempt(row: sqlite3.Row) -> PostAttempt:
         report_file_key=row["report_file_key"] or "", claimed_at=row["claimed_at"],
         settled_at=row["settled_at"],
         attempts=row["attempts"] if "attempts" in row.keys() else 1,
-        last_attempt_at=row["last_attempt_at"] if "last_attempt_at" in row.keys() else None)
+        last_attempt_at=row["last_attempt_at"] if "last_attempt_at" in row.keys() else None,
+        # Same guard as the two above, and for the same reason: a row selected from a store that
+        # predates the column has no such key, and reading it raises rather than returning None.
+        group_key=(row["group_key"] or "") if "group_key" in row.keys() else "")
 
 
 def find(conn: sqlite3.Connection, key: str) -> Optional[PostAttempt]:
@@ -154,7 +161,7 @@ def find_delivery(conn: sqlite3.Connection, po_number: str, line_number: Optiona
     with the delivery: reprocessing a mail erases records and re-extracts them under new ids, and
     a corrected re-extraction produces a new id for goods already received.
 
-    That gap is not hypothetical. PO 212559 accumulated **eight** receipts on the training
+    That gap is not hypothetical. PO 912559 accumulated **eight** receipts on the training
     instance, each from a re-extraction of the same delivery, because every one hashed to a new
     key and nothing else could see they were the same. Spitfire cannot answer this either —
     `ReceiptInProgressUnits` reads 0.0 against an unapproved receipt, which is exactly what we
@@ -186,6 +193,71 @@ def existing_for_record(conn: sqlite3.Connection, record_id: int) -> List[PostAt
         "SELECT * FROM spitfire_post WHERE record_id = ? ORDER BY id DESC", (record_id,)
     ).fetchall()
     return [_row_to_attempt(r) for r in rows]
+
+
+def new_group_key() -> str:
+    """A fresh identity for one attempt to build one receipt.
+
+    Minted per attempt rather than derived from the delivery, and that is deliberate. A line held
+    back today and fixed tomorrow becomes a **second** receipt on the same delivery — a posted
+    receipt is never reopened, because Premier may already have approved it and `DELETE` is refused
+    — so one delivery legitimately owns several groups over its life. Deriving this from
+    `delivery_id` would file both receipts under one key and make the second invisible.
+    """
+    return uuid.uuid4().hex
+
+
+def existing_for_group(conn: sqlite3.Connection, group_key: str) -> List[PostAttempt]:
+    """Every row claimed under one attempt, oldest first. Empty for an empty key.
+
+    The empty string is not a group. Rows written before grouping existed all carry it, and treating
+    that as a group would return the whole table as one receipt.
+    """
+    if not group_key:
+        return []
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM spitfire_post WHERE group_key = ? ORDER BY id", (group_key,)).fetchall()
+    return [_row_to_attempt(r) for r in rows]
+
+
+def for_receipt(conn: sqlite3.Connection, receipt_key: str) -> List[PostAttempt]:
+    """Every row describing one receipt, oldest first.
+
+    `group_key` is the identity of an *attempt*; this is the identity of the *document*. They agree
+    on everything that reached Spitfire, and differ for a group that died before `create_receipt`,
+    which has a group and no receipt. The UI groups by this one — what a person is looking at is a
+    receipt, not an attempt.
+    """
+    if not receipt_key:
+        return []
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM spitfire_post WHERE receipt_key = ? ORDER BY id", (receipt_key,)).fetchall()
+    return [_row_to_attempt(r) for r in rows]
+
+
+def settle_group(conn: sqlite3.Connection, keys: Sequence[str], state: str, detail: str = "",
+                 audit: Optional[Sequence[Dict[str, Any]]] = None) -> List[str]:
+    """Close every attempt in a group, returning the keys that could not be closed.
+
+    **Each row is settled in its own transaction, and a failure on one does not stop the rest.**
+    The alternative — one statement over all twenty — sounds tidier and is worse: if it raises
+    halfway, the rows it did not reach stay `CLAIMED` *and* the caller has no idea which those are.
+    A row left at `CLAIMED` is the safe direction to fail in, because `CLAIMED` is in `BLOCKING`, so
+    nothing will post a second receipt over it, and `stranded()` lists it for
+    `spitfire_post.evidenced_state` to settle by reading Spitfire back.
+
+    Returning the failures rather than raising lets the caller say "17 settled, 3 need recovery"
+    instead of losing the 17 that worked.
+    """
+    unsettled: List[str] = []
+    for key in keys:
+        try:
+            settle(conn, key, state, detail, audit)
+        except Exception:                                          # noqa: BLE001 — see docstring
+            unsettled.append(key)
+    return unsettled
 
 
 # What a record's state *is*, when its rows disagree. Lower sorts first and wins.
@@ -233,9 +305,33 @@ def latest_by_record(conn: sqlite3.Connection) -> List[PostAttempt]:
     return [_row_to_attempt(r) for r in best.values()]
 
 
+def posted_po_numbers(conn: sqlite3.Connection) -> set:
+    """Purchase orders whose final receipt we submitted to Spitfire — state POSTED only.
+
+    POSTED means the POD and the receiver report both landed and were read back. POD_POSTED (report
+    still due), PARTIAL, CLAIMED, FLAGGED and FAILED are not a final receipt, so they are left out.
+    One query for the Delivery status page and its CSV.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT po_number FROM spitfire_post WHERE state = ?", (POSTED,)).fetchall()
+    return {str(r[0]).strip() for r in rows}
+
+
+def latest_for_record(conn: sqlite3.Connection, record_id: int) -> Optional[PostAttempt]:
+    """`latest_by_record` for one record — the attempt that says what happened to it.
+
+    Same ranking, one row's worth of work. A page drawing a control per row already holds the whole
+    map from `latest_by_record` and should keep using it; this is for the handlers that are about
+    to act on a single record and must not read the entire ledger to do it.
+    """
+    attempts = existing_for_record(conn, record_id)
+    return min(attempts, key=lambda a: _rank(a.state)) if attempts else None
+
+
 def claim(conn: sqlite3.Connection, *, record_id: int, po_number: str,
           line_number: Optional[int], pod_md5: str, project_code: str = "",
-          quantity: Optional[float] = None, actor: str = "") -> Optional[PostAttempt]:
+          quantity: Optional[float] = None, actor: str = "",
+          group_key: str = "") -> Optional[PostAttempt]:
     """Reserve this delivery, or return None if it is already claimed.
 
     The UNIQUE constraint on `idempotency_key` is the lock, not a check-then-insert: two requests
@@ -251,10 +347,10 @@ def claim(conn: sqlite3.Connection, *, record_id: int, po_number: str,
         conn.execute(
             """INSERT INTO spitfire_post
                (idempotency_key, record_id, po_number, line_number, pod_md5, state, detail,
-                project_code, quantity, actor, claimed_at, attempts, last_attempt_at)
-               VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, 1, ?)""",
+                project_code, quantity, actor, claimed_at, attempts, last_attempt_at, group_key)
+               VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, 1, ?, ?)""",
             (key, record_id, po_number, line_number, pod_md5.upper(), CLAIMED,
-             project_code, quantity, actor, now, now))
+             project_code, quantity, actor, now, now, group_key))
         conn.commit()
         return find(conn, key)
     except sqlite3.IntegrityError:
@@ -272,9 +368,12 @@ def claim(conn: sqlite3.Connection, *, record_id: int, po_number: str,
         f"""UPDATE spitfire_post
                SET state = ?, detail = '', project_code = ?, quantity = ?, actor = ?,
                    claimed_at = ?, settled_at = NULL, attempts = COALESCE(attempts, 1) + 1,
-                   last_attempt_at = ?
+                   last_attempt_at = ?, group_key = ?
              WHERE idempotency_key = ? AND state NOT IN ({placeholders})""",
-        (CLAIMED, project_code, quantity, actor, now, now, key, *BLOCKING)).rowcount
+        # `group_key` is re-stamped rather than left alone: a row being retaken is joining *this*
+        # attempt, and keeping the previous receipt's group would file it under a receipt it is not
+        # going to be on.
+        (CLAIMED, project_code, quantity, actor, now, now, group_key, key, *BLOCKING)).rowcount
     conn.commit()
     return find(conn, key) if updated else None
 

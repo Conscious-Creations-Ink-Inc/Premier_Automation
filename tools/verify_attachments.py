@@ -23,11 +23,18 @@ NOT_STORED = "not_stored"            # no blob recorded — ingested before the 
 MISSING_FILE = "missing_file"        # the ledger names a blob that is not on disk
 CORRUPT_BLOB = "corrupt_blob"        # the file is there and its bytes do not match its name
 NO_BYTES = "no_bytes"                # nothing to store: a cloud link, or a zero-byte attachment
+RELEASED = "released"                # the bytes were dropped on purpose, and this says by whom
 
 
 def check_row(row) -> str:
     if not row["sha256"] or not row["size_bytes"]:
         return NO_BYTES
+    # Released on purpose is not the same fact as never stored, and neither is the same fact as
+    # lost. `tools/reclaim_decorative_blobs.py` stamps `blob_reclaimed_at` as it deletes, so this
+    # can tell them apart -- without it, the first run of that tool makes this one report ~23,900
+    # `missing_file` rows and advise a backfill that would undo the whole thing.
+    if _column(row, "blob_reclaimed_at"):
+        return RELEASED
     blob = row["blob_sha256"]
     if not blob:
         return NOT_STORED
@@ -37,6 +44,15 @@ def check_row(row) -> str:
     # The name is the checksum, so verification is just a re-read. Cheap insurance against a
     # half-written file or a disk that lied about a flush.
     return OK if hashlib.sha256(data).hexdigest() == blob else CORRUPT_BLOB
+
+
+def _column(row, name: str):
+    """A column that may predate this build. `sqlite3.Row` raises IndexError for an unknown key,
+    and a verifier must not be the thing that crashes on an older database."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 def main(argv=None) -> int:
@@ -51,7 +67,8 @@ def main(argv=None) -> int:
     conn.row_factory = __import__("sqlite3").Row
     try:
         rows = conn.execute(
-            "SELECT id, email_id, filename, sha256, size_bytes, blob_sha256, disposition "
+            "SELECT id, email_id, filename, sha256, size_bytes, blob_sha256, disposition, "
+            "       blob_reclaimed_at "
             "  FROM attachment_ledger ORDER BY id"
         ).fetchall()
     finally:
@@ -62,11 +79,11 @@ def main(argv=None) -> int:
     for row in rows:
         verdict = check_row(row)
         verdicts[verdict] += 1
-        if verdict not in (OK, NO_BYTES):
+        if verdict not in (OK, NO_BYTES, RELEASED):
             problems.append((verdict, row))
 
     print(f"{len(rows)} ledger row(s) in {args.source}")
-    for verdict in (OK, NO_BYTES, NOT_STORED, MISSING_FILE, CORRUPT_BLOB):
+    for verdict in (OK, NO_BYTES, RELEASED, NOT_STORED, MISSING_FILE, CORRUPT_BLOB):
         if verdicts[verdict]:
             print(f"  {verdict:14s} {verdicts[verdict]}")
 

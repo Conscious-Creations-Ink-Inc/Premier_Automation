@@ -40,6 +40,11 @@ class InboxMessage:
     """The stable id, so a row can be opened. Graph's own `id` changes the moment a message is
     moved, which makes it useless as a handle."""
 
+    source_folder: str = ""
+    """Which folder listed it — `inbox` or `junkemail`. Carried so "Check now" records the same
+    fact the background watch does; a button that reads a narrower mailbox than the watch beside
+    it would be its own kind of lie."""
+
 
 @dataclass
 class InboxView:
@@ -87,7 +92,17 @@ def _load_live() -> InboxView:
 
     try:
         token = _token()
-        messages, total = _list(token, mailbox)
+        messages: List[InboxMessage] = []
+        total = 0
+        # Every source folder, for the same reason the ingest reads them all: a delivery
+        # notification Exchange filed as junk is still a delivery notification, and "Check now"
+        # is the control someone presses precisely when they are looking for a mail that has not
+        # turned up.
+        for folder in settings.MAILBOX_SOURCE_FOLDERS:
+            found, count = _list(token, mailbox, folder)
+            messages.extend(found)
+            total += count or 0
+        messages.sort(key=lambda m: m.received, reverse=True)
         return InboxView(configured=True, mailbox=mailbox, messages=messages, total=total)
     except Exception as exc:                                   # noqa: BLE001 - shown to the user
         return InboxView(configured=True, mailbox=mailbox, messages=[],
@@ -121,11 +136,12 @@ def _token() -> str:
     return result["access_token"]
 
 
-def _list(token: str, mailbox: str) -> Tuple[List[InboxMessage], Optional[int]]:
+def _list(token: str, mailbox: str,
+          folder: str = "inbox") -> Tuple[List[InboxMessage], Optional[int]]:
     import requests
 
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{GRAPH_BASE_URL}/users/{mailbox}/mailFolders/Inbox/messages"
+    url = f"{GRAPH_BASE_URL}/users/{mailbox}/mailFolders/{folder}/messages"
     params = {
         "$top": PAGE_SIZE,
         "$orderby": "receivedDateTime desc",
@@ -152,6 +168,7 @@ def _list(token: str, mailbox: str) -> Tuple[List[InboxMessage], Optional[int]]:
                 subject=item.get("subject") or "",
                 has_attachments=bool(item.get("hasAttachments")),
                 internet_message_id=item.get("internetMessageId") or "",
+                source_folder=folder,
             ))
         url = payload.get("@odata.nextLink")
         pages += 1

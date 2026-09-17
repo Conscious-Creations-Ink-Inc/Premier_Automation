@@ -12,13 +12,13 @@ from api.services import po_status
 from api.stores.emails_store import DemoEmail
 from tests.api.conftest import make_line
 
-SEEDED_POS = {"212456", "212547", "206534", "198033", "213987", "214902"}
+SEEDED_POS = {"912456", "912547", "906534", "998033", "913987", "914902"}
 
 
-def _email(status_keyword: str, po_number: str = "212456") -> DemoEmail:
+def _email(status_keyword: str, po_number: str = "912456") -> DemoEmail:
     return DemoEmail(
         email_id=f"em-{status_keyword}", received_at="2026-07-20T08:30:00+00:00",
-        sender_address="warehouse@authoritylogistics.com", sender_domain="authoritylogistics.com",
+        sender_address="warehouse@example-logistics.test", sender_domain="example-logistics.test",
         subject="Delivery notification", body_snippet=None,
         notification_type="delivered_shipped", triage_category="hide", matched_rule="rule",
         reason="", status_keyword=status_keyword, po_number=po_number, has_attachment=False,
@@ -128,13 +128,13 @@ def test_list_declares_the_statuses_it_cannot_produce(client):
 
 
 def test_po_212456_does_not_read_as_delivered_while_two_lines_are_unreceived(client):
-    """The seeded case that proves the rollup rule. PO 212456 has three lines: em-1001 settled
+    """The seeded case that proves the rollup rule. PO 912456 has three lines: em-1001 settled
     line 1 (auto-approved, receipt staged), and lines 2 and 3 have had nothing. It also carries two
     carrier emails, one of them `delivered`.
 
     So the PO must report the least-advanced line — in transit, because the carrier mail proves
     *something* moved — and never `delivered`, which is both wrong and entirely plausible-looking."""
-    row = next(r for r in client.get("/api/po").json()["rows"] if r["po_number"] == "212456")
+    row = next(r for r in client.get("/api/po").json()["rows"] if r["po_number"] == "912456")
     assert row["line_count"] == 3
     assert row["status"] == po_status.IN_TRANSIT
     assert row["status"] != po_status.DELIVERED
@@ -143,11 +143,11 @@ def test_po_212456_does_not_read_as_delivered_while_two_lines_are_unreceived(cli
 
 
 def test_detail_returns_lines_and_the_email_audit_trail(client):
-    body = client.get("/api/po/212456").json()
+    body = client.get("/api/po/912456").json()
     assert len(body["lines"]) == 3
     assert all(line["reason"] for line in body["lines"]), "every status must state its evidence"
     assert body["email_count"] == len(body["emails"])
-    assert {e["po_number"] for e in body["emails"]} == {"212456"}
+    assert {e["po_number"] for e in body["emails"]} == {"912456"}
 
 
 def test_detail_404s_for_a_po_that_is_not_in_the_catalogue(client):
@@ -159,8 +159,8 @@ def test_detail_404s_for_a_po_that_is_not_in_the_catalogue(client):
 
 
 def test_quantities_roll_up_across_lines(client):
-    """PO 212456 orders 12 + 4 + 24."""
-    row = next(r for r in client.get("/api/po").json()["rows"] if r["po_number"] == "212456")
+    """PO 912456 orders 12 + 4 + 24."""
+    row = next(r for r in client.get("/api/po").json()["rows"] if r["po_number"] == "912456")
     assert row["qty_ordered"] == 40.0
     assert row["qty_outstanding"] == row["qty_ordered"] - row["qty_received"] - row["qty_in_transit"]
 

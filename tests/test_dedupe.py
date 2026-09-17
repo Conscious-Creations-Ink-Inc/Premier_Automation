@@ -19,8 +19,8 @@ def conn():
 
 
 def log(conn, email_id, **overrides):
-    fields = dict(subject="239260 - Inbound Notification - 206725, 207665",
-                  sender="maria@premierpm.com", category="surface", matched_rule="rule_1a",
+    fields = dict(subject="939260 - Inbound Notification - 906725, 907665",
+                  sender="maria@example-pm.test", category="surface", matched_rule="rule_1a",
                   reason="", folder="Processed", processed_at=NOW)
     fields.update(overrides)
     email_log.record(conn, email_id=email_id, **fields)
@@ -29,14 +29,14 @@ def log(conn, email_id, **overrides):
 # --- 1. the same message, arriving twice --------------------------------------------------------
 
 def test_a_forward_of_a_message_fingerprints_the_same_as_the_message():
-    """Everything in this corpus arrives forwarded from premierpm.com, often twice. A fingerprint
+    """Everything in this corpus arrives forwarded from example-pm.test, often twice. A fingerprint
     that kept the `Fwd:`/`RE:` markers would call two copies of one notification different, which
     is the opposite of useful."""
-    original = dedupe.fingerprint(subject="239260 - Inbound Notification",
-                                  origin_sender="warehousing@authoritylogistics.com",
+    original = dedupe.fingerprint(subject="939260 - Inbound Notification",
+                                  origin_sender="warehousing@example-logistics.test",
                                   origin_sent_at="2025-09-15 09:12")
-    forwarded = dedupe.fingerprint(subject="Fwd: FW: RE: 239260 - Inbound Notification",
-                                   origin_sender="warehousing@authoritylogistics.com",
+    forwarded = dedupe.fingerprint(subject="Fwd: FW: RE: 939260 - Inbound Notification",
+                                   origin_sender="warehousing@example-logistics.test",
                                    origin_sent_at="2025-09-15 09:12")
     assert original == forwarded
 
@@ -52,9 +52,9 @@ def test_attachment_order_and_case_do_not_change_the_fingerprint():
 
 
 def test_two_genuinely_different_notifications_do_not_collide():
-    a = dedupe.fingerprint(subject="239260 - Inbound", origin_sender="w@a.com",
+    a = dedupe.fingerprint(subject="939260 - Inbound", origin_sender="w@a.com",
                            origin_sent_at="2025-09-15 09:12")
-    b = dedupe.fingerprint(subject="239261 - Inbound", origin_sender="w@a.com",
+    b = dedupe.fingerprint(subject="939261 - Inbound", origin_sender="w@a.com",
                            origin_sent_at="2025-09-15 09:12")
     assert a != b
 
@@ -125,17 +125,17 @@ def test_inline_attachments_are_left_out_of_the_hashes(conn):
 # --- 3. the same delivery, staged as two records ------------------------------------------------
 
 def test_two_partial_deliveries_on_one_line_are_different_deliveries():
-    """PO 208491 line 300 took 11 pieces on 1 October and 1 more on the 9th. Both are real
+    """PO 908491 line 300 took 11 pieces on 1 October and 1 more on the 9th. Both are real
     receipts, and a key that merged them would lose the second."""
-    first = dedupe.delivery_key(po_number="208491", line_number=300, quantity=11,
+    first = dedupe.delivery_key(po_number="908491", line_number=300, quantity=11,
                                 pod_stated_date="2025-10-01")
-    second = dedupe.delivery_key(po_number="208491", line_number=300, quantity=1,
+    second = dedupe.delivery_key(po_number="908491", line_number=300, quantity=1,
                                  pod_stated_date="2025-10-09")
     assert first != second
 
 
 def test_the_same_delivery_read_twice_keys_the_same():
-    twice = [dedupe.delivery_key(po_number="208491", line_number=300, quantity=11,
+    twice = [dedupe.delivery_key(po_number="908491", line_number=300, quantity=11,
                                  pod_stated_date="2025-10-01") for _ in range(2)]
     assert twice[0] == twice[1]
 
@@ -165,7 +165,7 @@ def test_sub_parts_of_one_spec_are_separate_deliveries():
 def test_a_field_boundary_cannot_be_faked():
     """`("a|b", "c")` hashing the same as `("a", "b|c")` is a collision waiting for the one delivery
     it matters on — which is why the separator is a character no field can contain."""
-    assert (dedupe.delivery_key(po_number="208491", spec_code="X", quantity=1)
+    assert (dedupe.delivery_key(po_number="908491", spec_code="X", quantity=1)
             != dedupe.delivery_key(po_number="208491X", spec_code="", quantity=1))
 
 
@@ -175,7 +175,7 @@ def test_a_staged_record_is_found_by_its_key(conn):
            (id, source_email_id, po_number, spec_code, item_description, quantity_received,
             pod_stated_date, email_date, extraction_source, extraction_confidence,
             delivery_key, created_at)
-           VALUES (1, 'mail-1', '208491', 'STE-402-LT-B', 'Base', 11.0, '2025-10-01',
+           VALUES (1, 'mail-1', '908491', 'STE-402-LT-B', 'Base', 11.0, '2025-10-01',
                    '2025-10-01', 'test', 1.0, 'the-key', 'now')""")
     conn.commit()
 
@@ -249,3 +249,40 @@ def test_the_mark_does_not_spread_to_other_messages(conn):
     conn.commit()
 
     assert dedupe.is_handled_manually(conn, "mail-2") is False
+
+
+def test_a_failed_record_no_longer_blocks_the_same_delivery(conn):
+    """A guard against duplicates must not become a guard against retries.
+
+    `find_by_delivery_key` scanned the whole table, so a record that *failed* to record a delivery
+    went on blocking every later attempt to record it — the delivery could never be staged again.
+    `post_ledger.BLOCKING` already excludes FAILED for the same reason.
+    """
+    for record_id, status in ((1, "failed"), (2, "pending")):
+        conn.execute(
+            """INSERT INTO extracted_records
+               (id, source_email_id, po_number, spec_code, item_description, quantity_received,
+                pod_stated_date, email_date, extraction_source, extraction_confidence,
+                delivery_key, status, created_at)
+               VALUES (?, 'mail-1', '908491', 'STE-402-LT-B', 'Base', 11.0, '2025-10-01',
+                       '2025-10-01', 'test', 1.0, 'the-key', ?, 'now')""",
+            (record_id, status))
+    conn.commit()
+
+    found = [int(r["id"]) for r in dedupe.find_by_delivery_key(conn, "the-key")]
+    assert found == [2], "the failed record should not stand in the way; the pending one should"
+
+
+def test_a_posted_record_still_blocks_the_same_delivery(conn):
+    """The other half of the same rule. `pushed_to_spitfire` is the strongest possible reason to
+    refuse a second staging of a delivery, so it has to stay in the blocking set."""
+    conn.execute(
+        """INSERT INTO extracted_records
+           (id, source_email_id, po_number, spec_code, item_description, quantity_received,
+            pod_stated_date, email_date, extraction_source, extraction_confidence,
+            delivery_key, status, created_at)
+           VALUES (1, 'mail-1', '908491', 'STE-402-LT-B', 'Base', 11.0, '2025-10-01',
+                   '2025-10-01', 'test', 1.0, 'the-key', 'pushed_to_spitfire', 'now')""")
+    conn.commit()
+
+    assert [int(r["id"]) for r in dedupe.find_by_delivery_key(conn, "the-key")] == [1]

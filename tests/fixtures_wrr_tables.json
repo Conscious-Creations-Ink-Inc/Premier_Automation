@@ -1,0 +1,228 @@
+[
+ [
+  [
+   "Carrier",
+   "Vendor / Shipper's Name",
+   "Date Received",
+   "Received by"
+  ],
+  [
+   "Lunden.",
+   "Peerless Av. /",
+   "8/14/26",
+   "Randy"
+  ]
+ ],
+ [
+  [
+   "BOL, PRO, Or Tracking #",
+   "Total Weight of Shipment",
+   "Total Received",
+   "Customer PO #"
+  ],
+  [
+   "# 3041310",
+   "4171 #",
+   "4 pallets.",
+   ""
+  ]
+ ],
+ [
+  [
+   "Description (such as Desk, Chair, Lamp)",
+   "Carton Markings (Item#/Mfg #/Serial#/Model#)",
+   "Qty",
+   "Weight",
+   "Damage - Exception",
+   "TAG#",
+   "Storage Loc"
+  ],
+  [
+   "SmartMount.",
+   "ST650",
+   "373",
+   "4171",
+   "Pics.",
+   "RR - 17.\n:selected:",
+   "4 pallets. whsefloor"
+  ],
+  [
+   "",
+   "",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "PGR-905-EQ ?",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "? STE-901-EQ?",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "PO#212749.",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ],
+  [
+   "",
+   "",
+   "",
+   "",
+   "",
+   "",
+   ""
+  ]
+ ],
+ [
+  [
+   "Qty.",
+   "Pkg",
+   "HM",
+   "Description",
+   "Weight (Ibs)"
+  ],
+  [
+   "",
+   "",
+   "",
+   "4'0\"L 3'4\"W 7'1\"H 4'0\"L 3'4\"W 5'2\"H 4'0\"L 3'4\"W 6'1\"H QUICKTRANS SERVICE REQUESTED M/F: SHERATON ANCHORAGE GUESTROOMS",
+   ""
+  ],
+  [
+   "2",
+   "PLT",
+   "",
+   "RACK MOUNTS AND ACCESSORIES",
+   "2340"
+  ],
+  [
+   "1",
+   "PLT",
+   "",
+   "RACK MOUNTS AND ACCESSORIES",
+   "839"
+  ],
+  [
+   "1",
+   "PLT",
+   "",
+   "RACK MOUNTS AND ACCESSORIES",
+   "992"
+  ],
+  [
+   "",
+   "",
+   "",
+   "Combined Class 85 rating Rated as Class 85",
+   "4171"
+  ],
+  [
+   "1",
+   "EACH",
+   "",
+   "Notification Charge",
+   ""
+  ],
+  [
+   "4171",
+   "CWT",
+   "",
+   "Liftgate Charge",
+   ""
+  ],
+  [
+   "4171",
+   "CWT",
+   "",
+   "Inside or Limited Access Delivery NOTIFY ON ARRIVAL",
+   ""
+  ],
+  [
+   "1",
+   "",
+   "",
+   "Fuel Surcharge - QT 33%",
+   ""
+  ],
+  [
+   "4",
+   "",
+   "",
+   "TOTAL PREPAID",
+   "4171"
+  ]
+ ],
+ [
+  [
+   "No.",
+   "Item / Lotserial NBR",
+   "Ordered Qty",
+   "UOM",
+   "Delivered Qty",
+   "Remaining to Deliver"
+  ],
+  [
+   "1",
+   "ST650\n:selected:",
+   "373.0000",
+   "EA",
+   "373.0000",
+   "0.0000"
+  ]
+ ]
+]

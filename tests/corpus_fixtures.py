@@ -1,6 +1,6 @@
 """Email fixtures shaped like the real June corpus.
 
-The tests used to build emails with invented grammar — subjects like `Inbound - PO 213987`,
+The tests used to build emails with invented grammar — subjects like `Inbound - PO 913987`,
 senders at `hospitalitylogistics.com`, tables headed `PO | Spec | Qty`. None of those shapes
 occur in Premier's mail, so a green suite proved nothing about production behaviour, and the
 placeholder sender domains were themselves the top-ranked go-live blocker in
@@ -17,9 +17,9 @@ from typing import List, Optional, Sequence
 
 from pipeline.models import Attachment, RawEmail
 
-WAREHOUSING = "warehousing@authoritylogistics.com"
-ROUTING = "routing@authoritylogistics.com"
-EXPEDITOR = "mariagutierrez@premierpm.com"
+WAREHOUSING = "warehousing@example-logistics.test"
+ROUTING = "routing@example-logistics.test"
+EXPEDITOR = "arivera@example-pm.test"
 
 # --- Authority Inbound (class A) --------------------------------------------
 
@@ -54,16 +54,16 @@ _DELIVERED_HEADER_TEXT = """
 
 _DELIVERED_LINE_HEADER = "<tr><th>Package</th><th>PO #</th><th>Item</th><th>Supplier</th></tr>"
 
-DEFAULT_WAREHOUSE = "Crown Worldwide Moving &amp; Storage - Mira Loma 4550 Wineville Ave. Unit B Mira Loma, CA 91752"
+DEFAULT_WAREHOUSE = "Example Storage - Riverside 100 Example Ave. Unit B Riverside, CA 92500"
 
 
-def inbound_subject(notice: str, po_numbers: Sequence[str], project: str = "2985",
-                    project_name: str = "LXR Cameo Beverly Hills (Guestrooms) - MRC Los Angeles CA") -> str:
+def inbound_subject(notice: str, po_numbers: Sequence[str], project: str = "9085",
+                    project_name: str = "Example Hotel Downtown (Guestrooms) - PRJ Springfield IL") -> str:
     return f"[External] {notice} - Inbound Notification - {', '.join(po_numbers)} - {project} : {project_name}"
 
 
-def delivered_subject(notice: str, po_numbers: Sequence[str], project: Optional[str] = "2978",
-                      project_name: str = "LXR Cameo Beverly Hills (Public Space) - MRC") -> str:
+def delivered_subject(notice: str, po_numbers: Sequence[str], project: Optional[str] = "9078",
+                      project_name: str = "Example Hotel Downtown (Public Space) - MRC") -> str:
     """Note the doubled dash — Authority leaves an empty slot after the label, and that empty
     slot is what distinguishes the Delivered grammar from the Inbound one."""
     tail = f" - {project} - {project_name}" if project else ""
@@ -73,13 +73,13 @@ def delivered_subject(notice: str, po_numbers: Sequence[str], project: Optional[
 def inbound_email(
     *,
     email_id: str = "msg-inbound-1",
-    notice: str = "239336",
-    po_numbers: Sequence[str] = ("208491",),
+    notice: str = "939336",
+    po_numbers: Sequence[str] = ("908491",),
     lines: Sequence[dict] = (),
-    shipment: str = "50052 : 1",
+    shipment: str = "90052 : 1",
     received_date: str = "10/01/2025",
-    carrier: str = "Nolan Transportation",
-    tracking: str = "8840455",
+    carrier: str = "Example Freight",
+    tracking: str = "9940455",
     package_qty: str = "41 CTN",
     forwarded: bool = False,
     attachments: Optional[List[Attachment]] = None,
@@ -105,7 +105,7 @@ def inbound_email(
 
     body = (
         _INBOUND_HEADER_TABLE.format(
-            received_date=received_date, received_at=DEFAULT_WAREHOUSE, received_by="Miguel C.",
+            received_date=received_date, received_at=DEFAULT_WAREHOUSE, received_by="Jordan T.",
             shipment=shipment, carrier=carrier, tracking=tracking, package_qty=package_qty,
             weight="1240.00",
         )
@@ -118,12 +118,12 @@ def inbound_email(
 def delivered_email(
     *,
     email_id: str = "msg-delivered-1",
-    notice: str = "50009",
-    po_numbers: Sequence[str] = ("206725",),
+    notice: str = "90009",
+    po_numbers: Sequence[str] = ("906725",),
     lines: Sequence[dict] = (),
     delivered: str = "09/15/2025",
-    carrier: str = "Nolan Transportation",
-    tracking: str = "8801592",
+    carrier: str = "Example Freight",
+    tracking: str = "9801592",
     forwarded: bool = True,
     attachments: Optional[List[Attachment]] = None,
     received_at: str = "2025-09-15T18:00:00Z",
@@ -146,7 +146,7 @@ def delivered_email(
             notice=notice, carrier=carrier, tracking=tracking,
             ship_from="Tournesol Siteworks : 1540 Leader International Dr, Port Orchard, WA",
             delivered=delivered, signed_by="",
-            ship_to="Crown Worldwide Moving &amp; Storage - Mira Loma : 4550 Wineville Ave., Mira Loma, CA",
+            ship_to="Example Storage Moving &amp; Storage - Riverside : 4550 Wineville Ave., Riverside, CA",
         )
         + "<table>" + "".join(rows) + "</table>"
     )
@@ -154,18 +154,18 @@ def delivered_email(
     return _wrap(email_id, ROUTING, subject, body, forwarded, attachments, received_at)
 
 
-def status_report_email(email_id: str = "msg-status-1", project: str = "2978") -> RawEmail:
+def status_report_email(email_id: str = "msg-status-1", project: str = "9078") -> RawEmail:
     """The weekly summary — same sender as the receiver trigger, told apart only by subject."""
     subject = (f"[External] Purchase Order Status Report - Summary : {project}: "
-               f"LXR Cameo Beverly Hills (Public Space) - MRC Los Angeles, CA")
-    body = "<table><tr><th>PO</th><th>Status</th></tr><tr><td>208491</td><td>Open</td></tr></table>"
+               f"Example Hotel Downtown (Public Space) - MRC Los Angeles, CA")
+    body = "<table><tr><th>PO</th><th>Status</th></tr><tr><td>908491</td><td>Open</td></tr></table>"
     return _wrap(email_id, WAREHOUSING, subject, body, forwarded=True, attachments=None,
                  received_at="2026-06-05T20:38:00Z")
 
 
 def confirmation_request_email(
     email_id: str = "msg-confirm-1",
-    sender: str = "elber@5starinterior.com",
+    sender: str = "contact@example-interiors.test",
     reply_text: str = "We can confirm that we have only received the Sheer Fabric (GR-350c-WTF) attic stock.",
     rows: Sequence[dict] = (),
 ) -> RawEmail:
@@ -173,9 +173,9 @@ def confirmation_request_email(
     with the PO/spec/qty living only in the quoted grid."""
     rows = rows or [
         {"description": "Main Drapery Fabric", "spec": "GR-350a-WTF", "uom": "YD", "qty": "196",
-         "po": "210634", "vendor": "P. Kaufmann"},
+         "po": "910634", "vendor": "P. Kaufmann"},
         {"description": "Sheer Fabric", "spec": "GR-350c-WTF", "uom": "YD", "qty": "84",
-         "po": "210635", "vendor": "Fil Doux Inc"},
+         "po": "910635", "vendor": "Fil Doux Inc"},
     ]
     grid = ["<tr><th>Description of Item</th><th>SPEC # or Phase Code</th><th>UOM</th>"
             "<th>Qty</th><th>P.O.#</th><th>Vendor</th></tr>"]
@@ -186,9 +186,9 @@ def confirmation_request_email(
         )
     body = (
         f"<p>{reply_text}</p>"
-        "<p>From:<br/>Gutierrez, Maria &lt;MariaGutierrez@premierpm.com&gt;</p>"
+        "<p>From:<br/>Rivera, Alex &lt;ARivera@example-pm.test&gt;</p>"
         "<p>Sent:<br/>Wednesday, November 26, 2025 1:35 PM</p>"
-        "<p>To:<br/>Yvette &lt;yvette@5starinterior.com&gt;</p>"
+        "<p>To:<br/>Yvette &lt;yvette@example-interiors.test&gt;</p>"
         "<p>Subject:<br/>Verification of Fabric Receipt for ATTIC STOCK</p>"
         "<table>" + "".join(grid) + "</table>"
     )
@@ -217,17 +217,17 @@ def _default_delivered_line(po_number: str) -> dict:
 
 _FORWARD_WRAPPER = """
 <p>{annotation}</p>
-<p>Best regards,</p><p>Maria J Gutierrez</p><p>Project Expeditor</p>
-<p>14185 Dallas Parkway, Suite 1400 | Dallas, TX 75254</p>
+<p>Best regards,</p><p>Alex J Rivera</p><p>Project Expeditor</p>
+<p>100 Example Plaza, Suite 200 | Springfield, IL 62701</p>
 <p>NOTICE: This email contains confidential information solely for the use of the intended
 recipient(s). If you are not said recipient your use, disclosure or other distribution of any
 information included herewith is STRICTLY PROHIBITED, and you are instructed to notify the
 sender immediately and delete this email, all copies and attachments.</p>
 <p>From:<br/>{origin} &lt;{origin}&gt;</p>
 <p>Sent:<br/>Wednesday, October 1, 2025 1:59 PM</p>
-<p>To:<br/>Johnson, Kamilah &lt;kamilahjohnson@premierpm.com&gt;; warehousing@authoritylogistics.com
-&lt;warehousing@authoritylogistics.com&gt;; nick.beasley@goarmstrong.com
-&lt;nick.beasley@goarmstrong.com&gt;</p>
+<p>To:<br/>Johnson, Kamilah &lt;kamilahjohnson@example-pm.test&gt;; warehousing@example-logistics.test
+&lt;warehousing@example-logistics.test&gt;; nick.beasley@example-flooring.test
+&lt;nick.beasley@example-flooring.test&gt;</p>
 <p>Subject:<br/>{subject}</p>
 """
 
@@ -243,7 +243,7 @@ def _wrap(
 ) -> RawEmail:
     """Wrap the notice in the internal forward Premier's expeditors add, or deliver it direct.
 
-    Both shapes occur in the corpus for the same notification (239336 arrives once directly and
+    Both shapes occur in the corpus for the same notification (939336 arrives once directly and
     once forwarded), so every rule has to work either way.
     """
     if forwarded:

@@ -39,18 +39,18 @@ def test_path_for_refuses_anything_else(bad):
 
 
 def test_neither_store_can_see_the_other(tmp_path):
-    live = _store(tmp_path / "live.sqlite3", "212456", "STE-402")
+    live = _store(tmp_path / "live.sqlite3", "912456", "STE-402")
     sample = _store(tmp_path / "sample.sqlite3", "999999", "SAMPLE-1")
     try:
         live_report = receipt_log.build(live)
         sample_report = receipt_log.build(sample)
 
-        assert [po.po_number for po in live_report.purchase_orders] == ["212456"]
+        assert [po.po_number for po in live_report.purchase_orders] == ["912456"]
         assert [po.po_number for po in sample_report.purchase_orders] == ["999999"]
 
         # The report query has no source predicate and is not meant to grow one.
         assert "999999" not in str(receipt_log.to_html(live_report))
-        assert "212456" not in str(receipt_log.to_html(sample_report))
+        assert "912456" not in str(receipt_log.to_html(sample_report))
 
         assert read_views.summary(live).records_total == 1
         assert read_views.summary(sample).records_total == 1

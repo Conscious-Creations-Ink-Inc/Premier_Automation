@@ -107,7 +107,7 @@ class _Attempt:
 
 
 def _complete_row(**overrides):
-    row = {"id": 5, "po_number": "212614", "spec_code": "LT-03b",
+    row = {"id": 5, "po_number": "912614", "spec_code": "LT-03b",
            "item_description": "LT-03B Frosted", "vendor_name": "Archipelago",
            "quantity_received": 19.0, "unit_of_measure": "EA", "pod_stated_date": "2026-01-20",
            "received_by": "J Smith", "po_line_number": 1, "source_email_id": "mail-1"}
@@ -155,5 +155,5 @@ def test_the_client_itself_refuses_even_if_the_gate_is_bypassed(replaying):
     client = SpitfireWriteClient(session_cookie="not-a-real-ticket")
 
     with pytest.raises(spitfire_cassette.SpitfireOffline) as raised:
-        client.create_receipt("MRC024PB100003", "212559")
+        client.create_receipt("PRJ001PB100003", "912559")
     assert "office network" in str(raised.value)

@@ -1,4 +1,5 @@
 import io
+import re
 import time
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -12,17 +13,326 @@ from pipeline.parsing import sniff
 from pipeline.stage3_extract.base import (
     ExtractionAdapter,
     ExtractionSource,
+    apply_document_fields,
     build_record_from_row,
-    map_headers,
+    po_column_is_corroborated,
+    is_item_row,
+    kept_despite_a_misread_spec,
+    find_header_row,
+    harvest_document_fields,
+    states_a_line_item,
     strip_print_chrome,
 )
 from pipeline.stage3_extract.freetext_adapter import FreetextAdapter
 
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/tiff", "image/bmp"}
 
+# Statuses worth trying again. Everything else is the service telling us something about the
+# request that a second identical request cannot change — see `_is_retryable`.
+RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+class OcrQuotaExhausted(RuntimeError):
+    """Azure's own limit: the account has no call volume left this period.
+
+    Deliberately not an `AzureOcrError`. That class means "this request failed and here is what the
+    service said"; this one means "the service will not answer any request until the subscription
+    changes", which is a different fact with a different remedy — and, like `OcrBudgetExhausted`,
+    one that no retry can help with. `_is_retryable` treats both the same for that reason.
+
+    Raised only by `BudgetedOcrClient` once it has latched, so the ledger row for the page that
+    actually discovered the exhaustion still carries Azure's own wording.
+    """
+
+
+class OcrBudgetExhausted(RuntimeError):
+    """Our own per-run page ceiling, not a failure of Azure's.
+
+    Its own class so `_is_retryable` can tell it from every other `RuntimeError` without matching on
+    the message. Retrying it would be asking our spend guard to change its mind; classing *all*
+    `RuntimeError` as permanent to achieve that would have silently stopped retrying genuine
+    transient faults, which is the opposite of the fix.
+
+    Subclasses `RuntimeError` so `BudgetedOcrClient`'s existing callers keep working unchanged.
+    """
+
+
+_LAST_CALL_AT = [0.0]
+"""When the last analyze POST went out, so calls can be paced across every caller.
+
+Module-level rather than per-client because the pacing that matters is against the *resource*'s
+calls-per-minute, and `build_default_adapters` hands the same client to several adapters while
+`reextract` builds its own. A per-instance clock would let two of them outrun the tier together.
+"""
+
 
 def _log(message: str) -> None:
     print(f"[ocr_adapter] {message}")
+
+
+class AzureOcrError(Exception):
+    """An HTTP failure from Document Intelligence, carrying what Azure actually said.
+
+    `raise_for_status()` produces `"400 Client Error: Bad Request for url: …"` and nothing else,
+    and that is all the ledger held for five identical failures. Azure had answered:
+
+        {"error": {"code": "InvalidRequest", "innererror":
+                   {"code": "InvalidContentLength",
+                    "message": "The input image is too large."}}}
+
+    The file was 4.67 MB against this resource's 4 MB body cap. One line of the response body is
+    the difference between "OCR is broken" and "shrink the image", so it is read before the status
+    is raised on, and kept here.
+    """
+
+    def __init__(self, status: int, code: str, message: str, url: str = "",
+                 retry_after: Optional[str] = None):
+        self.status = status
+        self.code = code
+        self.message = message
+        self.url = url
+        self.retry_after = retry_after
+        """Whatever Azure put in the `Retry-After` header, unparsed. It is the service saying how
+        long its own throttle lasts, which beats any interval we would invent."""
+        detail = f"HTTP {status}"
+        if code:
+            detail += f" {code}"
+        if message:
+            detail += f": {message}"
+        super().__init__(detail)
+
+
+def _raise_for_status(response, url: str = "") -> None:
+    """Turn a non-2xx into an `AzureOcrError` that has read the body first."""
+    if response.status_code < 400:
+        return
+    code = message = ""
+    try:
+        error = (response.json() or {}).get("error") or {}
+        inner = error.get("innererror") or {}
+        # The inner code is the specific one — `InvalidContentLength` rather than `InvalidRequest`
+        # — and the inner message is the sentence a person can act on.
+        code = inner.get("code") or error.get("code") or ""
+        message = inner.get("message") or error.get("message") or ""
+    except ValueError:
+        message = (response.text or "")[:200]
+    raise AzureOcrError(response.status_code, code, message,
+                        url or getattr(response, "url", "") or "",
+                        (response.headers or {}).get("Retry-After"))
+
+
+def is_quota_exhausted(exc: Exception) -> bool:
+    """Whether this failure means the OCR account has no call volume left this period.
+
+    Distinct from every other failure here, because it is the only one that is true of the
+    *account* rather than of the document: retrying it costs a round trip and cannot succeed, and
+    neither can the next document, or the six hundredth.
+
+    That distinction was missing, and it cost the ledger 580 rows. Each attachment was tried,
+    refused with `HTTP 403: Out of call volume quota`, and filed individually as
+    `service_unavailable` — so an exhausted subscription looked like 580 separately broken
+    attachments rather than one account-level fact with a date on it.
+
+    Matched on the message as well as the status because 403 alone is ambiguous: a wrong key or a
+    firewalled endpoint is also 403, and those are worth retrying against the next document.
+    """
+    if not isinstance(exc, AzureOcrError):
+        return False
+    if exc.status != 403:
+        return False
+    return "out of call volume quota" in f"{exc.code} {exc}".lower()
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether trying the identical request again could plausibly succeed.
+
+    The retry used to catch bare `Exception`, so a 400 was re-sent exactly like a 429 — re-uploading
+    4.67 MB for a guaranteed second refusal, and spending one of only two attempts to learn nothing.
+    A budget stop was retried too, which is our own guard being asked to change its mind.
+    """
+    if isinstance(exc, AzureOcrError):
+        return exc.status in RETRYABLE_STATUSES
+    # A local refusal: a file too big to send that could not be shrunk, or our own spend ceiling.
+    # Neither is Azure's to change its mind about. Deliberately narrow — every other `RuntimeError`
+    # stays retryable, because "the service misbehaved in a way we did not anticipate" is exactly
+    # the case a retry exists for.
+    # `OcrQuotaExhausted` belongs here for the same reason as the budget, one step further out:
+    # it is raised without contacting Azure at all, so a retry re-asks a decision already taken
+    # locally. Left retryable it would multiply the very round trips the latch exists to stop.
+    if isinstance(exc, (ValueError, OcrBudgetExhausted, OcrQuotaExhausted)):
+        return False
+    # Timeouts, connection resets and the SSL EOF that dropped an 11.6 MB upload mid-flight.
+    return True
+
+
+def _retry_after_seconds(exc: Exception, attempt: int) -> float:
+    """How long to wait, preferring what Azure asked for over what we guessed.
+
+    `connectors/mailbox.py` has kept this contract for Graph since the day a 429 cost a whole
+    cycle there; its docstring calls obeying `Retry-After` "the difference between a two-second
+    pause and a lost cycle". The OCR path never did, and 77% of its failures are 429s.
+    """
+    header = getattr(exc, "retry_after", None)
+    if header:
+        try:
+            return min(float(header), settings.AZURE_OCR_RETRY_MAX_SECONDS)
+        except (TypeError, ValueError):
+            pass
+    # Exponential, with jitter so several callers backing off together do not resynchronise.
+    import random
+
+    base = settings.AZURE_OCR_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+    return min(base + random.uniform(0, base / 2), settings.AZURE_OCR_RETRY_MAX_SECONDS)
+
+
+def _open_image(content_bytes: bytes):
+    """The image behind these bytes, or None if Pillow cannot read them as one.
+
+    A PDF, a corrupt file and a Word document all land here on the way to OCR; none of them is
+    something to re-encode, and all of them must come back out untouched for the caller to refuse
+    or forward honestly.
+    """
+    try:
+        from PIL import Image
+    except ImportError:                                            # pragma: no cover
+        return None
+    try:
+        image = Image.open(io.BytesIO(content_bytes))
+        image.load()
+        return image
+    except Exception:                                              # noqa: BLE001 — not an image
+        return None
+
+
+def _clamp_to_dimension_range(image):
+    """Scale an image into Document Intelligence's 50-10000 pixel range, or return it unchanged.
+
+    Shared by `fit_for_upload` and the PDF page split, because the second needed it and did not
+    have it: three large-format submittals render at 8398x11198 at 200 DPI, and every page of all
+    three came back `400 InvalidContentDimensions` — the same refusal the whole-file path had just
+    been taught to prevent, reintroduced one level down.
+
+    Both bounds are checked after scaling for the first, so squaring up a long thin page cannot
+    push its short side back under the floor.
+    """
+    width, height = image.size
+    smallest, largest = min(width, height), max(width, height)
+    if smallest >= settings.OCR_MIN_IMAGE_PIXELS and largest <= settings.OCR_MAX_IMAGE_PIXELS:
+        return image
+
+    from PIL import Image
+
+    scale = 1.0
+    if smallest < settings.OCR_MIN_IMAGE_PIXELS:
+        scale = settings.OCR_MIN_IMAGE_PIXELS / smallest
+    if largest * scale > settings.OCR_MAX_IMAGE_PIXELS:
+        scale = settings.OCR_MAX_IMAGE_PIXELS / largest
+    resized = image.resize(
+        (max(settings.OCR_MIN_IMAGE_PIXELS, round(width * scale)),
+         max(settings.OCR_MIN_IMAGE_PIXELS, round(height * scale))),
+        Image.LANCZOS)
+    _log(f"scaled {width}x{height} to {resized.width}x{resized.height} into the "
+         f"{settings.OCR_MIN_IMAGE_PIXELS}-{settings.OCR_MAX_IMAGE_PIXELS}px range")
+    return resized
+
+
+def _encode(image, limit: int) -> bytes:
+    """The smallest acceptable encoding of `image` that fits under `limit`.
+
+    PNG first, because it is lossless and every image small enough for it to win is one where the
+    text is thin — a screenshot, a pasted table, a logo — and JPEG ringing on thin text is exactly
+    what an OCR pass then has to read through. JPEG only once PNG will not fit, stepping the scale
+    and the quality down together the way the old loop did.
+    """
+    from PIL import Image
+
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    if buffer.tell() <= limit:
+        return buffer.getvalue()
+
+    for scale in (1.0, 0.75, 0.5, 0.35, 0.25):
+        candidate = image
+        if scale < 1.0:
+            candidate = image.resize(
+                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                Image.LANCZOS)
+        for quality in (85, 70, 55):
+            buffer = io.BytesIO()
+            candidate.save(buffer, format="JPEG", quality=quality, optimize=True)
+            if buffer.tell() <= limit:
+                _log(f"downscaled to {buffer.tell()} bytes "
+                     f"({candidate.width}x{candidate.height}, q{quality}) to fit the upload cap")
+                return buffer.getvalue()
+    return b""
+
+
+def fit_for_upload(content_bytes: bytes, limit: Optional[int] = None) -> bytes:
+    """Make an image something Document Intelligence will look at, or return it unchanged.
+
+    Three separate refusals, all of which describe the *request* rather than the file, and all of
+    which are correctable here:
+
+    1. **Too large.** The resource caps a request body at 4 MB. A phone photo of a signed POD is
+       routinely larger — the one on PO 914711 is 4.67 MB at 5712x4284 — and refusing it loses the
+       only evidence that delivery has. Halving the linear size costs nothing OCR can read.
+    2. **Unsupported container** (`400 InvalidContent`). GIF is not on the service's list, and
+       Outlook writes GIFs for signature banners; twenty-one reached OCR and all came back as
+       "corrupted or format is unsupported". Only the first frame is a document, so that is what
+       gets re-encoded. This also normalises `MPO` — an iPhone multi-picture JPEG carrying extra
+       frames after the primary one, likewise not on the list, and a second independent reason
+       PO 914711's photo was refused.
+    3. **Out of dimension range** (`400 InvalidContentDimensions`). The service reads between 50
+       and 10000 pixels a side. Both ends are scaled into range rather than refused, so what
+       decides the disposition is the image's contents and not a request never looked at.
+
+    Anything Pillow cannot open — a PDF above the cap — comes back untouched, for the caller to
+    handle. There is no lossless way to shrink it here; `AzureDocumentIntelligenceClient` splits
+    those by page instead.
+
+    Returning the bytes unchanged where nothing needed doing is deliberate: the overwhelming
+    majority of attachments are already acceptable, and re-encoding them would spend CPU to make
+    the OCR result marginally worse.
+    """
+    limit = limit or settings.OCR_MAX_UPLOAD_BYTES
+    image = _open_image(content_bytes)
+    if image is None:
+        return content_bytes
+
+    fmt = (image.format or "").upper()
+    width, height = image.size
+    too_big = len(content_bytes) > limit
+    # Deliberately not "has more than one frame". A multi-page TIFF is a supported container and
+    # Document Intelligence reads every page of it; collapsing it to the first frame here would
+    # silently discard pages two onward of a faxed POD. Only an unsupported container is rewritten,
+    # and `MPO` — the iPhone multi-picture JPEG — is unsupported by name, so it is already covered.
+    wrong_format = fmt not in settings.OCR_UPLOAD_FORMATS
+    smallest, largest = min(width, height), max(width, height)
+    too_small = smallest < settings.OCR_MIN_IMAGE_PIXELS
+    too_wide = largest > settings.OCR_MAX_IMAGE_PIXELS
+
+    if not (too_big or wrong_format or too_small or too_wide):
+        return content_bytes
+
+    if wrong_format and getattr(image, "n_frames", 1) > 1:
+        # An animated GIF signature banner: the first frame carries whatever text there is and the
+        # rest are the animation. Seeking is also what makes a GIF's palette resolve before the
+        # conversion below. Guarded on `wrong_format` so a multi-page TIFF never reaches here.
+        image.seek(0)
+
+    image = _clamp_to_dimension_range(image)
+
+    prepared = _encode(image, limit)
+    if not prepared:
+        # Every scale and quality step still overshot. The original is no smaller, but it is at
+        # least the file the sender actually sent, and the caller refuses it by size with a
+        # message naming the real number.
+        return content_bytes
+    if wrong_format:
+        _log(f"re-encoded {fmt or 'unknown'} to a supported container for upload")
+    return prepared
 
 
 @dataclass
@@ -30,11 +340,79 @@ class OcrResult:
     tables: List[List[List[str]]] = field(default_factory=list)  # each table: list of rows, each row a list of cells
     raw_text: str = ""
     confidence: float = 0.0
+    pages: int = 1
+    """How many pages the service was billed for producing this.
+
+    Document Intelligence charges per page, and `BudgetedOcrClient` counted one per `analyze()`
+    call — so a 10-page scanned bill of lading drew ten pages of Premier's allowance and one unit
+    of ours. That undercount is how a 150-page budget could walk into the tier's monthly ceiling
+    with the meter reading a third full.
+
+    One for an image, which is always a single page, and the real count for a PDF.
+    """
 
 
 class DocumentIntelligenceClient(ABC):
     @abstractmethod
     def analyze(self, content_bytes: bytes) -> OcrResult: ...
+
+
+class CachingOcrClient(DocumentIntelligenceClient):
+    """Reads each distinct document once, however many attachments carry it.
+
+    Mail is enormously repetitive and the ledger says so plainly: the 533 attachments waiting on
+    OCR are **227 distinct blobs**. One signature banner accounts for thirty of them, one EMCO
+    bill of lading for two. Reading by ledger row therefore paid Azure 2.3 times over for the same
+    pages — and, because the page budget is finite, a run that spent itself on repeats left
+    genuinely unread documents still unread behind it.
+
+    Keyed on the SHA-256 of the bytes as submitted, so it is a statement about the document rather
+    than about the attachment: the same photograph forwarded through four hops of a thread hits the
+    cache three times, and two different files never share an entry.
+
+    **Failures are cached too, and deliberately.** A GIF the service refuses as an unsupported
+    container will be refused identically the next 29 times; re-asking spends a round trip and the
+    tier's rate allowance to be told the same thing. What is *not* cached is the account-level
+    quota failure — `BudgetedOcrClient` latches that separately, and it is not a fact about any
+    document.
+
+    In memory, for the life of one run. A cache that survived runs would need a table, and a
+    table is a schema change; this is where the repetition actually is.
+    """
+
+    def __init__(self, inner: DocumentIntelligenceClient):
+        self.inner = inner
+        self.hits = 0
+        self.misses = 0
+        self._results: dict = {}
+        self._failures: dict = {}
+
+    def analyze(self, content_bytes: bytes) -> OcrResult:
+        import hashlib
+
+        key = hashlib.sha256(content_bytes).hexdigest()
+        if key in self._results:
+            self.hits += 1
+            return self._results[key]
+        if key in self._failures:
+            self.hits += 1
+            raise self._failures[key]
+
+        try:
+            result = self.inner.analyze(content_bytes)
+        except (OcrQuotaExhausted, OcrBudgetExhausted):
+            # Neither is a fact about this document — one is the subscription and one is our own
+            # ceiling — so neither is cached against it. Raising a budget stop back at a blob whose
+            # turn came after the budget closed would make the stop permanent for the whole run,
+            # and it would still be there after the budget was raised.
+            raise
+        except Exception as exc:                                   # noqa: BLE001
+            self.misses += 1
+            self._failures[key] = exc
+            raise
+        self.misses += 1
+        self._results[key] = result
+        return result
 
 
 class MockDocumentIntelligenceClient(DocumentIntelligenceClient):
@@ -214,13 +592,99 @@ class AzureDocumentIntelligenceClient(DocumentIntelligenceClient):
             )
 
     def analyze(self, content_bytes: bytes) -> OcrResult:
-        import requests
-
-        if len(content_bytes) > settings.OCR_MAX_IMAGE_BYTES:
+        # Shrink before measuring: an oversized *image* is a thing we can fix, and refusing it
+        # loses the delivery it is evidence of.
+        content_bytes = fit_for_upload(content_bytes)
+        if len(content_bytes) > settings.OCR_MAX_UPLOAD_BYTES:
+            if content_bytes[:4] == b"%PDF":
+                # A scan too large to post whole is still readable a page at a time, and these are
+                # the documents most worth reading: of the fourteen refused on size, ten are EMCO
+                # bills of lading and one is a warehouse receiving report's damage photographs.
+                # Refusing them outright filed real delivery evidence as "the OCR service is down".
+                return self._analyze_pdf_by_page(content_bytes)
             raise ValueError(
                 f"document is {len(content_bytes)} bytes, above the "
-                f"{settings.OCR_MAX_IMAGE_BYTES}-byte limit"
+                f"{settings.OCR_MAX_UPLOAD_BYTES}-byte upload limit, and is not an image that "
+                f"could be scaled down to fit"
             )
+        return self._analyze_whole(content_bytes)
+
+    def _analyze_pdf_by_page(self, content_bytes: bytes) -> OcrResult:
+        """Rasterise an oversized PDF and read it page by page, merging the results.
+
+        Splitting rather than compressing, because the size is in the page images themselves —
+        these are scans — so there is nothing to strip out without destroying what OCR must read.
+
+        Billed per page either way: Document Intelligence charges by page, so N page-calls cost
+        what the whole document would have. `OcrResult.pages` carries the count out so
+        `BudgetedOcrClient` charges the budget the same N and the spend guard stays honest.
+
+        `OCR_MAX_PAGES` caps the read at the same place the whole-document path caps it with its
+        `pages=1-N` parameter, so a 23-page specification does not quietly become a 23-page bill.
+        """
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:                                        # pragma: no cover
+            raise ValueError(
+                f"document is {len(content_bytes)} bytes, above the "
+                f"{settings.OCR_MAX_UPLOAD_BYTES}-byte upload limit, and pypdfium2 is not "
+                f"installed to split it by page"
+            )
+
+        try:
+            document = pdfium.PdfDocument(content_bytes)
+        except Exception as exc:                                   # noqa: BLE001
+            # Too big to post and not a PDF anything can open. Refused by size, in the file's own
+            # terms — the reason a reviewer needs is "this document is 11 MB", not "PDFium: Data
+            # format error", and certainly not "the OCR service is unavailable".
+            raise ValueError(
+                f"document is {len(content_bytes)} bytes, above the "
+                f"{settings.OCR_MAX_UPLOAD_BYTES}-byte upload limit, and could not be opened to "
+                f"split by page ({type(exc).__name__})"
+            )
+
+        texts: List[str] = []
+        tables: List[List[List[str]]] = []
+        confidences: List[float] = []
+        pages_read = 0
+        try:
+            count = min(len(document), settings.OCR_MAX_PAGES)
+            _log(f"{len(content_bytes)} bytes is over the upload cap — reading "
+                 f"{count} of {len(document)} page(s) individually")
+            for index in range(count):
+                page = document[index]
+                # 200 DPI is what the Tesseract and Vision clients already rasterise at, and it is
+                # the resolution a scanned delivery note's text survives; the scale factor is
+                # relative to PDF's own 72 DPI user space.
+                bitmap = page.render(scale=200 / 72)
+                # Clamped, not just compressed. A large-format submittal renders to 8398x11198 at
+                # 200 DPI — over the service's 10000-pixel ceiling — and three of them failed every
+                # page with `InvalidContentDimensions` until this line existed.
+                image = _clamp_to_dimension_range(bitmap.to_pil())
+                prepared = _encode(image, settings.OCR_MAX_UPLOAD_BYTES)
+                if not prepared:
+                    _log(f"page {index + 1} would not fit the upload cap at any scale — skipped")
+                    continue
+                result = self._analyze_whole(prepared)
+                pages_read += 1
+                if result.raw_text:
+                    texts.append(result.raw_text)
+                tables.extend(result.tables)
+                if result.confidence:
+                    confidences.append(result.confidence)
+        finally:
+            document.close()
+
+        return OcrResult(
+            tables=tables,
+            raw_text="\n".join(texts),
+            confidence=(sum(confidences) / len(confidences)) if confidences else 0.0,
+            pages=max(1, pages_read),
+        )
+
+    def _analyze_whole(self, content_bytes: bytes) -> OcrResult:
+        """One document, one POST, polled to completion. The single billed call."""
+        import requests
 
         params = {"api-version": settings.AZURE_DOC_INTELLIGENCE_API_VERSION}
         if content_bytes[:4] == b"%PDF":
@@ -228,8 +692,10 @@ class AzureDocumentIntelligenceClient(DocumentIntelligenceClient):
             # only meaningful — and only accepted without complaint — for PDFs.
             params["pages"] = f"1-{settings.OCR_MAX_PAGES}"
 
+        url = f"{self.endpoint}/documentintelligence/documentModels/{self.model}:analyze"
+        self._pace()
         response = requests.post(
-            f"{self.endpoint}/documentintelligence/documentModels/{self.model}:analyze",
+            url,
             params=params,
             headers={
                 "Ocp-Apim-Subscription-Key": self.api_key,
@@ -238,24 +704,62 @@ class AzureDocumentIntelligenceClient(DocumentIntelligenceClient):
             data=content_bytes,
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        _raise_for_status(response, url)
         operation_url = response.headers.get("operation-location")
         if not operation_url:
             raise RuntimeError("Document Intelligence accepted the document but returned no "
                                "operation-location to poll")
         return _ocr_result_from_docint(self._poll(operation_url))
 
+    @staticmethod
+    def _pace() -> None:
+        """Hold the floor between submissions so a serial loop cannot outrun the tier.
+
+        The calls were never concurrent — and still overran the quota, because a loop over an
+        email's inline images fires them back to back and each analysis costs a POST plus several
+        poll GETs against the same allowance. Rate limiting was 77% of every OCR failure recorded.
+        """
+        gap = settings.OCR_MIN_SECONDS_BETWEEN_CALLS
+        if gap <= 0:
+            return
+        waited = time.monotonic() - _LAST_CALL_AT[0]
+        if 0 <= waited < gap:
+            time.sleep(gap - waited)
+        _LAST_CALL_AT[0] = time.monotonic()
+
     def _poll(self, operation_url: str) -> dict:
+        """Wait for the result, retrying the *same* operation rather than re-submitting.
+
+        This is where twelve analyses were lost. A 429 on the poll used to propagate out of
+        `analyze`, and the retry wrapper answered it by POSTing the whole document again — so
+        Premier was billed for an analysis Azure had already accepted, the finished result was
+        abandoned at a URL nobody went back to, and the load landed on the endpoint that had just
+        asked us to slow down.
+
+        The result is sitting at `operation_url` either way. Being throttled while collecting it
+        is a reason to wait, never a reason to start again.
+        """
         import requests
 
         deadline = time.monotonic() + settings.AZURE_DOC_INTELLIGENCE_POLL_TIMEOUT_SECONDS
+        throttled = 0
         while True:
-            result = requests.get(
-                operation_url,
-                headers={"Ocp-Apim-Subscription-Key": self.api_key},
-                timeout=self.timeout,
-            )
-            result.raise_for_status()
+            try:
+                result = requests.get(
+                    operation_url,
+                    headers={"Ocp-Apim-Subscription-Key": self.api_key},
+                    timeout=self.timeout,
+                )
+                _raise_for_status(result, operation_url)
+            except AzureOcrError as exc:
+                if not _is_retryable(exc) or time.monotonic() >= deadline:
+                    raise
+                throttled += 1
+                wait = _retry_after_seconds(exc, throttled)
+                _log(f"poll throttled ({exc}); waiting {wait:.1f}s for the result already paid for")
+                time.sleep(wait)
+                continue
+
             payload = result.json()
             status = (payload.get("status") or "").lower()
             if status == "succeeded":
@@ -269,6 +773,20 @@ class AzureDocumentIntelligenceClient(DocumentIntelligenceClient):
                     f"{settings.AZURE_DOC_INTELLIGENCE_POLL_TIMEOUT_SECONDS}s"
                 )
             time.sleep(settings.AZURE_DOC_INTELLIGENCE_POLL_SECONDS)
+
+
+SELECTION_MARK_RE = re.compile(r":(?:un)?selected:", re.IGNORECASE)
+"""Document Intelligence renders every checkbox as a `:selected:` / `:unselected:` token,
+inline in the cell beside it. On a receiving report the tick next to an item lands inside the
+item, and `ST650` reached the store as the spec code `ST650
+:selected:` — a value that
+matches no purchase order line and never will. It carries nothing the record fields model, so
+it comes out before anything reads them."""
+
+
+def strip_selection_marks(text: str) -> str:
+    """`text` with the checkbox tokens removed and the whitespace they left tidied."""
+    return " ".join(SELECTION_MARK_RE.sub(" ", text or "").split())
 
 
 def _ocr_result_from_docint(analyze_result: dict) -> OcrResult:
@@ -298,7 +816,9 @@ def _ocr_result_from_docint(analyze_result: dict) -> OcrResult:
     mean = sum(confidences) / len(confidences) if confidences else 0.5
     confidence = min(mean, settings.AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP)
 
-    return OcrResult(tables=[t for t in tables if t], raw_text=raw_text, confidence=confidence)
+    return OcrResult(tables=[t for t in tables if t], raw_text=raw_text, confidence=confidence,
+                     # What Azure says it read, which is what Azure bills for.
+                     pages=max(1, len(pages)))
 
 
 def _grid_from_docint_table(table: dict) -> List[List[str]]:
@@ -317,7 +837,7 @@ def _grid_from_docint_table(table: dict) -> List[List[str]]:
         row, column = cell.get("rowIndex"), cell.get("columnIndex")
         if row is None or column is None or row >= rows or column >= columns:
             continue
-        grid[row][column] = (cell.get("content") or "").strip()
+        grid[row][column] = strip_selection_marks(cell.get("content") or "")
     return grid
 
 
@@ -362,16 +882,31 @@ def build_client(preference: Optional[str] = None) -> DocumentIntelligenceClient
     return MockDocumentIntelligenceClient()
 
 
-def _empty_ocr_failure_record(source: ExtractionSource) -> ExtractedRecord:
-    return ExtractedRecord(
-        source_email_id=source.source_email_id,
-        po_number="", shipment_number=None, spec_code=None, parent_spec_code=None,
-        sub_spec_suffix=None, item_description=None, vendor_name=None, carrier_name=None,
-        tracking_number=None, quantity_received=None, unit_of_measure=None, pod_stated_date=None,
-        email_date=source.email_date, delivery_location=None,
-        comments="OCR service unavailable", extraction_source="ocr",
-        extraction_confidence=0.0, raw_snippet="OCR service unavailable",
-    )
+class OcrServiceUnavailable(Exception):
+    """The OCR service could not be reached or refused us. The file is fine.
+
+    Raised rather than swallowed, and raised rather than turned into a record, because both of
+    those were tried and both hid an outage. Until 2026-08-25 `analyze_with_retry` returned `None`
+    and `OcrAdapter.extract` answered with a one-element placeholder record; `dispatch`'s
+    `if records:` found that truthy and wrote `disposition='extracted'`, so every image that failed
+    during an Azure 401 outage was recorded as a successful extraction. Nothing could then name
+    what to re-run.
+
+    Returning `[]` instead would only have downgraded the lie to `empty` ("we read it and it held
+    nothing"). An exception is the one answer `dispatch` already knows how to record faithfully.
+
+    `service` and `detail` are carried so the ledger row says *which* dependency failed and why —
+    that is what a person reads before deciding whether re-running is worth anything yet.
+    """
+
+    def __init__(self, service: str, detail: str, error_type: str = ""):
+        self.service = service
+        self.detail = detail
+        self.error_type = error_type or "OcrServiceUnavailable"
+        """What actually went wrong, for the ledger's queryable column — `TooManyRequests`,
+        `InvalidContentLength`. Defaults to this class's own name, which is what every row used to
+        say regardless of cause."""
+        super().__init__(f"{service}: {detail}")
 
 
 class OcrAdapter(ExtractionAdapter):
@@ -397,47 +932,158 @@ class OcrAdapter(ExtractionAdapter):
         return False
 
     def extract(self, source: ExtractionSource) -> List[ExtractedRecord]:
+        """Records from the OCR read. Raises `OcrServiceUnavailable` if the service would not
+        answer — deliberately, so the ledger records a failure rather than a fabricated success."""
         result = self._analyze_with_retry(source.content_bytes, source.source_email_id)
-        if result is None:
-            return [_empty_ocr_failure_record(source)]
         return records_from_ocr_result(source, result, extraction_source="ocr")
 
-    def _analyze_with_retry(self, content_bytes: bytes, email_id: str) -> Optional[OcrResult]:
+    def _analyze_with_retry(self, content_bytes: bytes, email_id: str) -> OcrResult:
         return analyze_with_retry(self.client, content_bytes, email_id)
 
 
 def analyze_with_retry(
     client: DocumentIntelligenceClient, content_bytes: bytes, email_id: str
-) -> Optional[OcrResult]:
+) -> OcrResult:
     """Shared retry wrapper so any adapter that needs to OCR embedded image content (not just
-    OcrAdapter's own direct attachments — see DocxAdapter) gets the same retry/give-up behavior."""
+    OcrAdapter's own direct attachments — see DocxAdapter) gets the same retry/give-up behavior.
+
+    **Raises `OcrServiceUnavailable` when every attempt fails.** It used to return `None` and log
+    to stdout, which meant an outage left no trace anywhere a query could reach — see that
+    exception's docstring. The caller is expected to let it propagate to `dispatch`, which records
+    it against the attachment.
+    """
     attempts = settings.AZURE_OCR_RETRY_COUNT + 1
     for attempt in range(attempts):
         try:
             return client.analyze(content_bytes)
         except Exception as e:
-            if attempt < attempts - 1:
-                time.sleep(settings.AZURE_OCR_RETRY_BACKOFF_SECONDS)
+            # The *underlying* client, not whatever is wrapping it. `BudgetedOcrClient` sits in
+            # front of the real one, and a ledger row reading "BudgetedOcrClient unavailable" names
+            # our own spend guard rather than the dependency that actually failed.
+            service = type(getattr(client, "inner", client)).__name__
+            last = attempt >= attempts - 1
+
+            # A refusal that a second identical request cannot change. Re-sending 4.67 MB to be
+            # told "the input image is too large" a second time costs an attempt, a paid call and
+            # the wait between them, and teaches nobody anything.
+            if not _is_retryable(e):
+                _log(f"OCR refused {email_id} and will not be retried: {e}")
+                raise OcrServiceUnavailable(service, _detail_for(e), _error_type_for(e)) from e
+
+            if not last:
+                wait = _retry_after_seconds(e, attempt)
+                _log(f"OCR attempt {attempt + 1}/{attempts} for {email_id} failed ({e}); "
+                     f"retrying in {wait:.1f}s")
+                time.sleep(wait)
                 continue
+
             _log(f"OCR service unavailable for {email_id} after {attempts} attempts: {e}")
-            return None
-    return None
+            raise OcrServiceUnavailable(service, _detail_for(e), _error_type_for(e)) from e
+    raise OcrServiceUnavailable(
+        type(getattr(client, "inner", client)).__name__, "no attempt was made")
+
+
+def _detail_for(exc: Exception) -> str:
+    """The sentence that lands on the ledger row.
+
+    For an `AzureOcrError` that is Azure's own words — "InvalidContentLength: The input image is
+    too large." — instead of the status line `raise_for_status` used to produce, which named the
+    URL and nothing about what was wrong with the request.
+    """
+    if isinstance(exc, AzureOcrError):
+        return str(exc)[:300]
+    return f"{type(exc).__name__}: {exc}"[:300]
+
+
+_STATUS_NAMES = {400: "BadRequest", 401: "Unauthorized", 403: "Forbidden", 413: "PayloadTooLarge",
+                 415: "UnsupportedMediaType", 429: "TooManyRequests", 500: "ServerError",
+                 503: "ServiceUnavailable"}
+
+
+def _error_type_for(exc: Exception) -> str:
+    """A short, queryable name for what went wrong."""
+    if isinstance(exc, AzureOcrError):
+        return exc.code or _STATUS_NAMES.get(exc.status) or f"HTTP{exc.status}"
+    return type(exc).__name__
+
+
+_USE_OCR_CONFIDENCE_CAP = object()
 
 
 def records_from_ocr_result(
-    source: ExtractionSource, result: OcrResult, extraction_source: str = "ocr"
+    source: ExtractionSource, result: OcrResult, extraction_source: str = "ocr",
+    confidence_cap=_USE_OCR_CONFIDENCE_CAP,
 ) -> List[ExtractedRecord]:
     """Turns one OcrResult into ExtractedRecords — shared so DocxAdapter's embedded-image path
-    gets identical table/fallback/confidence-cap handling to OcrAdapter's own attachment path."""
+    gets identical table/fallback/confidence-cap handling to OcrAdapter's own attachment path.
+
+    `confidence_cap` is the OCR ceiling by default, because every caller in the pipeline is
+    reading a picture of a document and no such read deserves full confidence. `None` lifts it,
+    for a caller replaying tables that came from a text layer rather than from a reader — see
+    `tools/replay_parse.py`. Passing it explicitly keeps that a decision at the call site instead
+    of something inferred from a label.
+    """
+    # Everything the reader saw, kept before this function narrows it to record fields. OCR is the
+    # path where the loss was worst: Azure returns clean table structure and only the tables whose
+    # headers `map_headers` recognises survive the loop below. See `ExtractionSource.parsed_text`.
+    source.parsed_text = result.raw_text or ""
+    source.parsed_tables = [[[str(c) for c in row] for row in table] for table in result.tables]
+
+    # Read the form's labelled bands once, before the item grid, exactly as `PdfAdapter` does.
+    # A receiving report states the delivery date, who signed for it, the carrier and the tracking
+    # number **once**, above the items — so `build_record_from_row` never sees any of it. Skipping
+    # this was why every OCR record came out missing `pod_stated_date`, one of the five fields
+    # `completeness` requires, while `Date Received | 8/14/26` sat two tables up the same page.
+    document_fields = harvest_document_fields(result.tables)
+
     records = []
     for table in result.tables:
         if not table or len(table) < 2:
             continue
-        column_map = map_headers(table[0])
-        if not column_map:
+        # `find_header_row` rather than `map_headers(table[0])`, for two reasons. A form's item
+        # header is often not row 0, and — the sharper one — it applies `is_usable_column_map`,
+        # which demands an identity column plus one more. Row 0 alone accepted a freight bill's
+        # `Qty | Pkg | HM | Description | Weight` band and staged "2 PLT RACK MOUNTS AND
+        # ACCESSORIES" as goods received, alongside a liftgate charge and a prepaid total.
+        located = find_header_row(table)
+        if located is None:
             continue
-        for row in table[1:]:
-            records.append(build_record_from_row(source, row, column_map, extraction_source))
+        header_index, column_map = located
+        # Asked of the whole grid before any row is read — see `po_column_is_corroborated`. A scan
+        # is where this matters most: OCR is the reason a mirrored purchase order can arrive with a
+        # mangled digit, and blanking the cell hands the line to whichever order's event runs.
+        po_column_verified = po_column_is_corroborated(
+            [[strip_selection_marks(c) for c in r] for r in table[header_index + 1:]],
+            column_map, source.known_po_numbers)
+        for row in table[header_index + 1:]:
+            # A total, an address block or a label row is not an item, whatever it contains —
+            # `Shipping Address: … PO 900101 …` reads as a purchase order to the regex fallback
+            # and would otherwise survive the "names a PO or a spec" guard below.
+            if not is_item_row(row):
+                continue
+            # Stripped again here, not only in `_grid_from_docint_table`, so a grid that reached
+            # us any other way — a parse replayed out of `parsed_documents`, a fixture, a client
+            # that does its own flattening — is cleaned too. A tick fused onto a spec code splits
+            # one delivered item into two records that no longer look like each other.
+            cells = [strip_selection_marks(cell) for cell in row]
+            record = build_record_from_row(source, cells, column_map, extraction_source,
+                                           po_column_verified=po_column_verified)
+            # A grid runs on past its last item into totals and continuation lines. A record
+            # naming neither a purchase order nor a spec identifies nothing and can never become
+            # a receipt, so it is dropped here — inside the adapter, before the delivery event
+            # stamps its own PO onto it and makes the junk look attributable.
+            if not (record.po_number or record.spec_code
+                    or kept_despite_a_misread_spec(record, cells, column_map)):
+                continue
+            # A scan adds a failure mode a clean PDF does not have: the reader returns the
+            # *margin* as rows of the grid. Handwritten queries beside the Atlas item table came
+            # back as three rows reading `PGR-905-EQ ?`, `? STE-901-EQ?` and `PO#212749.` — each
+            # one a spec-shaped cell with no quantity and no description beside it, and each one
+            # staged as a delivered line against a real purchase order. A row that says neither
+            # how many nor what is not a line item.
+            if not states_a_line_item(record):
+                continue
+            records.append(apply_document_fields(record, document_fields))
 
     if not records and result.raw_text:
         # A photographed POD or BOL is a labelled form, not a table, so it never survives the
@@ -467,12 +1113,16 @@ def records_from_ocr_result(
         text_source = ExtractionSource(
             source_email_id=source.source_email_id, email_date=source.email_date,
             source_type="body", body_text=strip_print_chrome(result.raw_text),
+            ledger_id=source.ledger_id, known_po_numbers=source.known_po_numbers,
         )
         records = FreetextAdapter().extract(text_source)
         for r in records:
             r.extraction_source = extraction_source
 
-    for r in records:
-        r.extraction_confidence = min(r.extraction_confidence, settings.AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP)
+    if confidence_cap is _USE_OCR_CONFIDENCE_CAP:
+        confidence_cap = settings.AZURE_DOC_INTELLIGENCE_CONFIDENCE_CAP
+    if confidence_cap is not None:
+        for r in records:
+            r.extraction_confidence = min(r.extraction_confidence, confidence_cap)
 
     return records

@@ -84,7 +84,7 @@ def test_weak_description_does_not_earn_a_signal(record_factory, line_factory):
 def test_candidates_are_ranked_best_first(record_factory, line_factory):
     exact = line_factory(line_id=1)
     same_po_only = line_factory(line_id=2, line_number=2, spec_code="STE-402-UP",
-                                description="Steelcase 402 Upper Shelf Unit")
+                                description="Meridian 402 Upper Shelf Unit")
 
     ranked = reconcile.rank_candidates(record_factory(), [same_po_only, exact])
 
@@ -101,7 +101,7 @@ def test_candidates_are_ranked_best_first(record_factory, line_factory):
 def test_two_lines_sharing_a_spec_are_not_silently_guessed(record_factory, line_factory):
     """The bug this ladder exists for.
 
-    PO 207514 carries 23 signs, every one of them spec `LOB-900-SI`. An email saying "Exit" does
+    PO 907514 carries 23 signs, every one of them spec `LOB-900-SI`. An email saying "Exit" does
     not identify one. The old scorer sorted by description and returned the top row with no tie
     check, so the record was resolved by whichever line happened to score highest — and nothing
     recorded that it had been a coin toss.
@@ -122,7 +122,7 @@ def test_two_lines_sharing_a_spec_are_not_silently_guessed(record_factory, line_
 
 
 def test_vendor_code_resolves_lines_that_share_a_spec(record_factory, line_factory):
-    """PO 207249: 21 fitness items, all `FIT-900-FIT`, told apart only by the vendor's own code."""
+    """PO 907249: 21 fitness items, all `FIT-900-FIT`, told apart only by the vendor's own code."""
     chosen = line_factory(2, line_number=6, description="TECHNOGYM BENCH CODE: DGY100LBNRNR20")
     match = reconcile.compute_match(
         1, record_factory(item_description="TECHNOGYM BENCH CODE: DGY100LBNRNR20"),
@@ -135,7 +135,7 @@ def test_vendor_code_resolves_lines_that_share_a_spec(record_factory, line_facto
 
 
 def test_size_separates_items_a_token_set_score_calls_identical(record_factory, line_factory):
-    """Four medicine balls on PO 207249 differ only by weight, and a description score cannot
+    """Four medicine balls on PO 907249 differ only by weight, and a description score cannot
     separate them: measured on the corpus the right line scored 100 and the wrong one 94.1 — a
     gap of 5.9, well inside `DESC_MATCH_GAP`. Scoring alone would refer all four to a person."""
     assert fuzz.token_set_ratio("Medicine Ball 4 Kg", "Medicine Ball 11 Kg") > 90
@@ -154,7 +154,7 @@ def test_size_separates_items_a_token_set_score_calls_identical(record_factory, 
 
 
 def test_unit_separates_two_lines_with_the_same_spec_and_description(record_factory, line_factory):
-    """PO 210635 orders `GR-350c-WTF` twice — 84 YD and 1 EA. The unit is all there is."""
+    """PO 910635 orders `GR-350c-WTF` twice — 84 YD and 1 EA. The unit is all there is."""
     match = reconcile.compute_match(
         1, record_factory(item_description="Sheer Fabric", unit_of_measure="YD",
                           quantity_received=78.0),
@@ -169,7 +169,7 @@ def test_unit_separates_two_lines_with_the_same_spec_and_description(record_fact
 
 
 def test_a_labour_line_is_not_offered_as_a_candidate_for_goods(record_factory, line_factory):
-    """PO 207249 line 0002 is "Delivery & Installation" carrying `AccountCategory: SUB-FDP`, so it
+    """PO 907249 line 0002 is "Delivery & Installation" carrying `AccountCategory: SUB-FDP`, so it
     survives the account-category screen in `connectors.spitfire.is_tax_line`. A treadmill cannot
     be received against labour, and offering it invites a wrong match on a PO whose specs repeat.
     """
@@ -188,7 +188,7 @@ def test_a_labour_line_is_not_offered_as_a_candidate_for_goods(record_factory, l
 def test_but_a_record_may_name_a_labour_line_by_its_spec(record_factory, line_factory):
     """The screen must not block a delivery Premier really does receive.
 
-    PO 206993 line 0003 *is* `Installation`, its spec is `FIT-902b-EQ`, and the corpus carries a
+    PO 906993 line 0003 *is* `Installation`, its spec is `FIT-902b-EQ`, and the corpus carries a
     record for exactly that spec reading "Installation of Water Dispenser". An exact spec match is
     the record naming the line on purpose and outranks the screen.
     """
@@ -207,7 +207,7 @@ def test_a_line_on_another_purchase_order_is_not_a_weak_candidate_but_no_candida
         record_factory, line_factory):
     """A Spitfire receipt is a child of exactly one PO, so the PO number is a gate, not a signal."""
     resolution = reconcile.resolve_line(
-        record_factory(po_number="212456"), [line_factory(1, po_number="999111")])
+        record_factory(po_number="912456"), [line_factory(1, po_number="999111")])
 
     assert resolution.chosen is None
     assert resolution.step == "no lines on that purchase order"

@@ -60,12 +60,12 @@ def ours():
     """Our workbook, built from one purchase order — enough to exercise every row type."""
     report = receipt_log.Report(
         purchase_orders=[receipt_log.PurchaseOrder(
-            po_number="208491", vendor="Light Annex", title="PO 208491 Lighting",
+            po_number="908491", vendor="Light Annex", title="PO 908491 Lighting",
             lines=[receipt_log.Line(
                 line_number=300, spec="STE-402-LT-B", description="BASE, Floor Lamp 2",
                 received=1.0, uom="EA",
-                receipts=[receipt_log.Receipt(reference="239475", date="2025-10-09",
-                                              quantity=1.0, receiver="Miguel C.")],
+                receipts=[receipt_log.Receipt(reference="939475", date="2025-10-09",
+                                              quantity=1.0, receiver="Jordan T.")],
             )],
         )],
         generated_at="2026-08-11 12:00",
@@ -135,9 +135,9 @@ def test_the_columns_we_cannot_know_are_blank_not_zero(ours):
 
 
 def test_a_receipt_row_carries_the_reference_date_quantity_and_receiver(ours):
-    assert ours.cell(11, 4).value == "239475"
+    assert ours.cell(11, 4).value == "939475"
     assert ours.cell(11, 7).value == 1.0
-    assert ours.cell(11, 11).value == "Miguel C."
+    assert ours.cell(11, 11).value == "Jordan T."
 
 
 def test_receipt_dates_use_the_reference_number_format(theirs, ours):
@@ -151,7 +151,7 @@ def test_net_appears_once_order_qty_does():
     """The whole point of deriving Net rather than storing it: no edit to this module is needed on
     the day the Spitfire read lands."""
     report = receipt_log.Report(purchase_orders=[receipt_log.PurchaseOrder(
-        po_number="208491", vendor="Light Annex", title="PO 208491 Lighting",
+        po_number="908491", vendor="Light Annex", title="PO 908491 Lighting",
         lines=[receipt_log.Line(line_number=300, spec="SP", description="d",
                                 received=2.0, order_qty=5.0)],
     )])

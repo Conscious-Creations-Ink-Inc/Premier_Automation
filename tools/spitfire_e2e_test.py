@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from config import settings
+from connectors import spitfire_auth
 
 REPORTS_DIR = settings.BASE_DIR.parent / "dev_reports"
 
@@ -54,11 +55,11 @@ TEST_MARKER = "CC-TEST"
 """Every artefact carries this. A person opening one in the Spitfire UI with no context should
 know inside a second that it is ours and not real."""
 
-# PO 206577 line 0002 (LT-13) is ordered 11 / received 8, so three units are genuinely
+# PO 906577 line 0002 (LT-13) is ordered 11 / received 8, so three units are genuinely
 # outstanding. A partially-received line is the honest test: receiving against a line that is
 # already complete would exercise the over-receipt path and prove nothing about the normal one.
-DEFAULT_PROJECT = "MRC024PB100003"
-DEFAULT_PO = "206577"
+DEFAULT_PROJECT = "PRJ001PB100003"
+DEFAULT_PO = "906577"
 
 _HTML_TAG = re.compile(r"<[^>]+>")
 
@@ -379,7 +380,7 @@ def link_pay_request(h: Harness, run: Run, project: str, po_number: str, receipt
         file link  ->  DocKey = <fileKey>,  AttachedDocMaster = null
         doc  link  ->  DocKey = null,       AttachedDocMaster = <DocMasterKey>
 
-    Receipt 209330 has three doc links (its PO and two pay requests) and one file link (the POD),
+    Receipt 909330 has three doc links (its PO and two pay requests) and one file link (the POD),
     all in the same collection, distinguished only by which of those two fields is populated.
     """
     s = run.step("11", "find and link the pay request")
@@ -420,7 +421,7 @@ def route_to_self_and_dispatch(h: Harness, run: Run, receipt_key: str) -> bool:
     setup = run.step("12a", "remove every routee who is not us")
 
     # Creating a receipt makes Spitfire apply its *configured* approval chain, so the document
-    # arrives with a route already on it — on PO 206577 that was six entries, three of them real
+    # arrives with a route already on it — on PO 906577 that was six entries, three of them real
     # Premier staff at sequence 10. `DELETE /route` takes a **body**: the RouteIDs to remove.
     # Called without one it deletes nothing and returns 200, which is exactly how the first run of
     # this script ended up with a route it thought it had cleared.
@@ -501,10 +502,9 @@ def main(argv=None) -> int:
                    help="required to create anything in Spitfire")
     args = p.parse_args(argv)
 
-    cookie = settings.SPITFIRE_SESSION_COOKIE
+    cookie = spitfire_auth.auth_ticket_value(settings.SPITFIRE_BASE_URL)
     if not cookie:
-        print("SPITFIRE_SESSION_COOKIE is not set. Capture the sfPMSAuth cookie from the browser "
-              "(F12 -> Application -> Cookies) and set it in .env.", file=sys.stderr)
+        print("No Spitfire credentials: set SPITFIRE_UID and SPITFIRE_PW in .env.", file=sys.stderr)
         return 2
 
     write = bool(args.i_understand_this_writes) and not args.dry_run

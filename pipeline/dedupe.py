@@ -57,9 +57,9 @@ def _norm(text: Any) -> str:
 def normalize_subject(subject: Any) -> str:
     """Strip the forward and reply markers, repeatedly, then normalise.
 
-    `Fwd: FW: RE: 239260 - Inbound Notification` and `239260 - Inbound Notification` are the same
+    `Fwd: FW: RE: 939260 - Inbound Notification` and `939260 - Inbound Notification` are the same
     notification seen from different distances. Everything in this corpus arrives forwarded from
-    `premierpm.com`, often twice, so a fingerprint that kept the markers would call two copies of
+    `example-pm.test`, often twice, so a fingerprint that kept the markers would call two copies of
     one message different — which is precisely the case this exists to catch.
     """
     text = str(subject or "")
@@ -87,7 +87,7 @@ def fingerprint(*, subject: Any, origin_sender: Any, origin_sent_at: Any,
     distinguishing two genuinely different notifications:
 
     * the subject, with forward markers stripped — it carries the inbound number and the POs
-    * `origin_sender`, not `sender`: everything arrives from `premierpm.com`, so the envelope sender
+    * `origin_sender`, not `sender`: everything arrives from `example-pm.test`, so the envelope sender
       is the same for nearly all of it and would contribute nothing
     * `origin_sent_at`, not `email_date` — twelve of the fourteen corpus files were forwarded by one
       person on one day, so the envelope date is that day for nearly all of them and cannot separate
@@ -184,6 +184,139 @@ def find_by_fingerprint(conn: sqlite3.Connection, value: str,
     return None
 
 
+# --- 2. the same delivery, described by two messages --------------------------------------------
+
+SHIPMENT_RUNG = "shipment"
+NOTICE_RUNG = "notice"
+POD_RUNG = "pod"
+DATE_RUNG = "date"
+MESSAGE_RUNG = "message"
+
+IDENTIFYING_RUNGS = (SHIPMENT_RUNG, NOTICE_RUNG, POD_RUNG)
+"""Rungs that name *which* delivery. Two of these that differ are two different deliveries.
+
+A shipment number, a notice number and a proof-of-delivery hash are all identifiers issued by
+somebody about one physical delivery. A date is not: two deliveries can share one, and one delivery
+is dated by some of the mail about it and not by the rest.
+"""
+
+FLOATING_RUNGS = (DATE_RUNG, MESSAGE_RUNG)
+"""Rungs that describe a delivery without identifying it — corroboration, not a name.
+
+A property reply saying *"We received the items for PO 913500 today"* is evidence about a delivery
+and cannot say which. Treating it as its own delivery orphans it from the Inbound notice it belongs
+to; treating it as merging with everything on the PO is the nullable-key bug all over again. So it
+*floats*: it accumulates under its own ref, and is absorbed by an identified delivery on the same
+purchase order when one releases. If none ever does, it releases on its own through the grace
+sweep, still separated from any other floating evidence by its date.
+"""
+
+CERTAIN_RUNGS = IDENTIFYING_RUNGS + (DATE_RUNG,)
+"""Rungs resolved from something the mail states, for reporting rather than for joining.
+
+`MESSAGE_RUNG` is deliberately absent: falling through to the message id does not identify a
+delivery, it merely refuses to merge two messages that might be one. That is the honest answer but
+it is a guess, and Stage 2 flags it rather than presenting it as a join.
+"""
+
+
+def delivery_ref(*, shipment_number: Any = None, notification_number: Any = None,
+                 pod_sha256: Any = None, pod_stated_date: Any = None,
+                 email_id: Any = None) -> "tuple[str, str]":
+    """Which physical delivery a message is about, and how confidently we know.
+
+    Returns `(ref, rung)`. The ref is scoped to a purchase order by its caller, so it only has to
+    separate two deliveries *on the same PO*.
+
+    Five rungs, most trustworthy first. Every one of them is something a real message in Premier's
+    mailbox actually carries, and the order is not preference — it is what each one can prove:
+
+    1. **The shipment number.** The A↔B join. The Inbound and Delivered halves of one delivery carry
+       *different* notice numbers (939260 and 90009) and the *same* shipment number, so this has to
+       stay first or the pair splits and one truck becomes two receivers — the failure that ended
+       Premier's previous attempt. Only five of thirteen live delivery mails state one.
+    2. **The notification number.** The notice's own reference. `TriagedEmail.notification_number`
+       has carried it since triage was written and its docstring already says this is "what lets
+       Stage 2 see them as one event" — it simply was never wired up. It is what recognises notice
+       939475, which arrived twice under two different message ids and carries no attachment at all.
+    3. **The proof of delivery's content hash.** Different paperwork, different delivery. Available
+       here because `evidence.gather` parses every attachment *before* triage, so the ledger's
+       `is_pod` verdict is already written by the time Stage 2 runs. Handles the corpus's two
+       byte-identical PODs saved under different filenames — same hash, one delivery.
+    4. **The stated delivery date.** No proof to compare, but a date is still something the message
+       asserts. Two deliveries on one PO on one day with no shipment, notice or POD do merge here;
+       that is the accepted cost of not splitting every re-forward into a new receiver.
+    5. **The message id**, which identifies nothing — see `CERTAIN_RUNGS`.
+
+    The rung name is part of the value, so `90009` as a shipment number and `90009` as a notice
+    number cannot be mistaken for each other.
+    """
+    for rung, value in ((SHIPMENT_RUNG, shipment_number),
+                        (NOTICE_RUNG, notification_number),
+                        (POD_RUNG, pod_sha256),
+                        (DATE_RUNG, pod_stated_date),
+                        (MESSAGE_RUNG, email_id)):
+        text = _norm(value)
+        if text:
+            return f"{rung}:{text}", rung
+    # Nothing at all to go on — not even a message id. Its own ref rather than an empty string,
+    # because an empty key would collapse every such message on a PO into one delivery, which is
+    # the exact failure this ladder exists to prevent.
+    return f"{MESSAGE_RUNG}:", MESSAGE_RUNG
+
+
+def pod_sha_for_email(conn: sqlite3.Connection, email_id: str) -> str:
+    """The hash of this message's proof of delivery, or "" if nothing on it reads as one.
+
+    Lowest ordinal wins when a message carries several, so the answer does not depend on row order.
+    Inline attachments are excluded for the same reason they are excluded from `hashes_for_email`:
+    a signature logo is not proof of anything.
+    """
+    prior = conn.row_factory
+    conn.row_factory = None
+    try:
+        row = conn.execute(
+            "SELECT sha256 FROM attachment_ledger "
+            "WHERE email_id = ? AND COALESCE(is_pod, 0) = 1 AND COALESCE(is_inline, 0) = 0 "
+            "AND COALESCE(sha256,'') <> '' ORDER BY depth, ordinal LIMIT 1",
+            (email_id,)).fetchone()
+    finally:
+        conn.row_factory = prior
+    return str(row[0]) if row else ""
+
+
+def pod_date_for_email(conn: sqlite3.Connection, email_id: str) -> str:
+    """The delivery date this message's proof asserts, for rung 4.
+
+    Read off the ledger verdict `stage3_extract` already recorded rather than re-parsing anything —
+    the same source `record_completion` uses, so the date that identifies a delivery and the date
+    that ends up on its receipt cannot disagree.
+    """
+    prior = conn.row_factory
+    conn.row_factory = None
+    try:
+        row = conn.execute(
+            "SELECT pod_delivery_date FROM attachment_ledger "
+            "WHERE email_id = ? AND COALESCE(pod_delivery_date,'') <> '' "
+            "ORDER BY depth, ordinal LIMIT 1",
+            (email_id,)).fetchone()
+    finally:
+        conn.row_factory = prior
+    return str(row[0]) if row else ""
+
+
+def ref_for_email(conn: sqlite3.Connection, email_id: str, *,
+                  shipment_number: Any = None,
+                  notification_number: Any = None) -> "tuple[str, str]":
+    """`delivery_ref` for one message, reading rungs 3 and 4 off the ledger."""
+    return delivery_ref(
+        shipment_number=shipment_number,
+        notification_number=notification_number,
+        pod_sha256=pod_sha_for_email(conn, email_id),
+        pod_stated_date=pod_date_for_email(conn, email_id),
+        email_id=email_id)
+
+
 # --- 3. the same delivery, staged as two records ------------------------------------------------
 
 def delivery_key(*, po_number: Any, line_number: Any = None, spec_code: Any = None,
@@ -197,7 +330,7 @@ def delivery_key(*, po_number: Any, line_number: Any = None, spec_code: Any = No
     the seventeen records that happen to carry a line.
 
     The quantity is in the key on purpose. **Two deliveries against one PO line are ordinary** —
-    PO 208491 line 300 took 11 pieces on 1 October and 1 more on the 9th — so a key without it
+    PO 908491 line 300 took 11 pieces on 1 October and 1 more on the 9th — so a key without it
     would merge two genuine partial deliveries into one and lose the second.
     """
     return _digest(_norm(po_number),
@@ -229,16 +362,35 @@ def key_for_row(row: Any, *, pod_sha256: str = "") -> str:
         pod_sha256=pod_sha256)
 
 
+BLOCKING_STATUSES = ("pending", "matched", "pushed_to_spitfire")
+"""The statuses a record has to be in for it to stand in the way of staging the same delivery again.
+
+`failed` is deliberately absent. A record that failed is not a record of anything — it is a row
+saying an attempt did not work — and letting it block meant a delivery that failed once could never
+be staged again, which is the opposite of what a failure should cost. The same reasoning is already
+in `post_ledger.BLOCKING`, which excludes `FAILED` and `FLAGGED` for exactly this reason: a guard
+against duplicates must not become a guard against retries.
+"""
+
+
 def find_by_delivery_key(conn: sqlite3.Connection, key: str,
                          exclude_id: Optional[int] = None) -> Sequence[sqlite3.Row]:
-    """Records already staged for this same delivery, oldest first."""
+    """Records already staged for this same delivery, oldest first.
+
+    Only records still standing — see `BLOCKING_STATUSES`. Without that filter this scanned the
+    whole table, so a `failed` row went on blocking a fresh staging of the delivery it failed to
+    record.
+    """
     if not key:
         return []
     prior = conn.row_factory
     conn.row_factory = sqlite3.Row
     try:
+        placeholders = ", ".join("?" * len(BLOCKING_STATUSES))
         rows = conn.execute(
-            "SELECT * FROM extracted_records WHERE delivery_key = ? ORDER BY id", (key,)).fetchall()
+            f"SELECT * FROM extracted_records WHERE delivery_key = ? "
+            f"AND status IN ({placeholders}) ORDER BY id",
+            (key, *BLOCKING_STATUSES)).fetchall()
     finally:
         conn.row_factory = prior
     return [r for r in rows if exclude_id is None or int(r["id"]) != int(exclude_id)]

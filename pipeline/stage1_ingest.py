@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from config import settings
 from connectors.mailbox import Mailbox
-from pipeline import state_db
+from pipeline import mail_arrivals, state_db
 from pipeline.models import RawEmail
 
 
@@ -67,4 +67,63 @@ def fetch_new_emails(mailbox: Mailbox, conn=None) -> List[RawEmail]:
             continue
         this_batch.add(email.email_id)
         fresh.append(email)
+
+    for email in _recover_unreachable(mailbox, conn, skip=seen | this_batch):
+        if email.email_id in this_batch or state_db.has_seen(conn, email.email_id):
+            continue
+        this_batch.add(email.email_id)
+        fresh.append(email)
     return fresh
+
+
+def _recover_unreachable(mailbox: Mailbox, conn, skip: set) -> List[RawEmail]:
+    """Mail the watermark has left behind, fetched by id instead of by date.
+
+    The listing above asks the server only for mail newer than the last clean run. That is a cost
+    optimisation, and it turned into silent data loss: a message the pipeline never settled, but
+    whose `receivedDateTime` now sits behind the window, cannot appear in a listing again however
+    many times the run repeats.
+
+    Measured on Premier's live store on 2026-09-03: **24 messages** unreadable this way, reaching
+    back to 2026-08-31, one of them `URGENT Re: Dorado Beach PO 214336`. The watermark was
+    12:04:44Z, the window opened at 11:04:44Z, and every one of the 24 predated it. All 24 were
+    sitting in `mail_arrivals` with no `email_log` row, and the Mail page was already printing the
+    count — nothing acted on it.
+
+    Widening the window cannot fix this: the loss is by id, so the recovery is by id.
+
+    `skip` is passed so a message the listing already returned is not fetched twice in one run —
+    the caller filters again anyway, but a duplicate fetch here costs a Graph request and a full
+    attachment download.
+
+    **`skip` is compared on `mail_arrivals.match_key`, not on the ids themselves.** `skip` is built
+    from `state_db.seen_ids()` and from this run's listing, both of which hold the full id Graph
+    returns when `$select` includes the body; `unreachable()` returns ids the arrival watch wrote,
+    truncated at 255 characters. Comparing them raw, a candidate whose id runs past 255 never
+    matched anything in `skip` — so a message already settled would be handed to `fetch_by_ids`
+    and re-fetched, with its body and every attachment byte, on every run for ever.
+    """
+    try:
+        seen_keys = {mail_arrivals.match_key(i) for i in skip}
+        candidates = [i for i in mail_arrivals.unreachable(conn, settings.RECOVER_PER_RUN)
+                      if mail_arrivals.match_key(i) not in seen_keys]
+    except Exception:                                              # noqa: BLE001
+        return []                     # a recovery that cannot list is not worth failing a run over
+    if not candidates:
+        return []
+
+    result = mailbox.fetch_by_ids(candidates)
+
+    # Only ids the server *answered about and did not have* are recorded as gone, which is why the
+    # connector reports them explicitly rather than letting this infer absence from what is
+    # missing. Inferring it would mark a message permanently unreadable on any transient failure —
+    # an expired token, a throttle, a dropped connection — and the whole point here is that a
+    # purchase-order email must not be lost. An id in neither list is simply retried next run.
+    #
+    # Recording them matters because otherwise a deleted message is re-fetched every run for ever,
+    # and `recoverable_count` never reaches zero, so the run-health warning built on it stays
+    # permanently lit.
+    if result.absent:
+        mail_arrivals.mark_missing(
+            conn, result.absent, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return result.emails

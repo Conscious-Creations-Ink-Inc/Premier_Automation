@@ -80,7 +80,7 @@ def derive_line_status(
     #
     # An email carries a PO number and no line reference (`demo_emails` has no line column, and the
     # real mail usually names no line either — that is the entire reason a matching stage exists).
-    # So "a delivery notice arrived for PO 212456" cannot settle any particular line. Letting it
+    # So "a delivery notice arrived for PO 912456" cannot settle any particular line. Letting it
     # try was a bug caught by test_po_212456_rolls_up_to_open_despite_a_delivered_line: one carrier
     # email marked all three lines delivered, including two with nothing received, which made the
     # least-advanced rollup meaningless — every PO with any delivery mail read as fully delivered.

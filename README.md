@@ -1,126 +1,187 @@
-# Premier Receiver Automation
+# ppm-receiver-automation
 
-Email-parsing orchestrator for Premier Project Management's receiver process. It ingests
-receiving emails (warehouse inbound notifications, delivery-to-property confirmations,
-PODs/BOLs), triages them, extracts PO / spec / quantity data from bodies and attachments,
-and stages records for reconciliation. One user interface sits on top of it — see
-[The interface](#the-interface) below.
+Automates Premier Project Management's receiving process. It reads vendor delivery-confirmation
+emails and proof-of-delivery attachments from a monitored mailbox, extracts purchase-order and
+line-item data, matches it against open PO lines in **Spitfire sfPMS**, and prepares receiver
+documents for a person to approve.
 
-Full technical handbook (architecture, stage specs, security review, tech-debt register):
-[`docs/PREMIER_AUTOMATION.md`](docs/PREMIER_AUTOMATION.md).
-Known defects from the latest code analysis: [`docs/CODE-ANALYSIS-FINDINGS.md`](docs/CODE-ANALYSIS-FINDINGS.md).
+This replaces a manual procurement and fixed-asset receiving process running across
+approximately 66 properties. Approved receivers flow downstream into **Oracle ERP** for asset
+capitalisation.
 
-## Status
+> **The system never posts autonomously.** Anything it cannot resolve — a missing spec code, a
+> quantity that does not reconcile, unreadable paperwork — is routed to *Needs Attention* with a
+> written reason. A person decides. Nothing reaches Spitfire without human approval.
 
-| Piece | State |
+---
+
+## Repository classification
+
+| Field | Value |
 |---|---|
-| Stage 1 — Ingest (Graph API / local-folder mailbox) | Implemented + tested |
-| Stage 1 — Triage (7-rule chain) | Implemented + tested |
-| Stage 2 — Accumulate (multi-part shipments, stale-hold sweep) | Implemented + tested |
-| Stage 3 — Extract (HTML / PDF / DOCX / OCR / Excel / freetext adapters) | Implemented + tested |
-| Stages 4–7 — Match / Verify / Build / Route | **Stubs only** (`pipeline/stage4_match.py` …) — real logic is currently *mocked* in `api/services/` against synthetic demo data |
-| Dashboard API (`api/`) | Working demo on seeded synthetic data |
-| The UI (`api/ui/`) | Seven pages behind one sidebar. **No authentication** — see the handbook's S2 |
-| Scheduler (`operations/`) | Working: interval schedule, run history, kill switch. **Off until enabled on /ui/automation** |
-| Creating a record by hand | Implemented + tested — `/ui/records/new`, opened from a message on **Needs a human** or from the message popup |
-| Duplicate handling | Implemented + tested — content fingerprint per message, delivery key per record, evidence key per post (`pipeline/dedupe.py`) |
-| Production entry point | **None yet** — `run_pipeline.py` is a stub; the pipeline is otherwise invoked from the UI or from tests |
+| Organisation | `ashford` |
+| Repository | `ppm-receiver-automation` |
+| Visibility | Private |
+| Company scope | Premier (PPM) |
+| Department | Procurement / Fixed Asset Accounting |
+| **Risk tier** | **Critical** |
+| **Data classification** | **Confidential** |
+| Production status | Development |
+
+**Why Critical** (Standards v1.5 §5.3 — it meets five criteria): it creates and posts documents
+that materially affect financial reporting and fixed-asset capitalisation; it has write access to
+a critical enterprise platform; it feeds a SOX-controlled system of record; its failure would
+interrupt a live business process across ~66 properties; and it uses a privileged service
+principal.
+
+## Ownership
+
+| Role | Owner | Responsibility |
+|---|---|---|
+| Business owner | **To be named by Premier** *(Corina Heizer or Adam Okolicany)* | Accountable for the business process and outcome |
+| Technical owner | **Joe Higginbotham** (Premier) | Understands and maintains the solution; named PR approver for Premier |
+| Production support owner | **To be named by Premier** | Ongoing operation and incident response |
+| Delivery partner | Conscious Creations (`partner-conscious-creations`) | Builds and tests; **cannot approve PRs or production** |
+| Platform Admins | Ayotunde Gibbs, Henry Noel (Ashford IT) | GitHub configuration, security review, Critical-repo governance |
+
+The two "to be named" rows are open items tracked in [`docs/support-runbook.md`](docs/support-runbook.md).
+They must be filled before production sign-off.
+
+## Systems and data
+
+| System | Access | Notes |
+|---|---|---|
+| Microsoft Graph | **Read/write** on one mailbox | `Mail.ReadWrite` — write is needed only to move processed messages into a filed folder |
+| Azure AI (Vision / Document Intelligence) | Read | OCR for photographed and scanned proof of delivery. Metered — see the spend cap in `.env.example` |
+| Spitfire sfPMS REST API | **Read**, plus a narrow allowlisted write surface | Write is deny-checked before allowlisting; see [`docs/spitfire-integration.md`](docs/spitfire-integration.md) |
+| Spitfire SQL Server | **`SELECT` only** | No `INSERT`, `UPDATE`, `DELETE` or DDL in any code path, tests included |
+| Oracle ERP | **Read only** | Reconciliation. **Nothing in this repository writes to Oracle.** |
+
+**Data touched:** vendor delivery documents and proof of delivery; purchase-order headers, lines,
+quantities and cost codes; supplier and property identifiers; names of individuals who signed for
+goods. Classified **Confidential**. Full treatment in [`docs/data-handling.md`](docs/data-handling.md).
+
+**Test data is synthetic.** Fixtures mirror the *shape* of real messages — subject grammars,
+table layouts, forwarding wrappers — with every identifier substituted. Real PO numbers, property
+names, vendor names and staff names are prohibited anywhere in this repository.
+
+## How it works
+
+Seven stages. An email enters at 1 and either becomes an approved receiver at 6, or is routed to
+a person at 7.
+
+| Stage | Does | State |
+|---|---|---|
+| 1 · Ingest & triage | Read the mailbox; classify each message and record why | Implemented, tested |
+| 2 · Accumulate | Group multi-part shipments; sweep stale holds | Implemented, tested |
+| 3 · Extract | Read bodies and attachments — HTML, PDF, DOCX, XLSX, plain text, OCR for images | Implemented, tested |
+| 4 · Match | Resolve the PO and match each item to a line by `SourceItemNumber` | In progress |
+| 5 · Verify | Check quantities against what is still open on the line | In progress |
+| 6 · Build | Create the receipt, attach the POD and report | **Blocked** — see below |
+| 7 · Route | Send anything unresolved to a reviewer, with the reason | In progress |
+
+**Stage 6 is blocked on one decision:** whether receivers are created through Spitfire's REST API
+or by writing to its tables directly. Direct table inserts bypass Spitfire's own workflow
+triggers, which is the concrete argument for the API route. The decision sits with Premier.
+Detail in [`docs/spitfire-integration.md`](docs/spitfire-integration.md).
+
+**Matching rules that must not drift:**
+
+```
+Line matching key   SourceItemNumber (spec code)
+Open quantity       RelatedLineDetails.ContractUnits - ReceivedUnits
+```
+
+Open quantity subtracts prior receipts. Reading `ContractUnits` alone over-receives any line with
+a partial receipt against it.
 
 ## The interface
 
-**There is one.** `python run_api.py`, then <http://127.0.0.1:8000/ui>. Server-rendered, no build
-step, one inline script. Seven pages behind a sidebar:
-
-| Group | Page | Reads | What it answers |
-|---|---|---|---|
-| Deliveries | Delivery status | corpus | Where each purchase order stands, and the mail that says so |
-| | Records | corpus | What was extracted and is ready to go further, plus the receiver report sheet |
-| Mail | Mails | corpus | Every email through Stage 1 and what triage decided about it |
-| | Inbox | **live mailbox** | Premier's receiving inbox, read and never written |
-| Needs action | Needs a human | corpus | What the pipeline could not finish on its own — and, per row, a way to record it by hand |
-| Operations | Automation | operations DB | Run now, the schedule, run history |
-| | Receiver report | **live** | The report Premier compares against Spitfire's Receipt Log, and its Excel export |
-
-The kill switch is pinned to the bottom of the sidebar on every page.
-
-Two pages sit outside the sidebar because each is reached from a row rather than from navigation:
-`/ui/records/new` builds a record from one message, and `/ui/records/{id}/waive-pod` records that a
-delivery stated only in an email body may be posted with no proof document attached.
-
-**A record is complete when it carries the five facts only the delivery notification can supply** —
-PO number, spec code, description, quantity and delivery date (`pipeline/completeness.py`). Vendor,
-unit, PO line number and who signed for the goods are `DERIVED`: each has a source already holding
-the authoritative value, so nobody is asked to type them.
-
-**Automation never posts a receipt with no proof of delivery.** `post_decision`'s second gate
-refuses one outright; the only way past it is a named person accepting the risk on the waive page,
-which is stored on the record and carried into the ledger.
-
-There were three UIs until 11 Aug 2026 — these pages, an operations console on :8500, and a React
-dashboard on :5173. The console's four screens moved here (its logic still lives in `operations/`,
-without the app or the renderer it used to carry); the React dashboard was deleted and is recoverable
-from git history at `d14f407`. **`console/app.py` and `console/view.py` were never committed and are
-gone.**
-
-### The one line that must not be crossed
-
-Two databases, never joined:
-
-* **corpus** — `state/sample_state.sqlite3`, the 14 `.msg` files used to develop and test against.
-* **live** — `state/pipeline_state.sqlite3`, mail read from `receiver@premierpm.com`.
-
-Records and Receiver report are the same builder over the two different stores, which is exactly why
-they are separate pages. The report is evidence; evidence that mixes test data with Premier's real
-receiving mail is worth nothing.
-
-`run_api.py` also still serves `/api/*` — a demo surface on synthetic data
-(`state/demo_dashboard.sqlite3`) that nothing in the UI reads. Same process, nothing else shared.
-
-## Layout
+One interface, server-rendered, no build step:
 
 ```
-config/       settings (paths, sender domains, regexes, thresholds)
-connectors/   mailbox.py (Graph API + local-folder), spitfire.py (read-only)
-pipeline/     stages 1–3, ingest_orchestrator, models, state DB
-api/          FastAPI: routers/ + services/ (mock stages 4–7) + stores/ + demo seed
-api/ui/       THE UI — html.py is the whole design system, routes.py every page
-operations/   running the automation: schedule, kill switch, live inbox read, run history
-sample_data/  email fixtures for local runs
-state/        runtime SQLite databases (gitignored)
-tests/        pipeline tests + tests/api/
-docs/         handbook, analysis findings, assets/
+python run_api.py     # then http://127.0.0.1:8000/ui
 ```
 
-`api/ui/html.py` is the only place markup is built. Its docstring states the two rules that make the
-whole surface XSS-safe by construction — never build markup with an f-string outside that file, and
-never construct `Raw` from anything a user or a mail server supplied. Mail subjects are
-attacker-influenced by definition, and the corpus already contains one carrying a bare `&`.
+Seven pages behind a sidebar: delivery status per PO, extracted records, all mail with its triage
+verdict, a read-only view of the live inbox, *Needs a human*, the automation schedule and run
+history, and the receiver report. A kill switch is pinned to the sidebar on every page.
 
-## Setup
+**A record is complete when it carries the five facts only a delivery notification can supply** —
+PO number, spec code, description, quantity, delivery date. Vendor, unit, PO line number and
+signatory are derived from sources that already hold the authoritative value, so nobody is asked
+to retype them.
 
-```
+**Two databases, never joined.** A development corpus and live mail are kept in separate stores
+and surfaced on separate pages. The receiver report is evidence, and evidence that mixes test
+data with real receiving mail is worth nothing.
+
+### One rule for the UI
+
+All markup is built in a single module, which is what makes the surface XSS-safe by construction:
+never build markup with an f-string outside that module, and never construct raw HTML from
+anything a user or a mail server supplied. Mail subjects are attacker-influenced by definition.
+
+## Running it locally
+
+```bash
 python -m venv .venv
-.venv\Scripts\activate        # Windows
+.venv\Scripts\activate            # Windows
 pip install -r requirements.txt -r requirements-dev.txt
-copy .env.example .env        # then fill in the GRAPH_* values
+copy .env.example .env            # then fill in — see .env.example for each value
 ```
 
-## Common commands
+Never commit `.env`. It is gitignored and is the only file the code reads for credentials.
 
-```
-pytest                          # run all tests (from repo root)
-python run_api.py               # the UI on http://127.0.0.1:8000/ui (restarts on save)
-python -m tools.ingest_corpus --reset       # re-run the .msg corpus (the corpus pages)
-python -m tools.ingest_mailbox              # read the live mailbox (read-only)
-python -m api.demo.seed --reset             # reseed the /api/* demo database
+```bash
+pytest                            # full suite, ~21 minutes
+python run_api.py                 # the interface
+python -m tools.ingest_mailbox    # read the live mailbox (read-only)
 ```
 
-Saving a `.py` under `api/`, `pipeline/`, `config/` or `operations/`, or editing `.env`, restarts
-the server and reloads any open tab. `tools/` and `tests/` deliberately do not — nor does anything
-under `state/`, whose SQLite files are rewritten every fifteen seconds by the arrivals watch and
-would otherwise hold the server in a restart loop. Only one instance can run at a time; a second
-`python run_api.py` exits rather than binding a port beside the first.
+Nothing runs unattended unless someone turns it on. The schedule is off until enabled in the UI,
+and the kill switch stops everything — schedule and manual runs — until Resume is pressed. A run
+in progress finishes the email it is on, then halts.
 
-Nothing runs unattended unless someone turns it on: the schedule is off until enabled on
-`/ui/automation`, and the kill switch in the sidebar stops everything — schedule and Run now — until
-Resume is pressed. A run in progress finishes the email it is on and then halts.
+## Testing
+
+`pytest`, with unit tests mirroring the source package. Integration tests are marked and skip
+cleanly when credentials are absent; they never run against a live Spitfire instance in CI.
+
+Critical tier requires automated tests with retained, reproducible evidence, covering negative
+and error scenarios, security-sensitive paths, and rollback validation. Coverage target is 80%
+overall and **100% on line matching and quantity logic** — those two are where a bug becomes a
+financial misstatement. Evidence is retained in [`docs/testing-evidence/`](docs/testing-evidence/).
+
+## Deployment, support and rollback
+
+| Question | Document |
+|---|---|
+| How it deploys, to where, by whom | [`docs/deployment.md`](docs/deployment.md) |
+| How to undo a bad release | [`docs/rollback.md`](docs/rollback.md) |
+| It broke at 2am — what now | [`docs/support-runbook.md`](docs/support-runbook.md) |
+| What data it touches, and where that data lives | [`docs/data-handling.md`](docs/data-handling.md) |
+| Architecture, data flow, trust boundaries | [`docs/architecture.md`](docs/architecture.md) |
+| Spitfire endpoints, auth, constants | [`docs/spitfire-integration.md`](docs/spitfire-integration.md) |
+
+Production deployment is a **separate authority** from code approval: a member of
+`ppm-production-approvers`, who must not be the person who wrote the change. Nobody deploys from
+a workstation.
+
+## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before your first change — branching, commit format,
+the approval matrix, and the hard rules. Read [`SECURITY.md`](SECURITY.md) for the
+credential-exposure procedure. If you are using Claude Code, [`CLAUDE.md`](CLAUDE.md) governs the
+session.
+
+Critical tier requires **two human approvals**, at least one from a technically qualified Company
+Developer in `ppm-developers`. Conscious Creations is an external partner and **cannot satisfy a
+required approval** — we contribute and review, Premier approves.
+
+## Support
+
+Standards questions: Ayotunde Gibbs or Henry Noel.
+Access requests, security concerns, or accidental credential exposure: raise a ticket to
+`AshfordIT@Ashfordinc.com`, copying both.
+Business and functional questions: Joe Higginbotham (Premier).

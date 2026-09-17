@@ -11,12 +11,14 @@ is now part of. What is here is what is specific to it.
 """
 
 import re
+from urllib.parse import parse_qs, urlsplit
 import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
+from pipeline import mail_view
 from api.ui import routes as ui_routes
 from pipeline import read_views, state_db
 
@@ -40,11 +42,11 @@ def store(tmp_path):
     conn = state_db.get_connection(db)
     conn.execute("""INSERT INTO email_log (email_id, subject, sender, email_date, category,
                                            matched_rule, reason, folder, processed_at)
-                    VALUES ('mail-1', 'Delivered 212559', 'vendor@example.com',
+                    VALUES ('mail-1', 'Delivered 912559', 'vendor@example.com',
                             '2026-08-17T09:00:00Z', 'surface', '', '', 'Processed', 'now')""")
     rows = [
-        (0, "POD.pdf", "pdf", 0, "extracted", 1, "212559", "aaaa1111"),
-        (1, "FedEx 884603885067.pdf", "pdf", 0, "dropped_duplicate", 1, "212559", "aaaa1111"),
+        (0, "POD.pdf", "pdf", 0, "extracted", 1, "912559", "aaaa1111"),
+        (1, "FedEx 884603885067.pdf", "pdf", 0, "dropped_duplicate", 1, "912559", "aaaa1111"),
         (2, "logo.png", "image", 1, "dropped_decorative", 0, "", "bbbb2222"),
     ]
     for ordinal, name, kind, inline, disposition, is_pod, pos, sha in rows:
@@ -76,39 +78,64 @@ def store(tmp_path):
     conn.close()
 
 
-def test_every_attachment_is_listed_including_the_inline_one(store):
-    """"All the attachments we have downloaded" means all of them. An inline logo was still
-    downloaded and still takes up disk, so the count on screen matches the count in the table."""
-    body = TestClient(app).get("/ui/attachments").text
+def test_every_attachment_is_reachable_and_none_is_silently_dropped(store):
+    """An inline logo was still downloaded and still takes up disk, so it must stay reachable and
+    stay counted.
 
-    assert len(rows_of(body)) == 3
-    assert "POD.pdf" in body and "logo.png" in body
+    It is no longer *rendered* by default. On the live store 10,109 of 11,012 rows are signature
+    logos, and shipping all of them to show a page of 25 cost 25 MB of HTML — so the default view
+    loads the real files and the other two views are a click away. What must not change is that
+    nothing disappears: the logo is one link away and its count is printed on the page.
+    """
+    client = TestClient(app)
+    body = client.get("/ui/attachments").text
+
+    assert len(rows_of(body)) == 2, "the default view is the real files"
+    assert "POD.pdf" in body
+    assert 'href="/ui/attachments?view=all"' in body, "no way back to everything"
+
+    everything = client.get("/ui/attachments?view=all").text
+    assert len(rows_of(everything)) == 3
+    assert "POD.pdf" in everything and "logo.png" in everything
 
 
-def test_the_logos_can_be_put_aside_from_the_view_dropdown(store):
+def test_the_logos_can_be_put_aside_from_the_view_links(store):
     """Signature logos outnumber real attachments better than two to one on the live store, so a
     page that only ever showed everything would bury what matters.
 
     This was `?inline=hide`, a link that reloaded the whole page to hide rows it had already
-    rendered. It is a view of the same rows, so it is one of the views — and the dropdown can say
-    the two things the link could not: which files nothing could read, and the logos on their own.
-    Every row is still in the page; the filter hides them by class, as it does everywhere else.
+    rendered, then a dropdown filtering rows the browser held. It is a view of the same rows, so it
+    is one of three views — and each says the thing the old link could not: how many rows it holds.
+    None of them is rendered and then hidden; the row set is chosen by the query.
     """
-    body = TestClient(app).get("/ui/attachments").text
+    client = TestClient(app)
+    body = client.get("/ui/attachments").text
 
-    assert len(rows_of(body)) == 3, "every attachment is still rendered"
-    assert '<option value="file">Real files only</option>' in body
-    assert '<option value="inline">Inline images only</option>' in body
-    # The row says what it is; the dropdown names one of those words. A row can be both a logo and
-    # unreadable, which is why this is a set of words and not a column.
-    states = dict(zip(re.findall(r'data-choice-value="([^"]*)"', body),
-                      re.findall(r'<button[^>]*class="link-btn subj nw"[^>]*>([^<]*)<', body)))
-    assert any(name == "logo.png" and "inline" in words for words, name in states.items())
-    assert any(name == "POD.pdf" and "file" in words for words, name in states.items())
+    # Put aside by not being loaded at all, rather than by being rendered and then hidden with a
+    # class — which is what made the page cost 25 MB to show 25 rows.
+    assert len(rows_of(body)) == 2, "the logo should not be in the default page at all"
+    assert "logo.png" not in body
+    assert 'href="/ui/attachments?view=inline"' in body, "the logos on their own"
+
+    logos = client.get("/ui/attachments?view=inline").text
+    assert "logo.png" in logos and "POD.pdf" not in logos
+
+    # The row still says what it is, and the two ways of narrowing stay independent: a file can be
+    # both a signature logo and one nothing could read, and must not fall through the gap between
+    # the two views.
+    #
+    # This used to be read off `data-choice-value`, a space-separated state stamped on every row so
+    # a dropdown in the browser could match against it. That went when the page moved server-side —
+    # the browser holds 25 rows now, so a control matching what it holds could only ever narrow
+    # those. The same two dimensions are `view=` and `state=` on the query, and being separate
+    # clauses in SQL is what makes them compose.
+    assert ">inline<" in logos, "the inline view does not badge its rows as inline"
+    both = client.get("/ui/attachments?view=inline&state=unread").text
+    assert len(rows_of(both)) <= len(rows_of(logos)),         "narrowing to unreadable files did not narrow the inline view"
 
 
 def test_the_same_bytes_under_two_names_are_visibly_the_same_file(store):
-    """The failure this page exists to make visible. Two PDFs arrived on the 210634 thread under
+    """The failure this page exists to make visible. Two PDFs arrived on the 910634 thread under
     filenames citing different specs and tracking numbers and are byte-identical; nothing in the
     per-message view could show that, because it shows one message at a time and neither name is
     wrong on its face."""
@@ -123,7 +150,7 @@ def test_a_pod_says_which_purchase_order_it_names(store):
     the thing that must never be attached to this receipt."""
     body = TestClient(app).get("/ui/attachments").text
 
-    assert "212559" in body
+    assert "912559" in body
     assert "U ALI" in body and "2026-08-17" in body
 
 
@@ -156,6 +183,37 @@ def test_the_store_is_named_on_every_attachment_url(store):
         assert "src=" in url, url
 
 
+def test_every_attachment_url_has_exactly_one_query_string():
+    """A URL has one `?`. These had two, and the second one was silently eaten.
+
+    `api/ui/routes.py` hands `mail_view.render` an `attachment_url` that already carries `src=`,
+    and the two places that added `id=` and `n=` wrote `?` unconditionally — producing
+    `/ui/mail/attachment?src=inbox?id=<...>&n=3`. The server read that as `src="inbox?id=<...>"`
+    with **no `id` at all**, `_store_for` sent the unrecognised `src` to the sample corpus, and it
+    404'd. Every inline image in every stored message body was a broken icon, along with the
+    Download link and the thumbnail beside it.
+
+    Asserted by parsing rather than by matching text, because the broken form *contains* the right
+    substrings — `src=` and `id=` and `n=` are all present in it. Only a parser notices.
+    """
+    for base in ("/ui/mail/attachment?src=inbox", "/ui/mail/attachment"):
+        url = mail_view._url(base, id="<DM4PR14MB4831@namprd14.prod.outlook.com>", n=3)
+        assert url.count("?") == 1, url
+        query = parse_qs(urlsplit(url).query, keep_blank_values=True)
+        assert query["id"] == ["<DM4PR14MB4831@namprd14.prod.outlook.com>"], url
+        assert query["n"] == ["3"], url
+        if "src" in base:
+            assert query["src"] == ["inbox"], "changing view must not lose the store"
+
+
+def test_the_payload_viewer_reads_the_key_the_serializer_writes():
+    """`stage2_accumulate` writes `content_b64`; this read `content_bytes`, a key no payload has
+    ever carried, so held mail never showed its own inline copies."""
+    import inspect
+
+    assert '"content_b64"' in inspect.getsource(mail_view._from_accumulation)
+
+
 def test_the_view_returns_plain_rows_for_an_empty_store(monkeypatch):
     conn = state_db.get_connection(":memory:")
     try:
@@ -181,7 +239,9 @@ def test_every_row_offers_view_as_well_as_download(store):
     """The in-page viewer existed all along — a PDF renders in an iframe, an image in an img — but
     the only way in was clicking the filename, which is styled as text. A page whose only visible
     control is Download reads as download-only, and people downloaded files to look at them."""
-    body = TestClient(app).get("/ui/attachments").text
+    # Asked of every row there is, not only the default view's, so the control is proved present
+    # on an inline row too.
+    body = TestClient(app).get("/ui/attachments?view=all").text
     table = re.search(r'id="attachments-table".*?</table>', body, re.S).group(0)
 
     assert table.count(">View<") == 3, "one View per row"
@@ -223,20 +283,20 @@ def _po_cell(body: str, filename: str) -> str:
 def test_a_po_named_by_the_file_itself_is_shown_plainly(store):
     """The strong claim, and the only one `spitfire_post._pod_for` will act on: the document says
     which order it is proof for."""
-    assert _po_cell(TestClient(app).get("/ui/attachments").text, "POD.pdf") == "212559"
+    assert _po_cell(TestClient(app).get("/ui/attachments").text, "POD.pdf") == "912559"
 
 
 def test_a_po_known_only_from_the_email_is_marked_as_such(store):
     """`email_log.po_hints` was populated all along and never surfaced, which is why this page
     first shipped showing an em dash for forty-eight of fifty-five files."""
-    store.execute("UPDATE email_log SET po_hints = '207030, 211169' WHERE email_id = 'mail-1'")
+    store.execute("UPDATE email_log SET po_hints = '907030, 911169' WHERE email_id = 'mail-1'")
     store.execute("UPDATE attachment_ledger SET is_pod = 0, pod_po_numbers = ''")
     store.commit()
 
     cell = _po_cell(TestClient(app).get("/ui/attachments").text, "logo.png")
 
     assert cell.startswith("email:"), cell
-    assert "207030" in cell
+    assert "907030" in cell
 
 
 def test_a_po_known_only_from_the_records_is_marked_weakest(store):
@@ -246,24 +306,24 @@ def test_a_po_known_only_from_the_records_is_marked_weakest(store):
     store.execute("""INSERT INTO extracted_records
                      (source_email_id, po_number, email_date, extraction_source,
                       extraction_confidence, status, created_at)
-                     VALUES ('mail-1', '206993', '2026-08-17', 'test', 1.0, 'pending', 'now')""")
+                     VALUES ('mail-1', '906993', '2026-08-17', 'test', 1.0, 'pending', 'now')""")
     store.commit()
 
     cell = _po_cell(TestClient(app).get("/ui/attachments").text, "logo.png")
 
     assert cell.startswith("records:"), cell
-    assert "206993" in cell
+    assert "906993" in cell
 
 
 def test_the_file_outranks_the_email_when_both_name_one(store):
-    """A file naming 212559 on a message about 999999 is proof for 212559. The email's claim is
+    """A file naming 912559 on a message about 999999 is proof for 912559. The email's claim is
     still counted, so nothing is hidden — it is just not what the cell leads with."""
     store.execute("UPDATE email_log SET po_hints = '999999' WHERE email_id = 'mail-1'")
     store.commit()
 
     cell = _po_cell(TestClient(app).get("/ui/attachments").text, "POD.pdf")
 
-    assert cell.startswith("212559"), cell
+    assert cell.startswith("912559"), cell
     assert "more on the email" in cell
 
 

@@ -13,7 +13,7 @@ answers and they are not the same code path:
     B  .png   an image POD, which is what a phone-photographed delivery note is
     C  .doc   legacy Word — refused outright until 2026-08-17, and the reason this file exists
 
-They point at **PO 212559**, chosen because it is genuinely receivable: project MRC024PB100003,
+They point at **PO 912559**, chosen because it is genuinely receivable: project PRJ001PB100003,
 lines 1/2/4 ordering 4/4/2 Set with nothing received, cost code 102011215. Records 191-194 already
 sit on those lines needing nothing but a receiver, so the seeds are those rows made complete
 rather than fiction.
@@ -47,8 +47,8 @@ MARKER = "cc-test:seed"
 """`extraction_source` for every seeded row. One greppable string is what makes `--remove` exact
 rather than a guess at which records were ours."""
 
-PO = "212559"
-PROJECT = "MRC024PB100003"
+PO = "912559"
+PROJECT = "PRJ001PB100003"
 
 # (label, PO line, quantity, spec, description, filename, kind, content-type)
 # Quantities match the mirrored order exactly: the decision gate's tolerance is 0.0, so a seed
